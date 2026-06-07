@@ -91,6 +91,22 @@ def setup_news_schema(engine) -> None:
         review_reason text
     );
 
+    CREATE TABLE IF NOT EXISTS public.news_source_health (
+        source_name text NOT NULL,
+        feed_url text PRIMARY KEY,
+        last_success_at timestamptz,
+        last_failure_at timestamptz,
+        success_count integer DEFAULT 0,
+        failure_count integer DEFAULT 0,
+        consecutive_failure_count integer DEFAULT 0,
+        last_error text,
+        last_fetch_seconds numeric,
+        avg_fetch_seconds numeric,
+        last_article_count integer DEFAULT 0,
+        enabled_recommendation boolean DEFAULT true,
+        updated_at timestamptz DEFAULT now()
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_news_articles_canonical_url_hash
     ON public.news_articles (canonical_url_hash);
 
