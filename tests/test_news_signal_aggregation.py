@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from db_builder.news_signal_aggregation import aggregate_signal_records, expand_signal_dimensions, source_weight_factor
+from db_builder.news_signal_aggregation import (
+    aggregate_signal_records,
+    article_quality_score,
+    expand_signal_dimensions,
+    source_weight_factor,
+)
 from db_builder.news_taxonomy import canonical_theme, normalize_theme_key, normalize_ticker
 
 
@@ -229,3 +234,70 @@ def test_weighted_sentiment_uses_source_priority():
 
     assert signal["weighted_sentiment_score"] == round(expected, 6)
     assert signal["top_article_ids"][0] == "00000000-0000-0000-0000-000000000006"
+
+
+def test_top_articles_prefer_premium_source_when_scores_are_similar():
+    records = [
+        {
+            "article_id": "00000000-0000-0000-0000-000000000008",
+            "sentiment_score": -0.3,
+            "impact_score": 80,
+            "confidence_score": 0.9,
+            "themes": ["Geopolitics"],
+            "affected_tickers": [],
+            "raw_response": {},
+            "source_name": "Yahoo Finance",
+            "source_priority": 50,
+            "published_at": datetime(2026, 6, 7, 12, tzinfo=timezone.utc),
+        },
+        {
+            "article_id": "00000000-0000-0000-0000-000000000009",
+            "sentiment_score": -0.3,
+            "impact_score": 78,
+            "confidence_score": 0.9,
+            "themes": ["Geopolitics"],
+            "affected_tickers": [],
+            "raw_response": {},
+            "source_name": "Federal Reserve",
+            "source_priority": 100,
+            "published_at": datetime(2026, 6, 7, 10, tzinfo=timezone.utc),
+        },
+    ]
+
+    signals = aggregate_signal_records(records, window_hours=24, run_time=RUN_TIME)
+    signal = next(s for s in signals if s["dimension_value"] == "Geopolitics")
+
+    assert article_quality_score(records[1]) > article_quality_score(records[0])
+    assert signal["top_article_ids"][0] == "00000000-0000-0000-0000-000000000009"
+
+
+def test_top_articles_tie_break_by_published_at_desc():
+    records = [
+        {
+            "article_id": "00000000-0000-0000-0000-000000000010",
+            "sentiment_score": 0.2,
+            "impact_score": 80,
+            "confidence_score": 0.9,
+            "themes": ["Oil"],
+            "affected_tickers": [],
+            "raw_response": {},
+            "source_priority": 90,
+            "published_at": datetime(2026, 6, 7, 8, tzinfo=timezone.utc),
+        },
+        {
+            "article_id": "00000000-0000-0000-0000-000000000011",
+            "sentiment_score": 0.2,
+            "impact_score": 80,
+            "confidence_score": 0.9,
+            "themes": ["Oil"],
+            "affected_tickers": [],
+            "raw_response": {},
+            "source_priority": 90,
+            "published_at": datetime(2026, 6, 7, 12, tzinfo=timezone.utc),
+        },
+    ]
+
+    signals = aggregate_signal_records(records, window_hours=24, run_time=RUN_TIME)
+    signal = next(s for s in signals if s["dimension_value"] == "Oil")
+
+    assert signal["top_article_ids"][0] == "00000000-0000-0000-0000-000000000011"

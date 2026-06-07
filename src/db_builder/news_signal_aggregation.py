@@ -203,6 +203,24 @@ def source_weight_factor(record: dict) -> float:
     return numeric / 100.0
 
 
+def article_quality_score(record: dict) -> float:
+    return float(record["impact_score"]) * float(record["confidence_score"]) * source_weight_factor(record)
+
+
+def _published_at_sort_value(record: dict) -> float:
+    value = record.get("published_at")
+    if value is None or pd.isna(value):
+        return 0.0
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return 0.0
+    return float(parsed.timestamp())
+
+
+def top_article_sort_key(record: dict) -> tuple[float, float]:
+    return article_quality_score(record), _published_at_sort_value(record)
+
+
 def _score(weighted_sentiment: float, high_impact_count: int, article_count: int, *, positive: bool) -> float:
     sentiment_component = max(weighted_sentiment, 0) if positive else max(-weighted_sentiment, 0)
     return round((sentiment_component * 60) + (high_impact_count * 10) + min(article_count, 10) * 2, 4)
@@ -235,7 +253,7 @@ def aggregate_signal_records(
         neutral_count = article_count - positive_count - negative_count
         top_articles = sorted(
             grouped,
-            key=lambda r: float(r["impact_score"]) * float(r["confidence_score"]) * source_weight_factor(r),
+            key=top_article_sort_key,
             reverse=True,
         )[:5]
 
