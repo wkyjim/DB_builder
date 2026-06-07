@@ -28,6 +28,23 @@ INDICATOR_COLUMNS = [
 ]
 
 
+def ensure_indicator_indexes(
+    engine,
+    raw_table: str = RAW_TABLE,
+    indicator_table: str = INDICATOR_TABLE,
+) -> None:
+    sql = f"""
+    CREATE INDEX IF NOT EXISTS idx_us_equities_ticker_date
+    ON {raw_table} (ticker, date DESC);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_us_equities_indicators_ticker_date
+    ON {indicator_table} (ticker, date);
+    """
+
+    with engine.begin() as conn:
+        conn.execute(text(sql))
+
+
 def calculate_group(g: pd.DataFrame) -> pd.DataFrame:
     ticker = g["ticker"].iloc[0]
 
@@ -148,11 +165,15 @@ def daily_update_missing_indicators(
     limit: int | None = None,
     tickers: list[str] | None = None,
     allow_non_trading_day: bool = False,
+    recalculate_full_window: bool = False,
 ) -> None:
     start_time = time.time()
     print("Starting daily update for missing/latest indicator dates")
 
-    ticker_filter = [ticker.strip().upper() for ticker in tickers or [] if ticker.strip()]
+    if not dry_run:
+        ensure_indicator_indexes(engine, raw_table, indicator_table)
+
+    ticker_filter = [ticker.strip() for ticker in tickers or [] if ticker.strip()]
     ticker_where = "WHERE ticker = ANY(%(ticker_filter)s)" if ticker_filter else ""
     params = {"ticker_filter": ticker_filter} if ticker_filter else None
 
@@ -180,9 +201,8 @@ def daily_update_missing_indicators(
 
     status = latest_raw.merge(latest_ind, on="ticker", how="left")
 
-    if ticker_filter:
-        # Explicit ticker runs are small validation runs; recalculate the
-        # lookback window even when the latest indicator date is current.
+    if ticker_filter and recalculate_full_window:
+        # Repair runs can force the full lookback window for explicit tickers.
         status_to_update = status.copy()
     else:
         status_to_update = status[
@@ -205,7 +225,19 @@ def daily_update_missing_indicators(
 
     df = pd.read_sql(
         f"""
-        WITH ranked AS (
+        WITH target_tickers AS (
+            SELECT unnest(%(tickers)s::text[]) AS ticker
+        )
+        SELECT
+            r.date,
+            r.ticker,
+            r.open,
+            r.high,
+            r.low,
+            r.close,
+            r.volume
+        FROM target_tickers t
+        CROSS JOIN LATERAL (
             SELECT
                 date,
                 ticker,
@@ -213,18 +245,13 @@ def daily_update_missing_indicators(
                 high,
                 low,
                 close,
-                volume,
-                ROW_NUMBER() OVER (
-                    PARTITION BY ticker
-                    ORDER BY date DESC
-                ) AS rn
+                volume
             FROM {raw_table}
-            WHERE ticker = ANY(%(tickers)s)
-        )
-        SELECT date, ticker, open, high, low, close, volume
-        FROM ranked
-        WHERE rn <= %(lookback_rows)s
-        ORDER BY ticker, date
+            WHERE ticker = t.ticker
+            ORDER BY date DESC
+            LIMIT %(lookback_rows)s
+        ) r
+        ORDER BY r.ticker, r.date
         """,
         engine,
         params={"tickers": tickers_to_update, "lookback_rows": lookback_rows},
@@ -259,7 +286,7 @@ def daily_update_missing_indicators(
             result["ticker"] = ticker
 
             latest_indicator_date = latest_indicator_map.get(ticker)
-            if pd.notnull(latest_indicator_date) and not ticker_filter:
+            if pd.notnull(latest_indicator_date) and not recalculate_full_window:
                 result = result[result["date"] > latest_indicator_date]
 
             if not result.empty:

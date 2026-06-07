@@ -1,13 +1,44 @@
 .env
 *.env
+
+# Logs
+logs/
+*.log
+
+# Generated reports
+reports/
+*.md
+
+# Pytest cache
+.pytest_cache/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Jupyter
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
-*.log
-logs/
+
+# Environment
+.env
+*.env
+.venv/
+
+# VSCode
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# OneDrive temp files
+~$*
+
+# Data exports / local dumps
 *.csv
 *.dump
 *.sql
-.venv/
+
+# Separate deployment repo
 neon-api/

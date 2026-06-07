@@ -14,8 +14,8 @@ from db_builder.config import RAW_TABLE, local_engine as make_local_engine
 # CONFIG
 # ============================================================
 
-CUSTOM_START_DATE = "2026-05-20"
-CUSTOM_END_DATE = "2026-05-30"
+CUSTOM_START_DATE = "2026-06-01"
+CUSTOM_END_DATE = "2026-06-02"
 
 FETCH_BUFFER_DAYS = 3
 BATCH_SIZE = 100

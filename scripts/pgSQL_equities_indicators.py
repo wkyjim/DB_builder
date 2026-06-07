@@ -23,13 +23,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Debug only: allow non-NYSE trading dates through validation.",
     )
+    parser.add_argument(
+        "--recalculate-full-window",
+        action="store_true",
+        help="Repair mode: upsert the full lookback window instead of only newer rows.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     engine = local_engine(use_insertmanyvalues=True)
-    tickers = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else None
+    tickers = [t.strip() for t in args.tickers.split(",") if t.strip()] if args.tickers else None
     dry_run = args.dry_run or (bool(tickers) and not args.upsert_local)
 
     daily_update_missing_indicators(
@@ -38,6 +43,7 @@ def main() -> None:
         limit=args.limit,
         tickers=tickers,
         allow_non_trading_day=args.allow_non_trading_day,
+        recalculate_full_window=args.recalculate_full_window,
     )
 
 
