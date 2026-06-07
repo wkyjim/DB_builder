@@ -79,6 +79,8 @@ def normalize_entry(entry: dict, source: NewsSource, *, keyword_records: list[di
         "source_name": source.source_name,
         "source_type": source.source_type,
         "feed_url": source.feed_url,
+        "source_priority": source.priority,
+        "source_category": source.category,
         "title": title,
         "summary": summary,
         "url": url,

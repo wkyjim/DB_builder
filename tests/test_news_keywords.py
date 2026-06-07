@@ -9,6 +9,11 @@ def test_seed_keywords_include_required_macro_and_technology_terms():
     assert "Treasury yields" in keywords
     assert "AI" in keywords
     assert "uranium" in keywords
+    assert "monetary policy" in keywords
+    assert "bank regulation" in keywords
+    assert "ETF regulation" in keywords
+    assert "crypto regulation" in keywords
+    assert "trade policy" in keywords
 
 
 def test_keyword_candidate_generation_from_low_coverage_headlines():

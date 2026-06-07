@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import text
 
+from db_builder.news_classifier import _ollama_chat, extract_json_object, ollama_model, ollama_url
 from db_builder.opportunity_scanner import WATCHLIST_UNIVERSE
 
 
 LOW_ARTICLE_COUNT_THRESHOLD = 10
+QUALITY_SUMMARY_FIELDS = {
+    "executive_summary",
+    "top_risks",
+    "top_opportunities",
+    "positioning_bias",
+}
 
 
 def _project_root() -> Path:
@@ -346,8 +354,111 @@ def render_investment_report(data: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def generate_investment_report(engine, *, window_hours: int) -> str:
-    return render_investment_report(collect_report_data(engine, window_hours=window_hours))
+def quality_summary_prompt(markdown: str) -> list[dict]:
+    system = (
+        "You are an investment strategist reviewing a generated market intelligence report. "
+        "Return one valid JSON object only. No markdown. No prose outside JSON."
+    )
+    user = {
+        "task": "Summarize the report into a concise investment decision layer.",
+        "required_json_schema": {
+            "executive_summary": "exactly 5 bullet strings",
+            "top_risks": "list of concise risk strings",
+            "top_opportunities": "list of concise opportunity strings",
+            "positioning_bias": "one concise string describing portfolio stance",
+        },
+        "rules": [
+            "Use only evidence from the report.",
+            "If opportunities are absent, say that explicitly.",
+            "Do not invent tickers or macro facts.",
+            "Keep each bullet under 30 words.",
+        ],
+        "report_markdown": markdown[:20000],
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=True)},
+    ]
+
+
+def normalize_quality_summary(payload: dict) -> dict:
+    missing = sorted(QUALITY_SUMMARY_FIELDS - set(payload))
+    if missing:
+        raise ValueError(f"Missing quality summary fields: {missing}")
+
+    executive_summary = payload.get("executive_summary")
+    top_risks = payload.get("top_risks")
+    top_opportunities = payload.get("top_opportunities")
+    positioning_bias = payload.get("positioning_bias")
+
+    if not isinstance(executive_summary, list) or not all(isinstance(item, str) for item in executive_summary):
+        raise ValueError("executive_summary must be list[str]")
+    if not isinstance(top_risks, list) or not all(isinstance(item, str) for item in top_risks):
+        raise ValueError("top_risks must be list[str]")
+    if not isinstance(top_opportunities, list) or not all(isinstance(item, str) for item in top_opportunities):
+        raise ValueError("top_opportunities must be list[str]")
+
+    summary = [item.strip() for item in executive_summary if item.strip()][:5]
+    while len(summary) < 5:
+        summary.append("Insufficient report evidence for an additional summary point.")
+
+    return {
+        "executive_summary": summary,
+        "top_risks": [item.strip() for item in top_risks if item.strip()],
+        "top_opportunities": [item.strip() for item in top_opportunities if item.strip()],
+        "positioning_bias": str(positioning_bias or "Neutral until more evidence is available.").strip(),
+    }
+
+
+def summarize_report_with_deepseek(markdown: str, *, timeout: int = 120) -> dict:
+    response = _ollama_chat(
+        quality_summary_prompt(markdown),
+        url=ollama_url(),
+        model=ollama_model(),
+        timeout=timeout,
+    )
+    content = response.get("message", {}).get("content", "")
+    return normalize_quality_summary(extract_json_object(content))
+
+
+def render_quality_summary(summary: dict) -> str:
+    lines = ["## Report Quality Summary", "", "### 5-Bullet Executive Summary", ""]
+    lines.extend([f"- {item}" for item in summary["executive_summary"]])
+    lines.extend(["", "### Top Risks", ""])
+    risks = summary["top_risks"] or ["No distinct top risks were identified by the quality layer."]
+    lines.extend([f"- {item}" for item in risks])
+    lines.extend(["", "### Top Opportunities", ""])
+    opportunities = summary["top_opportunities"] or ["No high-conviction opportunities were identified."]
+    lines.extend([f"- {item}" for item in opportunities])
+    lines.extend(["", "### Positioning Bias", "", f"- {summary['positioning_bias']}"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def append_quality_summary(markdown: str, *, timeout: int = 120, summarizer=summarize_report_with_deepseek) -> str:
+    try:
+        summary = summarizer(markdown, timeout=timeout)
+        return markdown.rstrip() + "\n\n" + render_quality_summary(summary)
+    except Exception as exc:
+        fallback = {
+            "executive_summary": [
+                "Quality summary could not be generated from the local model.",
+                "Use the base report sections for regime, themes, risks, opportunities, and data quality.",
+                "Review model availability before relying on the quality layer.",
+                "No additional positioning conclusions were added.",
+                "The base report remains unchanged.",
+            ],
+            "top_risks": [f"Quality summary failure: {exc}"],
+            "top_opportunities": ["No model-generated opportunity summary is available."],
+            "positioning_bias": "No model-generated positioning bias is available.",
+        }
+        return markdown.rstrip() + "\n\n" + render_quality_summary(fallback)
+
+
+def generate_investment_report(engine, *, window_hours: int, quality_summary: bool = True, timeout: int = 120) -> str:
+    markdown = render_investment_report(collect_report_data(engine, window_hours=window_hours))
+    if not quality_summary:
+        return markdown
+    return append_quality_summary(markdown, timeout=timeout)
 
 
 def save_report(markdown: str, *, generated_at: datetime | None = None, reports_dir: Path | None = None) -> Path:

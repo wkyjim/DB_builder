@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 
 import _bootstrap  # noqa: F401
 
@@ -30,16 +31,35 @@ def main() -> None:
         return
 
     all_articles = []
+    failed_sources = []
     for source in sources:
         print(f"Fetching {source.source_name}: {source.feed_url}")
-        articles = fetch_source_articles(source, limit=args.limit, timeout=args.timeout)
+        try:
+            articles = fetch_source_articles(source, limit=args.limit, timeout=args.timeout)
+        except Exception as exc:
+            failed_sources.append((source.source_name, str(exc)))
+            print(f"[WARN] skipped {source.source_name}: {exc}")
+            continue
         all_articles.extend(articles)
         print(f"Fetched {len(articles):,} unique articles")
 
     if args.dry_run or not args.upsert_local:
         print(f"[dry-run] would upsert {len(all_articles):,} articles from {len(sources):,} source(s)")
+        if failed_sources:
+            print("Failed sources:")
+            for source_name, error in failed_sources:
+                print(f"- {source_name}: {error}")
+        source_counts = Counter(article["source_name"] for article in all_articles)
+        category_counts = Counter(article.get("source_category") or "uncategorized" for article in all_articles)
+        print("Source counts:")
+        for source_name, count in source_counts.most_common():
+            print(f"- {source_name}: {count}")
+        print("Category counts:")
+        for category, count in category_counts.most_common():
+            print(f"- {category}: {count}")
         for article in all_articles[: args.limit or 10]:
             print(f"- {article['published_at']} | {article['source_name']} | {article['title']}")
+            print(f"  source_priority={article.get('source_priority')} source_category={article.get('source_category')}")
             if article["matched_keywords"]:
                 print(f"  keywords: {', '.join(article['matched_keywords'])}")
         return
@@ -50,6 +70,8 @@ def main() -> None:
     upsert_sources(engine, sources)
     upsert_articles(engine, all_articles)
     print(f"Upserted {len(all_articles):,} articles into local PostgreSQL.")
+    if failed_sources:
+        print(f"Skipped {len(failed_sources):,} source(s) after fetch errors.")
 
 
 if __name__ == "__main__":

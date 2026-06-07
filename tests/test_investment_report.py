@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from db_builder.investment_report import render_investment_report, save_report
+from db_builder.investment_report import (
+    append_quality_summary,
+    normalize_quality_summary,
+    render_investment_report,
+    render_quality_summary,
+    save_report,
+)
 
 
 GENERATED_AT = datetime(2026, 6, 7, 12, 30, tzinfo=timezone.utc)
@@ -117,3 +123,63 @@ def test_save_report_uses_timestamped_markdown_name(tmp_path):
 
     assert path.name == "investment_report_20260607_123000.md"
     assert path.read_text(encoding="utf-8") == "hello\n"
+
+
+def test_normalize_quality_summary_enforces_five_summary_bullets():
+    summary = normalize_quality_summary(
+        {
+            "executive_summary": ["One", "Two"],
+            "top_risks": ["Risk"],
+            "top_opportunities": [],
+            "positioning_bias": "Defensive.",
+        }
+    )
+
+    assert len(summary["executive_summary"]) == 5
+    assert summary["executive_summary"][0] == "One"
+    assert summary["top_risks"] == ["Risk"]
+    assert summary["positioning_bias"] == "Defensive."
+
+
+def test_render_quality_summary_includes_required_sections():
+    markdown = render_quality_summary(
+        {
+            "executive_summary": ["A", "B", "C", "D", "E"],
+            "top_risks": ["Risk one"],
+            "top_opportunities": ["Opportunity one"],
+            "positioning_bias": "Defensive with dry powder.",
+        }
+    )
+
+    assert "## Report Quality Summary" in markdown
+    assert "### 5-Bullet Executive Summary" in markdown
+    assert "### Top Risks" in markdown
+    assert "### Top Opportunities" in markdown
+    assert "### Positioning Bias" in markdown
+
+
+def test_append_quality_summary_uses_injected_summarizer():
+    def fake_summarizer(markdown, *, timeout):
+        assert "base report" in markdown
+        assert timeout == 3
+        return {
+            "executive_summary": ["A", "B", "C", "D", "E"],
+            "top_risks": ["Risk one"],
+            "top_opportunities": ["No high-conviction opportunities."],
+            "positioning_bias": "Risk-off.",
+        }
+
+    markdown = append_quality_summary("base report\n", timeout=3, summarizer=fake_summarizer)
+
+    assert "## Report Quality Summary" in markdown
+    assert "- Risk-off." in markdown
+
+
+def test_append_quality_summary_falls_back_on_model_error():
+    def failing_summarizer(markdown, *, timeout):
+        raise RuntimeError("ollama unavailable")
+
+    markdown = append_quality_summary("base report\n", summarizer=failing_summarizer)
+
+    assert "Quality summary could not be generated" in markdown
+    assert "ollama unavailable" in markdown

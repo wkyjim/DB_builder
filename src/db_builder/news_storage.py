@@ -19,6 +19,8 @@ def setup_news_schema(engine) -> None:
         feed_url text NOT NULL,
         category text,
         priority integer,
+        source_priority integer,
+        source_category text,
         enabled boolean,
         created_at timestamptz DEFAULT now(),
         updated_at timestamptz DEFAULT now()
@@ -29,6 +31,8 @@ def setup_news_schema(engine) -> None:
         source_name text,
         source_type text,
         feed_url text,
+        source_priority integer,
+        source_category text,
         title text,
         summary text,
         url text,
@@ -95,6 +99,18 @@ def setup_news_schema(engine) -> None:
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_news_keyword_candidates_keyword
     ON public.news_keyword_candidates (keyword);
+
+    ALTER TABLE public.news_sources
+    ADD COLUMN IF NOT EXISTS source_priority integer;
+
+    ALTER TABLE public.news_sources
+    ADD COLUMN IF NOT EXISTS source_category text;
+
+    ALTER TABLE public.news_articles
+    ADD COLUMN IF NOT EXISTS source_priority integer;
+
+    ALTER TABLE public.news_articles
+    ADD COLUMN IF NOT EXISTS source_category text;
     """
     with engine.begin() as conn:
         conn.execute(text(sql))
@@ -110,6 +126,8 @@ def source_record(source: NewsSource) -> dict:
         "feed_url": source.feed_url,
         "category": source.category,
         "priority": source.priority,
+        "source_priority": source.priority,
+        "source_category": source.category,
         "enabled": source.enabled,
     }
 
@@ -119,10 +137,12 @@ def upsert_sources(engine, sources: list[NewsSource]) -> None:
         return
     sql = text("""
         INSERT INTO public.news_sources (
-            source_id, source_name, source_type, feed_url, category, priority, enabled, created_at, updated_at
+            source_id, source_name, source_type, feed_url, category, priority,
+            source_priority, source_category, enabled, created_at, updated_at
         )
         VALUES (
-            :source_id, :source_name, :source_type, :feed_url, :category, :priority, :enabled, now(), now()
+            :source_id, :source_name, :source_type, :feed_url, :category, :priority,
+            :source_priority, :source_category, :enabled, now(), now()
         )
         ON CONFLICT (source_id)
         DO UPDATE SET
@@ -131,6 +151,8 @@ def upsert_sources(engine, sources: list[NewsSource]) -> None:
             feed_url = EXCLUDED.feed_url,
             category = EXCLUDED.category,
             priority = EXCLUDED.priority,
+            source_priority = EXCLUDED.source_priority,
+            source_category = EXCLUDED.source_category,
             enabled = EXCLUDED.enabled,
             updated_at = now();
     """)
@@ -170,13 +192,13 @@ def upsert_articles(engine, articles: list[dict]) -> None:
     sql = text("""
         INSERT INTO public.news_articles (
             article_id, source_name, source_type, feed_url, title, summary, url,
-            canonical_url, canonical_url_hash, title_hash, published_at, fetched_at,
+            source_priority, source_category, canonical_url, canonical_url_hash, title_hash, published_at, fetched_at,
             language, matched_keywords, related_tickers, classification_status,
             classification_attempts, last_classification_error, raw_payload
         )
         VALUES (
             :article_id, :source_name, :source_type, :feed_url, :title, :summary, :url,
-            :canonical_url, :canonical_url_hash, :title_hash, :published_at, :fetched_at,
+            :source_priority, :source_category, :canonical_url, :canonical_url_hash, :title_hash, :published_at, :fetched_at,
             :language, :matched_keywords, :related_tickers, :classification_status,
             :classification_attempts, :last_classification_error, CAST(:raw_payload AS jsonb)
         )
@@ -185,6 +207,8 @@ def upsert_articles(engine, articles: list[dict]) -> None:
             source_name = EXCLUDED.source_name,
             source_type = EXCLUDED.source_type,
             feed_url = EXCLUDED.feed_url,
+            source_priority = EXCLUDED.source_priority,
+            source_category = EXCLUDED.source_category,
             title = EXCLUDED.title,
             summary = EXCLUDED.summary,
             url = EXCLUDED.url,

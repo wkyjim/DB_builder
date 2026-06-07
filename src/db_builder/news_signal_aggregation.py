@@ -16,6 +16,7 @@ from db_builder.news_taxonomy import canonical_theme, normalize_ticker
 
 DEFAULT_WINDOWS = [6, 24, 72]
 HIGH_IMPACT_THRESHOLD = 70
+DEFAULT_SOURCE_PRIORITY = 75
 
 
 def setup_news_signals_schema(engine) -> None:
@@ -48,8 +49,44 @@ def setup_news_signals_schema(engine) -> None:
         conn.execute(text(sql))
 
 
+def _table_columns(engine, table_name: str) -> set[str]:
+    schema, table = table_name.split(".", 1)
+    sql = text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = :schema
+          AND table_name = :table
+    """)
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {"schema": schema, "table": table}).fetchall()
+    return {row[0] for row in rows}
+
+
 def fetch_classified_news(engine, *, window_hours: int, run_time: datetime | None = None) -> pd.DataFrame:
     selected_run_time = run_time or datetime.now(timezone.utc)
+    article_columns = _table_columns(engine, "public.news_articles")
+    source_columns = _table_columns(engine, "public.news_sources")
+    priority_exprs = []
+    category_exprs = []
+    if "source_priority" in article_columns:
+        priority_exprs.append("a.source_priority")
+    if "source_priority" in source_columns:
+        priority_exprs.append("s.source_priority")
+    if "priority" in source_columns:
+        priority_exprs.append("s.priority")
+    if "source_category" in article_columns:
+        category_exprs.append("a.source_category")
+    if "source_category" in source_columns:
+        category_exprs.append("s.source_category")
+    if "category" in source_columns:
+        category_exprs.append("s.category")
+
+    source_priority_sql = "COALESCE(" + ", ".join(priority_exprs + [":default_source_priority"]) + ")"
+    source_category_sql = (
+        "COALESCE(" + ", ".join(category_exprs + ["NULL"]) + ")"
+        if category_exprs
+        else "NULL"
+    )
     sql = text("""
         SELECT
             c.article_id,
@@ -59,17 +96,25 @@ def fetch_classified_news(engine, *, window_hours: int, run_time: datetime | Non
             c.themes,
             c.affected_tickers,
             c.raw_response,
+            {source_priority_sql} AS source_priority,
+            {source_category_sql} AS source_category,
+            a.source_name,
             a.published_at,
             a.fetched_at
         FROM public.news_classifications c
         JOIN public.news_articles a ON a.article_id = c.article_id
+        LEFT JOIN public.news_sources s ON s.feed_url = a.feed_url
         WHERE COALESCE(a.published_at, a.fetched_at, c.classified_at)
             >= (CAST(:run_time AS timestamptz) - (:window_hours * INTERVAL '1 hour'))
-    """)
+    """.format(source_priority_sql=source_priority_sql, source_category_sql=source_category_sql))
     return pd.read_sql(
         sql,
         engine,
-        params={"run_time": selected_run_time, "window_hours": window_hours},
+        params={
+            "run_time": selected_run_time,
+            "window_hours": window_hours,
+            "default_source_priority": DEFAULT_SOURCE_PRIORITY,
+        },
     )
 
 
@@ -135,11 +180,27 @@ def _signal_id(run_time: datetime, window_hours: int, dimension_type: str, dimen
 
 def _weighted_sentiment(records: list[dict]) -> float:
     numerator = sum(
-        float(r["sentiment_score"]) * float(r["impact_score"]) * float(r["confidence_score"])
+        float(r["sentiment_score"])
+        * float(r["impact_score"])
+        * float(r["confidence_score"])
+        * source_weight_factor(r)
         for r in records
     )
-    denominator = sum(float(r["impact_score"]) * float(r["confidence_score"]) for r in records)
+    denominator = sum(
+        float(r["impact_score"]) * float(r["confidence_score"]) * source_weight_factor(r)
+        for r in records
+    )
     return 0.0 if denominator == 0 else numerator / denominator
+
+
+def source_weight_factor(record: dict) -> float:
+    priority = record.get("source_priority")
+    try:
+        numeric = float(priority)
+    except (TypeError, ValueError):
+        numeric = DEFAULT_SOURCE_PRIORITY
+    numeric = min(max(numeric, 0), 100)
+    return numeric / 100.0
 
 
 def _score(weighted_sentiment: float, high_impact_count: int, article_count: int, *, positive: bool) -> float:
@@ -174,7 +235,7 @@ def aggregate_signal_records(
         neutral_count = article_count - positive_count - negative_count
         top_articles = sorted(
             grouped,
-            key=lambda r: float(r["impact_score"]) * float(r["confidence_score"]),
+            key=lambda r: float(r["impact_score"]) * float(r["confidence_score"]) * source_weight_factor(r),
             reverse=True,
         )[:5]
 

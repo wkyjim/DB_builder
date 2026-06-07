@@ -90,7 +90,34 @@ def score_news_regime(news_df: pd.DataFrame) -> tuple[float, float, list[str]]:
     risk_on = 0.0
     risk_off = 0.0
     drivers = []
-    risk_keywords = {"market sentiment", "ai", "fed", "rates", "oil", "defense", "nuclear"}
+    risk_keywords = {
+        "market sentiment",
+        "ai",
+        "fed",
+        "rates",
+        "oil",
+        "defense",
+        "nuclear",
+        "monetary policy",
+        "central banks",
+        "interest rates",
+        "inflation",
+        "financial stability",
+        "bank regulation",
+        "capital markets",
+        "etf regulation",
+        "crypto regulation",
+        "ai regulation",
+        "trade policy",
+        "fiscal policy",
+        "treasury market",
+        "labor market",
+        "housing",
+        "energy security",
+        "national security",
+        "defense spending",
+        "geopolitics",
+    }
 
     for row in news_df.to_dict(orient="records"):
         value = str(row.get("dimension_value", "")).lower()

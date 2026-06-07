@@ -24,7 +24,7 @@ def test_clean_html_removes_tags():
 
 
 def test_parse_feed_entries_normalizes_article():
-    source = NewsSource("Test", "rss", "https://example.com/rss")
+    source = NewsSource("Test", "rss", "https://example.com/rss", category="markets", priority=95)
     articles = parse_feed_entries(feedparser.parse(RSS), source)
 
     assert len(articles) == 1
@@ -32,3 +32,5 @@ def test_parse_feed_entries_normalizes_article():
     assert articles[0]["summary"] == "GPU demand rises."
     assert articles[0]["canonical_url"] == "https://example.com/a"
     assert "AI" in articles[0]["matched_keywords"]
+    assert articles[0]["source_priority"] == 95
+    assert articles[0]["source_category"] == "markets"
