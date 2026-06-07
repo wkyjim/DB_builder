@@ -11,6 +11,8 @@ from typing import Any
 import requests
 from sqlalchemy import text
 
+from db_builder.news_importance import sort_classification_queue
+
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_OLLAMA_MODEL = "deepseek-r1:14b"
@@ -43,7 +45,13 @@ def ollama_model() -> str:
     return os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
 
 
-def select_articles_for_classification(engine, *, limit: int | None = None, article_id: str | None = None) -> list[dict]:
+def select_articles_for_classification(
+    engine,
+    *,
+    limit: int | None = None,
+    article_id: str | None = None,
+    min_importance: float | None = None,
+) -> list[dict]:
     article_clause = "AND article_id = :article_id" if article_id else ""
     limit_clause = "LIMIT :limit" if limit is not None else ""
     params: dict[str, Any] = {}
@@ -58,18 +66,23 @@ def select_articles_for_classification(engine, *, limit: int | None = None, arti
             title,
             summary,
             source_name,
+            source_priority,
+            published_at,
+            fetched_at,
             matched_keywords,
             related_tickers,
             classification_attempts
         FROM public.news_articles
         WHERE classification_status = 'new'
         {article_clause}
-        ORDER BY fetched_at DESC NULLS LAST
-        {limit_clause}
+        ORDER BY source_priority DESC NULLS LAST,
+                 published_at DESC NULLS LAST,
+                 fetched_at DESC NULLS LAST
     """)
     with engine.begin() as conn:
         rows = conn.execute(sql, params).mappings().all()
-    return [dict(row) for row in rows]
+    articles = sort_classification_queue([dict(row) for row in rows], min_importance=min_importance)
+    return articles[:limit] if limit is not None else articles
 
 
 def article_payload(article: dict) -> dict:

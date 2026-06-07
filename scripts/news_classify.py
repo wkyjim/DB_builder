@@ -22,10 +22,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--article-id", default=None, help="Classify one article UUID.")
     parser.add_argument("--timeout", type=int, default=120, help="Ollama request timeout in seconds.")
     parser.add_argument("--max-seconds", type=float, default=None, help="Stop cleanly after this many elapsed seconds.")
+    parser.add_argument("--min-importance", type=float, default=None, help="Only classify articles at or above this importance score.")
+    parser.add_argument("--show-queue", action="store_true", help="Print selected queue ordering before classification.")
     parser.add_argument("--no-repair", action="store_true", help="Disable one-pass JSON repair.")
     parser.add_argument("--dry-run", action="store_true", help="Classify and print only; do not write.")
     parser.add_argument("--upsert-local", action="store_true", help="Persist classifications to local PostgreSQL.")
     return parser.parse_args()
+
+
+def print_queue(articles: list[dict]) -> None:
+    print("Classification queue:")
+    for rank, article in enumerate(articles, start=1):
+        reasons = article.get("importance_reasons") or []
+        print(
+            f"{rank}. {article.get('title')} | source={article.get('source_name')} "
+            f"source_priority={article.get('source_priority')} "
+            f"importance_score={article.get('importance_score')}"
+        )
+        if reasons:
+            print(f"   importance_reasons={'; '.join(reasons)}")
 
 
 def time_budget_reached(start_time: float, max_seconds: float | None, *, now_fn=time.monotonic) -> bool:
@@ -93,8 +108,14 @@ def main() -> None:
         engine,
         limit=args.limit,
         article_id=args.article_id,
+        min_importance=args.min_importance,
     )
     print(f"Selected {len(articles):,} article(s) for classification")
+    if args.show_queue:
+        print_queue(articles)
+        if dry_run:
+            print("[dry-run] queue displayed; classifications were not run")
+            return
     if dry_run:
         print("[dry-run] classifications will not be written")
 

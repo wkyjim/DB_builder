@@ -1,0 +1,264 @@
+"""Deterministic news importance scoring for classification queue ordering."""
+
+from __future__ import annotations
+
+import re
+
+
+IMPORTANT_TERMS: dict[str, list[str]] = {
+    "economic_data": [
+        "CPI",
+        "PPI",
+        "payrolls",
+        "NFP",
+        "jobs report",
+        "unemployment",
+        "jobless claims",
+        "GDP",
+        "PMI",
+        "ISM",
+        "retail sales",
+        "consumer confidence",
+        "inflation expectations",
+    ],
+    "central_banks": [
+        "Fed",
+        "Federal Reserve",
+        "FOMC",
+        "Powell",
+        "Waller",
+        "Bowman",
+        "ECB",
+        "Lagarde",
+        "BOJ",
+        "Ueda",
+        "PBOC",
+        "BOE",
+        "rate cut",
+        "rate hike",
+        "monetary policy",
+        "quantitative tightening",
+        "liquidity",
+    ],
+    "geopolitics": [
+        "Iran",
+        "Israel",
+        "Hezbollah",
+        "Hamas",
+        "Russia",
+        "Ukraine",
+        "Taiwan",
+        "China",
+        "South China Sea",
+        "NATO",
+        "sanctions",
+        "missile",
+        "drone",
+        "war",
+        "ceasefire",
+        "Strait of Hormuz",
+        "Red Sea",
+    ],
+    "fiscal_policy_trade": [
+        "tariff",
+        "tariffs",
+        "trade restrictions",
+        "export controls",
+        "tax bill",
+        "fiscal stimulus",
+        "budget deficit",
+        "debt ceiling",
+        "government spending",
+        "industrial policy",
+    ],
+    "regulation": [
+        "SEC",
+        "DOJ",
+        "FTC",
+        "antitrust",
+        "lawsuit",
+        "enforcement",
+        "approval",
+        "ban",
+        "investigation",
+        "crypto regulation",
+        "bank regulation",
+        "AI regulation",
+    ],
+    "sector_policy": [
+        "semiconductor subsidies",
+        "CHIPS Act",
+        "AI infrastructure",
+        "power grid",
+        "nuclear approval",
+        "uranium",
+        "defense spending",
+        "cybersecurity regulation",
+        "energy policy",
+    ],
+    "earnings_company_events": [
+        "earnings",
+        "results",
+        "revenue",
+        "profit",
+        "EPS",
+        "guidance",
+        "outlook",
+        "forecast",
+        "beat",
+        "miss",
+        "margin",
+        "demand",
+        "backlog",
+    ],
+    "corporate_actions": [
+        "merger",
+        "acquisition",
+        "takeover",
+        "buyout",
+        "spin-off",
+        "IPO",
+        "secondary offering",
+        "share buyback",
+        "dividend cut",
+    ],
+    "credit_stress": [
+        "default",
+        "bankruptcy",
+        "downgrade",
+        "liquidity crisis",
+        "bank failure",
+        "credit spreads",
+        "distressed debt",
+    ],
+    "commodities_energy_shock": [
+        "oil",
+        "Brent",
+        "WTI",
+        "OPEC",
+        "natural gas",
+        "LNG",
+        "copper",
+        "gold",
+        "uranium",
+        "inventories",
+        "supply disruption",
+    ],
+}
+
+GENERIC_TERMS = [
+    "stocks rise",
+    "stocks fall",
+    "market today",
+    "what to watch",
+    "things to know",
+    "analyst says",
+    "could be",
+    "should you buy",
+    "best stocks",
+    "underperforming",
+    "watch these stocks",
+]
+
+CATEGORY_WEIGHTS = {
+    "economic_data": 35,
+    "central_banks": 35,
+    "geopolitics": 34,
+    "fiscal_policy_trade": 30,
+    "regulation": 26,
+    "sector_policy": 30,
+    "earnings_company_events": 24,
+    "corporate_actions": 30,
+    "credit_stress": 34,
+    "commodities_energy_shock": 28,
+}
+
+GENERIC_PENALTY = 25
+MAX_SCORE = 100
+
+
+def _term_pattern(term: str) -> re.Pattern:
+    escaped = re.escape(term.lower())
+    return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])")
+
+
+IMPORTANT_PATTERNS = {
+    category: [(term, _term_pattern(term)) for term in terms]
+    for category, terms in IMPORTANT_TERMS.items()
+}
+GENERIC_PATTERNS = [(term, _term_pattern(term)) for term in GENERIC_TERMS]
+
+
+def _score_text(text: str, *, multiplier: float, reason_prefix: str) -> tuple[float, list[str], set[str]]:
+    score = 0
+    reasons = []
+    matched_categories = set()
+
+    for category, patterns in IMPORTANT_PATTERNS.items():
+        matches = [term for term, pattern in patterns if pattern.search(text)]
+        if not matches:
+            continue
+        matched_categories.add(category)
+        score += CATEGORY_WEIGHTS[category] * multiplier
+        score += min(len(matches) - 1, 3) * 5 * multiplier
+        reasons.append(f"{reason_prefix}{category}: {', '.join(matches[:4])}")
+
+    for term, pattern in GENERIC_PATTERNS:
+        if pattern.search(text):
+            score -= GENERIC_PENALTY * multiplier
+            reasons.append(f"{reason_prefix}generic: {term}")
+
+    return score, reasons, matched_categories
+
+
+def score_news_importance(title: str | None, summary: str | None = None) -> dict:
+    title_score, title_reasons, title_categories = _score_text(
+        (title or "").lower(),
+        multiplier=1.0,
+        reason_prefix="title ",
+    )
+    summary_score, summary_reasons, summary_categories = _score_text(
+        (summary or "").lower(),
+        multiplier=0.35,
+        reason_prefix="summary ",
+    )
+
+    score = title_score + summary_score
+    reasons = title_reasons + summary_reasons
+    matched_categories = title_categories | summary_categories
+
+    if len(matched_categories) >= 2:
+        score += 10
+        reasons.append("multiple important categories")
+
+    normalized = max(0, min(MAX_SCORE, round(score, 2)))
+    return {
+        "importance_score": float(normalized),
+        "importance_reasons": reasons,
+    }
+
+
+def annotate_article_importance(article: dict) -> dict:
+    row = article.copy()
+    result = score_news_importance(row.get("title"), row.get("summary"))
+    row.update(result)
+    return row
+
+
+def sort_classification_queue(articles: list[dict], *, min_importance: float | None = None) -> list[dict]:
+    annotated = [annotate_article_importance(article) for article in articles]
+    if min_importance is not None:
+        annotated = [article for article in annotated if article["importance_score"] >= min_importance]
+
+    return sorted(
+        annotated,
+        key=lambda article: (
+            article.get("importance_score") or 0,
+            article.get("source_priority") or 0,
+            article.get("published_at") is not None,
+            article.get("published_at"),
+            article.get("fetched_at") is not None,
+            article.get("fetched_at"),
+        ),
+        reverse=True,
+    )

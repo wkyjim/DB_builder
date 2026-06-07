@@ -11,6 +11,7 @@ from db_builder.news_classifier import (
     classify_with_ollama,
     parse_model_response,
     persist_classification,
+    select_articles_for_classification,
     strip_deepseek_thinking,
     validate_classification,
 )
@@ -185,3 +186,56 @@ def test_time_budget_commits_completed_then_stops_cleanly():
 
     assert result == {"completed": 1, "failed": 0, "time_budget_reached": True}
     assert persisted == ["00000000-0000-0000-0000-000000000001"]
+
+
+def test_classifier_selection_sorts_by_importance_before_recency():
+    class FakeRows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [
+                {
+                    "article_id": "00000000-0000-0000-0000-000000000001",
+                    "title": "Stocks rise in market today",
+                    "summary": "",
+                    "source_name": "Recent",
+                    "source_priority": 100,
+                    "published_at": "2026-06-07",
+                    "fetched_at": "2026-06-07",
+                    "matched_keywords": [],
+                    "related_tickers": [],
+                    "classification_attempts": 0,
+                },
+                {
+                    "article_id": "00000000-0000-0000-0000-000000000002",
+                    "title": "Fed Powell warns CPI inflation may force rate hike",
+                    "summary": "",
+                    "source_name": "Important",
+                    "source_priority": 50,
+                    "published_at": "2026-06-01",
+                    "fetched_at": "2026-06-01",
+                    "matched_keywords": [],
+                    "related_tickers": [],
+                    "classification_attempts": 0,
+                },
+            ]
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, *args, **kwargs):
+            return FakeRows()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    queue = select_articles_for_classification(FakeEngine(), limit=2)
+
+    assert queue[0]["source_name"] == "Important"
+    assert queue[0]["importance_score"] > queue[1]["importance_score"]
