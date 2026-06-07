@@ -95,6 +95,15 @@ def test_canonical_theme_mapping():
     assert canonical_theme("treasury market") == "Treasury Market"
     assert canonical_theme("energy security") == "Energy Security"
     assert canonical_theme("national security") == "National Security"
+    assert canonical_theme("equity markets") == "Market Sentiment"
+    assert canonical_theme("stocks") == "Market Sentiment"
+    assert canonical_theme("gaming sector") == "Consumer Discretionary"
+    assert canonical_theme("technology sector") == "Technology"
+    assert canonical_theme("banking sector") == "Financials"
+    assert canonical_theme("cryptocurrency market") == "Crypto"
+    assert canonical_theme("healthcare sector") == "Healthcare"
+    assert canonical_theme("energy sector") == "Energy"
+    assert canonical_theme("retail sector") == "Consumer Discretionary"
 
 
 def test_ticker_normalization_rejects_generic_regions_and_bad_dotted_values():

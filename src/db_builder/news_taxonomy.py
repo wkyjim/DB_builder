@@ -15,7 +15,10 @@ CANONICAL_THEME_MAP = {
     "central bank": "Central Banks",
     "central banks": "Central Banks",
     "crypto regulation": "Crypto Regulation",
+    "cryptocurrency market": "Crypto",
+    "equity markets": "Market Sentiment",
     "stock market": "Market Sentiment",
+    "stocks": "Market Sentiment",
     "investment performance": "Market Sentiment",
     "interest rates": "Interest Rates",
     "inflation": "Inflation",
@@ -43,11 +46,17 @@ CANONICAL_THEME_MAP = {
     "nuclear energy": "Nuclear",
     "power grid": "Power Infrastructure",
     "electric grid": "Power Infrastructure",
+    "banking sector": "Financials",
     "financial services": "Financials",
+    "technology sector": "Technology",
     "semiconductor": "Semiconductors",
     "semiconductors": "Semiconductors",
     "cloud": "Cloud Computing",
     "cloud computing": "Cloud Computing",
+    "gaming sector": "Consumer Discretionary",
+    "retail sector": "Consumer Discretionary",
+    "healthcare sector": "Healthcare",
+    "energy sector": "Energy",
 }
 
 GENERIC_REGION_TOKENS = {
