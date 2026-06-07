@@ -11,6 +11,7 @@ from db_builder.news_classifier import (
     classify_with_ollama,
     parse_model_response,
     persist_classification,
+    reset_new_for_premium_sources,
     select_articles_for_classification,
     strip_deepseek_thinking,
     validate_classification,
@@ -201,6 +202,7 @@ def test_classifier_selection_sorts_by_importance_before_recency():
                     "summary": "",
                     "source_name": "Recent",
                     "source_priority": 100,
+                    "source_category": "markets",
                     "published_at": "2026-06-07",
                     "fetched_at": "2026-06-07",
                     "matched_keywords": [],
@@ -213,6 +215,7 @@ def test_classifier_selection_sorts_by_importance_before_recency():
                     "summary": "",
                     "source_name": "Important",
                     "source_priority": 50,
+                    "source_category": "markets",
                     "published_at": "2026-06-01",
                     "fetched_at": "2026-06-01",
                     "matched_keywords": [],
@@ -239,3 +242,131 @@ def test_classifier_selection_sorts_by_importance_before_recency():
 
     assert queue[0]["source_name"] == "Important"
     assert queue[0]["importance_score"] > queue[1]["importance_score"]
+
+
+def test_classifier_selection_sql_filters_source_priority_min():
+    captured = {}
+
+    class FakeRows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params):
+            captured["sql"] = str(sql)
+            captured["params"] = params
+            return FakeRows()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    select_articles_for_classification(FakeEngine(), source_priority_min=85)
+
+    assert "FROM public.news_articles a" in captured["sql"]
+    assert "a.source_name" in captured["sql"]
+    assert "WHERE a.classification_status = 'new'" in captured["sql"]
+    assert "source_priority_min" in captured["sql"]
+    assert captured["params"]["source_priority_min"] == 85
+
+
+def test_classifier_selection_sql_filters_lookback_hours():
+    captured = {}
+
+    class FakeRows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params):
+            captured["sql"] = str(sql)
+            captured["params"] = params
+            return FakeRows()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    select_articles_for_classification(FakeEngine(), source_priority_min=85, lookback_hours=48)
+
+    assert "lookback_hours" in captured["sql"]
+    assert captured["params"]["lookback_hours"] == 48
+
+
+def test_classifier_selection_sql_filters_source_category():
+    captured = {}
+
+    class FakeRows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params):
+            captured["sql"] = str(sql)
+            captured["params"] = params
+            return FakeRows()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    select_articles_for_classification(FakeEngine(), source_category="economy")
+
+    assert "source_category" in captured["sql"]
+    assert captured["params"]["source_category"] == "economy"
+
+
+def test_reset_new_for_premium_does_not_affect_analyzed_articles():
+    captured = {}
+
+    class FakeResult:
+        rowcount = 3
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params):
+            captured["sql"] = str(sql)
+            captured["params"] = params
+            return FakeResult()
+
+    class FakeEngine:
+        def begin(self):
+            return FakeConn()
+
+    count = reset_new_for_premium_sources(FakeEngine(), source_priority_min=85, lookback_hours=48)
+
+    assert count == 3
+    assert "classification_status IN ('failed', 'skipped')" in captured["sql"]
+    assert "analyzed" not in captured["sql"]

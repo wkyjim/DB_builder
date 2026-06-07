@@ -51,38 +51,85 @@ def select_articles_for_classification(
     limit: int | None = None,
     article_id: str | None = None,
     min_importance: float | None = None,
+    source_priority_min: float | None = None,
+    lookback_hours: float | None = None,
+    source_category: str | None = None,
 ) -> list[dict]:
     article_clause = "AND article_id = :article_id" if article_id else ""
-    limit_clause = "LIMIT :limit" if limit is not None else ""
+    source_priority_clause = "AND COALESCE(a.source_priority, s.source_priority, s.priority, :default_source_priority) >= :source_priority_min" if source_priority_min is not None else ""
+    lookback_clause = "AND COALESCE(a.published_at, a.fetched_at) >= now() - (:lookback_hours * INTERVAL '1 hour')" if lookback_hours is not None else ""
+    source_category_clause = "AND COALESCE(a.source_category, s.source_category, s.category) = :source_category" if source_category else ""
     params: dict[str, Any] = {}
     if article_id:
         params["article_id"] = article_id
     if limit is not None:
         params["limit"] = limit
+    if source_priority_min is not None:
+        params["source_priority_min"] = source_priority_min
+    if lookback_hours is not None:
+        params["lookback_hours"] = lookback_hours
+    if source_category:
+        params["source_category"] = source_category
+    params["default_source_priority"] = 0
 
     sql = text(f"""
         SELECT
-            article_id,
-            title,
-            summary,
-            source_name,
-            source_priority,
-            published_at,
-            fetched_at,
-            matched_keywords,
-            related_tickers,
-            classification_attempts
-        FROM public.news_articles
-        WHERE classification_status = 'new'
+            a.article_id,
+            a.title,
+            a.summary,
+            a.source_name,
+            COALESCE(a.source_priority, s.source_priority, s.priority, :default_source_priority) AS source_priority,
+            COALESCE(a.source_category, s.source_category, s.category) AS source_category,
+            a.published_at,
+            a.fetched_at,
+            a.matched_keywords,
+            a.related_tickers,
+            a.classification_attempts
+        FROM public.news_articles a
+        LEFT JOIN public.news_sources s ON s.feed_url = a.feed_url
+        WHERE a.classification_status = 'new'
         {article_clause}
-        ORDER BY source_priority DESC NULLS LAST,
-                 published_at DESC NULLS LAST,
-                 fetched_at DESC NULLS LAST
+        {source_priority_clause}
+        {lookback_clause}
+        {source_category_clause}
+        ORDER BY COALESCE(a.source_priority, s.source_priority, s.priority, :default_source_priority) DESC NULLS LAST,
+                 a.published_at DESC NULLS LAST,
+                 a.fetched_at DESC NULLS LAST
     """)
     with engine.begin() as conn:
         rows = conn.execute(sql, params).mappings().all()
     articles = sort_classification_queue([dict(row) for row in rows], min_importance=min_importance)
     return articles[:limit] if limit is not None else articles
+
+
+def reset_new_for_premium_sources(
+    engine,
+    *,
+    source_priority_min: float,
+    lookback_hours: float = 24,
+    source_category: str | None = None,
+) -> int:
+    source_category_clause = "AND COALESCE(a.source_category, s.source_category, s.category) = :source_category" if source_category else ""
+    params: dict[str, Any] = {
+        "source_priority_min": source_priority_min,
+        "lookback_hours": lookback_hours,
+        "source_category": source_category,
+        "default_source_priority": 0,
+    }
+    sql = text(f"""
+        UPDATE public.news_articles a
+        SET classification_status = 'new',
+            last_classification_error = NULL
+        FROM public.news_sources s
+        WHERE s.feed_url = a.feed_url
+          AND COALESCE(a.source_priority, s.source_priority, s.priority, :default_source_priority) >= :source_priority_min
+          AND COALESCE(a.published_at, a.fetched_at) >= now() - (:lookback_hours * INTERVAL '1 hour')
+          AND a.classification_status IN ('failed', 'skipped')
+          {source_category_clause}
+    """)
+    with engine.begin() as conn:
+        result = conn.execute(sql, params)
+    return int(result.rowcount or 0)
 
 
 def article_payload(article: dict) -> dict:

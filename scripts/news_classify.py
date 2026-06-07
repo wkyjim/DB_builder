@@ -12,6 +12,7 @@ from db_builder.news_classifier import (
     ollama_model,
     persist_classification,
     record_classification_failure,
+    reset_new_for_premium_sources,
     select_articles_for_classification,
 )
 
@@ -23,6 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=120, help="Ollama request timeout in seconds.")
     parser.add_argument("--max-seconds", type=float, default=None, help="Stop cleanly after this many elapsed seconds.")
     parser.add_argument("--min-importance", type=float, default=None, help="Only classify articles at or above this importance score.")
+    parser.add_argument("--source-priority-min", type=float, default=None, help="Only classify sources at or above this priority.")
+    parser.add_argument("--lookback-hours", type=float, default=24, help="Recent article lookback for premium-source filtering/reset.")
+    parser.add_argument("--source-category", default=None, help="Only classify articles from this source category.")
+    parser.add_argument("--reset-new-for-premium", action="store_true", help="Reset recent failed/skipped premium-source articles back to new.")
     parser.add_argument("--show-queue", action="store_true", help="Print selected queue ordering before classification.")
     parser.add_argument("--no-repair", action="store_true", help="Disable one-pass JSON repair.")
     parser.add_argument("--dry-run", action="store_true", help="Classify and print only; do not write.")
@@ -37,6 +42,7 @@ def print_queue(articles: list[dict]) -> None:
         print(
             f"{rank}. {article.get('title')} | source={article.get('source_name')} "
             f"source_priority={article.get('source_priority')} "
+            f"source_category={article.get('source_category')} "
             f"importance_score={article.get('importance_score')}"
         )
         if reasons:
@@ -104,11 +110,28 @@ def main() -> None:
     args = parse_args()
     dry_run = args.dry_run or not args.upsert_local
     engine = local_engine()
+    if args.reset_new_for_premium:
+        if args.source_priority_min is None:
+            raise SystemExit("--reset-new-for-premium requires --source-priority-min")
+        if dry_run:
+            print("[dry-run] premium reset was not written")
+        else:
+            reset_count = reset_new_for_premium_sources(
+                engine,
+                source_priority_min=args.source_priority_min,
+                lookback_hours=args.lookback_hours,
+                source_category=args.source_category,
+            )
+            print(f"Reset {reset_count:,} premium article(s) to classification_status='new'")
+
     articles = select_articles_for_classification(
         engine,
         limit=args.limit,
         article_id=args.article_id,
         min_importance=args.min_importance,
+        source_priority_min=args.source_priority_min,
+        lookback_hours=args.lookback_hours if args.source_priority_min is not None or args.source_category else None,
+        source_category=args.source_category,
     )
     print(f"Selected {len(articles):,} article(s) for classification")
     if args.show_queue:
