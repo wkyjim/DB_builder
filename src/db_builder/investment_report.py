@@ -117,6 +117,60 @@ def fetch_latest_sector_signals(engine, *, window_hours: int, limit: int = 20) -
         return pd.DataFrame()
 
 
+def fetch_latest_market_regime_v2(engine, *, window_hours: int) -> pd.DataFrame:
+    sql = text("""
+        SELECT *
+        FROM public.market_regime_v2
+        WHERE window_hours = :window_hours
+        ORDER BY run_time DESC
+        LIMIT 1
+    """)
+    try:
+        return pd.read_sql(sql, engine, params={"window_hours": window_hours})
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_latest_sector_regimes(engine, *, window_hours: int, limit: int = 20) -> pd.DataFrame:
+    sql = text("""
+        WITH latest_run AS (
+            SELECT MAX(run_time) AS run_time
+            FROM public.sector_regimes
+            WHERE window_hours = :window_hours
+        )
+        SELECT s.*
+        FROM public.sector_regimes s
+        JOIN latest_run r ON r.run_time = s.run_time
+        WHERE s.window_hours = :window_hours
+        ORDER BY s.final_score DESC, s.sector_name
+        LIMIT :limit
+    """)
+    try:
+        return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_latest_sector_rotation(engine, *, window_hours: int, limit: int = 30) -> pd.DataFrame:
+    sql = text("""
+        WITH latest_run AS (
+            SELECT MAX(run_time) AS run_time
+            FROM public.sector_rotation_signals
+            WHERE window_hours = :window_hours
+        )
+        SELECT s.*
+        FROM public.sector_rotation_signals s
+        JOIN latest_run r ON r.run_time = s.run_time
+        WHERE s.window_hours = :window_hours
+        ORDER BY s.rotation_rank ASC, s.sector_name
+        LIMIT :limit
+    """)
+    try:
+        return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+    except Exception:
+        return pd.DataFrame()
+
+
 def fetch_recent_articles(engine, *, window_hours: int, limit: int = 50) -> pd.DataFrame:
     sql = text("""
         SELECT
@@ -205,9 +259,12 @@ def fetch_latest_watchlist_quality(engine, *, tickers: list[str] | None = None) 
 
 def collect_report_data(engine, *, window_hours: int) -> dict:
     regime = fetch_latest_market_regime(engine, window_hours=window_hours)
+    regime_v2 = fetch_latest_market_regime_v2(engine, window_hours=window_hours)
     news_signals = fetch_latest_news_signals(engine, window_hours=window_hours)
     opportunities = fetch_latest_opportunity_signals(engine, window_hours=window_hours)
     sector_signals = fetch_latest_sector_signals(engine, window_hours=window_hours)
+    sector_regimes = fetch_latest_sector_regimes(engine, window_hours=window_hours)
+    sector_rotation = fetch_latest_sector_rotation(engine, window_hours=window_hours)
     articles = fetch_recent_articles(engine, window_hours=window_hours)
     macro = fetch_latest_macro(engine)
     watchlist = fetch_latest_watchlist_quality(engine)
@@ -215,9 +272,12 @@ def collect_report_data(engine, *, window_hours: int) -> dict:
         "generated_at": datetime.now(timezone.utc),
         "window_hours": window_hours,
         "regime": regime.to_dict(orient="records"),
+        "regime_v2": regime_v2.to_dict(orient="records"),
         "news_signals": news_signals.to_dict(orient="records"),
         "opportunities": opportunities.to_dict(orient="records"),
         "sector_signals": sector_signals.to_dict(orient="records"),
+        "sector_regimes": sector_regimes.to_dict(orient="records"),
+        "sector_rotation": sector_rotation.to_dict(orient="records"),
         "articles": articles.to_dict(orient="records"),
         "macro": macro.to_dict(orient="records"),
         "watchlist": watchlist.to_dict(orient="records"),
@@ -246,13 +306,33 @@ def render_theme_articles(signal: dict, articles_by_id: dict[str, dict], *, limi
     return rendered
 
 
+def _driver_lines(drivers, *, limit: int = 8) -> list[str]:
+    if isinstance(drivers, str):
+        try:
+            drivers = json.loads(drivers)
+        except json.JSONDecodeError:
+            return [drivers]
+    if isinstance(drivers, dict):
+        lines = []
+        for group, values in drivers.items():
+            for value in _as_list(values):
+                lines.append(f"{group}: {value}")
+                if len(lines) >= limit:
+                    return lines
+        return lines
+    return [str(value) for value in _as_list(drivers)[:limit]]
+
+
 def render_investment_report(data: dict) -> str:
     generated_at = data.get("generated_at") or datetime.now(timezone.utc)
     window_hours = int(data.get("window_hours") or 24)
     regime_rows = data.get("regime") or []
+    regime_v2_rows = data.get("regime_v2") or []
     news_signals = data.get("news_signals") or []
     opportunities = data.get("opportunities") or []
     sector_signals = data.get("sector_signals") or []
+    sector_regimes = data.get("sector_regimes") or []
+    sector_rotation = data.get("sector_rotation") or []
     articles = data.get("articles") or []
     macro = data.get("macro") or []
     watchlist = data.get("watchlist") or []
@@ -301,6 +381,29 @@ def render_investment_report(data: dict) -> str:
             lines.extend([f"  - {driver}" for driver in drivers[:8]])
     else:
         lines.append("No market regime signal is available yet.")
+
+    lines.extend(["", "## Market Regime 2.0", ""])
+    regime_v2 = regime_v2_rows[0] if regime_v2_rows else {}
+    if regime_v2:
+        lines.extend(
+            [
+                f"- Market regime: **{regime_v2.get('market_regime')}**",
+                f"- Market phase: **{regime_v2.get('market_phase')}**",
+                f"- Confidence: `{format_value(regime_v2.get('confidence'))}`",
+                f"- Market strength: `{regime_v2.get('market_strength')}`",
+                f"- Trend: `{regime_v2.get('trend_state')}`",
+                f"- Momentum: `{regime_v2.get('momentum_state')}`",
+                f"- Volatility: `{regime_v2.get('volatility_state')}`",
+                f"- Breadth: `{regime_v2.get('breadth_state')}`",
+                f"- Risk appetite: `{regime_v2.get('risk_appetite_state')}`",
+            ]
+        )
+        drivers = _driver_lines(regime_v2.get("drivers"))
+        if drivers:
+            lines.append("- Top drivers:")
+            lines.extend([f"  - {driver}" for driver in drivers[:8]])
+    else:
+        lines.append("No Market Regime 2.0 signal is available yet.")
 
     lines.extend(["", "## Top News Themes", ""])
     theme_signals = [s for s in news_signals if s.get("dimension_type") == "theme"]
@@ -362,6 +465,52 @@ def render_investment_report(data: dict) -> str:
     else:
         lines.append("No sector intelligence signals are available yet.")
 
+    lines.extend(["", "## Sector Regimes", ""])
+    if sector_regimes:
+        for signal in sorted(sector_regimes, key=lambda s: _float(s.get("final_score")), reverse=True):
+            etfs = ", ".join(_as_list(signal.get("related_etfs"))) or "n/a"
+            lines.append(
+                f"- **{signal.get('sector_name')}**: regime `{signal.get('sector_regime')}`, "
+                f"phase `{signal.get('cycle_phase')}`, confidence `{format_value(signal.get('confidence'))}`, "
+                f"final `{format_value(signal.get('final_score'))}`, ETFs `{etfs}`"
+            )
+    else:
+        lines.append("No sector regime signals are available yet.")
+
+    lines.extend(["", "## Sector Rotation", ""])
+    if sector_rotation:
+        overweight = [
+            signal for signal in sector_rotation
+            if signal.get("allocation_bias") in {"overweight", "modest_overweight"}
+        ][:5]
+        defensive = [
+            signal for signal in sector_rotation
+            if signal.get("allocation_bias") in {"underweight", "avoid"}
+        ][:5]
+        if overweight:
+            lines.append("- Overweight candidates:")
+            for signal in overweight:
+                etfs = ", ".join(_as_list(signal.get("related_etfs"))) or "n/a"
+                lines.append(
+                    f"  - **{signal.get('sector_name')}**: rank `{signal.get('rotation_rank')}`, "
+                    f"score `{format_value(signal.get('rotation_score'))}`, "
+                    f"action `{signal.get('recommended_action')}`, ETFs `{etfs}`"
+                )
+        else:
+            lines.append("- No overweight sector rotation candidates are available.")
+        if defensive:
+            lines.append("- Underweight / avoid candidates:")
+            for signal in defensive:
+                etfs = ", ".join(_as_list(signal.get("related_etfs"))) or "n/a"
+                lines.append(
+                    f"  - **{signal.get('sector_name')}**: bias `{signal.get('allocation_bias')}`, "
+                    f"action `{signal.get('recommended_action')}`, ETFs `{etfs}`"
+                )
+        else:
+            lines.append("- No underweight or avoid sector rotation signals are available.")
+    else:
+        lines.append("No sector rotation signals are available yet.")
+
     lines.extend(["", "## Watchlist Commentary", ""])
     if watchlist:
         for row in watchlist[:12]:
@@ -386,6 +535,8 @@ def render_investment_report(data: dict) -> str:
         lines.append("- Opportunity scanner filters are currently strict; zero passing names is an expected valid result.")
     if not regime:
         lines.append("- Market regime table has no matching local rows.")
+    if not regime_v2_rows:
+        lines.append("- Market Regime 2.0 table has no matching local rows.")
     if not news_signals:
         lines.append("- News signal table has no matching local rows.")
 

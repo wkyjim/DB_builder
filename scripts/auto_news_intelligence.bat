@@ -21,6 +21,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if (-not (Invoke-RetryPython 'scripts\market_regime.py' 'market_regime.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'market_regime.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\opportunity_report.py' 'opportunity_report.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'opportunity_report.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\sector_intelligence.py' 'sector_intelligence.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_intelligence.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\market_regime_v2.py' 'market_regime_v2.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'market_regime_v2.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\sector_regime.py' 'sector_regime.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_regime.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\sector_rotation.py' 'sector_rotation.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_rotation.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\investment_report.py' 'investment_report.py' @('--save', '--window-hours', '24', '--no-quality-summary'))) { Write-Log 'ERROR' 'investment_report.py failed after 3 retries'; exit 1 }" ^
   "Write-Log 'SUCCESS' 'auto_news_intelligence workflow complete'; exit 0"
 

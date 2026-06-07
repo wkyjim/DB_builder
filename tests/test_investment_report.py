@@ -40,6 +40,20 @@ def sample_data(opportunities=None, article_count=2):
                 "drivers": ["macro:^VIX pct_chg=4.0"],
             }
         ],
+        "regime_v2": [
+            {
+                "market_regime": "risk_off",
+                "market_phase": "correction_in_bull",
+                "confidence": 0.38,
+                "market_strength": "moderate",
+                "trend_state": "downtrend",
+                "momentum_state": "negative",
+                "volatility_state": "elevated",
+                "breadth_state": "weak",
+                "risk_appetite_state": "risk_reducing",
+                "drivers": {"risk_appetite": ["VIX close=24 pct_chg=6"], "technical": ["QQQ technical=35"]},
+            }
+        ],
         "news_signals": [
             {
                 "dimension_type": "theme",
@@ -73,6 +87,34 @@ def sample_data(opportunities=None, article_count=2):
                 "top_themes": ["AI", "Semiconductors"],
             }
         ],
+        "sector_regimes": [
+            {
+                "sector_name": "Semiconductors",
+                "related_etfs": ["SMH", "SOXX"],
+                "sector_regime": "bull",
+                "cycle_phase": "mid_bull",
+                "confidence": 0.44,
+                "final_score": 72,
+            }
+        ],
+        "sector_rotation": [
+            {
+                "sector_name": "Semiconductors",
+                "related_etfs": ["SMH", "SOXX"],
+                "rotation_rank": 1,
+                "rotation_score": 70,
+                "allocation_bias": "overweight",
+                "recommended_action": "add",
+            },
+            {
+                "sector_name": "Real Estate",
+                "related_etfs": ["XLRE"],
+                "rotation_rank": 12,
+                "rotation_score": 32,
+                "allocation_bias": "underweight",
+                "recommended_action": "trim",
+            },
+        ],
         "articles": articles,
         "macro": [{"symbol": "^VIX", "name": "Volatility", "pct_chg": 4.0, "close": 20}],
         "watchlist": [{"ticker": "SMH", "close": 250, "pct_chg": 1.2, "rsi_14": 55.2}],
@@ -84,10 +126,13 @@ def test_report_includes_required_sections_and_regime_confidence():
 
     assert "## Executive Summary" in markdown
     assert "## Market Regime" in markdown
+    assert "## Market Regime 2.0" in markdown
     assert "## Top News Themes" in markdown
     assert "## Risk Signals" in markdown
     assert "## Opportunity Signals" in markdown
     assert "## Sector Intelligence" in markdown
+    assert "## Sector Regimes" in markdown
+    assert "## Sector Rotation" in markdown
     assert "## Watchlist Commentary" in markdown
     assert "## Data Quality Notes" in markdown
     assert "Confidence: `0.42`" in markdown
@@ -137,6 +182,24 @@ def test_report_renders_sector_intelligence():
     assert "**Semiconductors**: final `65.5`" in markdown
     assert "ETFs `SMH, SOXX`" in markdown
     assert "Top themes: AI, Semiconductors" in markdown
+
+
+def test_report_renders_market_regime_v2():
+    markdown = render_investment_report(sample_data())
+
+    assert "Market regime: **risk_off**" in markdown
+    assert "Market phase: **correction_in_bull**" in markdown
+    assert "risk_appetite: VIX close=24 pct_chg=6" in markdown
+
+
+def test_report_renders_sector_regimes_and_rotation():
+    markdown = render_investment_report(sample_data())
+
+    assert "**Semiconductors**: regime `bull`, phase `mid_bull`" in markdown
+    assert "Overweight candidates:" in markdown
+    assert "**Semiconductors**: rank `1`, score `70`" in markdown
+    assert "Underweight / avoid candidates:" in markdown
+    assert "**Real Estate**: bias `underweight`" in markdown
 
 
 def test_report_sector_intelligence_fallback():
