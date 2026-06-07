@@ -6,3 +6,5 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 pandas_market_calendars
+feedparser
+beautifulsoup4

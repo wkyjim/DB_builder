@@ -1,0 +1,359 @@
+"""Generate local markdown investment intelligence reports."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+from sqlalchemy import text
+
+from db_builder.opportunity_scanner import WATCHLIST_UNIVERSE
+
+
+LOW_ARTICLE_COUNT_THRESHOLD = 10
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _float(value, default: float = 0.0) -> float:
+    if pd.isna(value):
+        return default
+    return float(value)
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return []
+
+
+def format_value(value, digits: int = 4) -> str:
+    if value is None or pd.isna(value):
+        return "n/a"
+    if isinstance(value, float):
+        return str(round(value, digits))
+    return str(value)
+
+
+def fetch_latest_market_regime(engine, *, window_hours: int) -> pd.DataFrame:
+    sql = text("""
+        SELECT *
+        FROM public.market_regime_signals
+        WHERE window_hours = :window_hours
+        ORDER BY run_time DESC
+        LIMIT 1
+    """)
+    return pd.read_sql(sql, engine, params={"window_hours": window_hours})
+
+
+def fetch_latest_news_signals(engine, *, window_hours: int, limit: int = 20) -> pd.DataFrame:
+    sql = text("""
+        WITH latest_run AS (
+            SELECT MAX(run_time) AS run_time
+            FROM public.news_signals
+            WHERE window_hours = :window_hours
+        )
+        SELECT s.*
+        FROM public.news_signals s
+        JOIN latest_run r ON r.run_time = s.run_time
+        WHERE s.window_hours = :window_hours
+        ORDER BY GREATEST(s.opportunity_score, s.risk_score) DESC,
+                 s.article_count DESC,
+                 s.dimension_value
+        LIMIT :limit
+    """)
+    return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+
+
+def fetch_latest_opportunity_signals(engine, *, window_hours: int, limit: int = 20) -> pd.DataFrame:
+    sql = text("""
+        WITH latest_run AS (
+            SELECT MAX(run_time) AS run_time
+            FROM public.opportunity_signals
+            WHERE window_hours = :window_hours
+        )
+        SELECT o.*
+        FROM public.opportunity_signals o
+        JOIN latest_run r ON r.run_time = o.run_time
+        WHERE o.window_hours = :window_hours
+        ORDER BY o.opportunity_score DESC, o.risk_score DESC, o.ticker
+        LIMIT :limit
+    """)
+    return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+
+
+def fetch_recent_articles(engine, *, window_hours: int, limit: int = 50) -> pd.DataFrame:
+    sql = text("""
+        SELECT
+            a.article_id,
+            a.title,
+            a.source_name,
+            a.url,
+            a.published_at,
+            c.sentiment_score,
+            c.impact_score,
+            c.confidence_score,
+            c.themes,
+            c.affected_tickers
+        FROM public.news_articles a
+        LEFT JOIN public.news_classifications c ON c.article_id = a.article_id
+        WHERE COALESCE(a.published_at, a.fetched_at, c.classified_at)
+            >= (now() - (:window_hours * INTERVAL '1 hour'))
+        ORDER BY COALESCE(c.impact_score, 0) DESC,
+                 COALESCE(a.published_at, a.fetched_at) DESC
+        LIMIT :limit
+    """)
+    return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+
+
+def fetch_latest_macro(engine, *, limit: int = 12) -> pd.DataFrame:
+    sql = text("""
+        SELECT DISTINCT ON (symbol)
+            symbol,
+            name,
+            asset_type,
+            date,
+            close,
+            pct_chg
+        FROM public.macro
+        WHERE pct_chg IS NOT NULL
+        ORDER BY symbol, date DESC
+    """)
+    df = pd.read_sql(sql, engine)
+    if df.empty:
+        return df
+    df["_abs_move"] = df["pct_chg"].astype(float).abs()
+    return df.sort_values("_abs_move", ascending=False).head(limit).drop(columns=["_abs_move"])
+
+
+def fetch_latest_watchlist_quality(engine, *, tickers: list[str] | None = None) -> pd.DataFrame:
+    selected_tickers = tickers or sorted(WATCHLIST_UNIVERSE)
+    params = {"tickers": selected_tickers}
+    sql = text(f"""
+        WITH latest_raw AS (
+            SELECT DISTINCT ON (ticker)
+                ticker,
+                date,
+                close,
+                pct_chg
+            FROM public.us_equities
+            ORDER BY ticker, date DESC
+        ),
+        latest_indicators AS (
+            SELECT DISTINCT ON (ticker)
+                ticker,
+                date AS indicator_date,
+                rsi_14,
+                ma_50,
+                ma_200,
+                return_20d
+            FROM public.us_equities_indicators
+            ORDER BY ticker, date DESC
+        )
+        SELECT
+            r.ticker,
+            r.date,
+            r.close,
+            r.pct_chg,
+            i.indicator_date,
+            i.rsi_14,
+            i.ma_50,
+            i.ma_200,
+            i.return_20d
+        FROM latest_raw r
+        LEFT JOIN latest_indicators i ON i.ticker = r.ticker
+        WHERE r.ticker = ANY(:tickers)
+        ORDER BY r.ticker
+    """)
+    return pd.read_sql(sql, engine, params=params)
+
+
+def collect_report_data(engine, *, window_hours: int) -> dict:
+    regime = fetch_latest_market_regime(engine, window_hours=window_hours)
+    news_signals = fetch_latest_news_signals(engine, window_hours=window_hours)
+    opportunities = fetch_latest_opportunity_signals(engine, window_hours=window_hours)
+    articles = fetch_recent_articles(engine, window_hours=window_hours)
+    macro = fetch_latest_macro(engine)
+    watchlist = fetch_latest_watchlist_quality(engine)
+    return {
+        "generated_at": datetime.now(timezone.utc),
+        "window_hours": window_hours,
+        "regime": regime.to_dict(orient="records"),
+        "news_signals": news_signals.to_dict(orient="records"),
+        "opportunities": opportunities.to_dict(orient="records"),
+        "articles": articles.to_dict(orient="records"),
+        "macro": macro.to_dict(orient="records"),
+        "watchlist": watchlist.to_dict(orient="records"),
+    }
+
+
+def article_lookup(articles: list[dict]) -> dict[str, dict]:
+    return {str(article.get("article_id")): article for article in articles if article.get("article_id")}
+
+
+def format_article(article: dict) -> str:
+    title = str(article.get("title") or "Untitled")
+    source = str(article.get("source_name") or "unknown source")
+    url = article.get("url")
+    if url:
+        return f"[{title}]({url}) ({source})"
+    return f"{title} ({source})"
+
+
+def render_theme_articles(signal: dict, articles_by_id: dict[str, dict], *, limit: int = 3) -> list[str]:
+    rendered = []
+    for article_id in _as_list(signal.get("top_article_ids"))[:limit]:
+        article = articles_by_id.get(str(article_id))
+        if article:
+            rendered.append(format_article(article))
+    return rendered
+
+
+def render_investment_report(data: dict) -> str:
+    generated_at = data.get("generated_at") or datetime.now(timezone.utc)
+    window_hours = int(data.get("window_hours") or 24)
+    regime_rows = data.get("regime") or []
+    news_signals = data.get("news_signals") or []
+    opportunities = data.get("opportunities") or []
+    articles = data.get("articles") or []
+    macro = data.get("macro") or []
+    watchlist = data.get("watchlist") or []
+    articles_by_id = article_lookup(articles)
+    article_count = len(articles)
+
+    regime = regime_rows[0] if regime_rows else {}
+    regime_label = regime.get("regime_label", "unknown")
+    confidence = _float(regime.get("confidence_score"))
+
+    lines = [
+        "# Daily Investment Intelligence Report",
+        "",
+        f"Generated at: {generated_at.isoformat()}",
+        f"Window: {window_hours}h",
+        "",
+        "## Executive Summary",
+        "",
+        f"- Current market regime: **{regime_label}** with confidence `{round(confidence, 4)}`.",
+        f"- News signals reviewed: `{len(news_signals)}`.",
+        f"- Classified/recent articles reviewed: `{article_count}`.",
+    ]
+    if opportunities:
+        top = opportunities[0]
+        lines.append(
+            f"- Top filtered opportunity: `{top.get('ticker')}` "
+            f"({top.get('signal_label')}, score `{top.get('opportunity_score')}`)."
+        )
+    else:
+        lines.append("- No high-conviction opportunities passed current filters.")
+    lines.extend(["", "## Market Regime", ""])
+
+    if regime:
+        lines.extend(
+            [
+                f"- Regime: **{regime_label}**",
+                f"- Confidence: `{round(confidence, 4)}`",
+                f"- Risk-on score: `{regime.get('risk_on_score')}`",
+                f"- Risk-off score: `{regime.get('risk_off_score')}`",
+                f"- Source counts: news `{regime.get('news_signal_count')}`, macro `{regime.get('macro_signal_count')}`",
+            ]
+        )
+        drivers = _as_list(regime.get("drivers"))
+        if drivers:
+            lines.append("- Drivers:")
+            lines.extend([f"  - {driver}" for driver in drivers[:8]])
+    else:
+        lines.append("No market regime signal is available yet.")
+
+    lines.extend(["", "## Top News Themes", ""])
+    theme_signals = [s for s in news_signals if s.get("dimension_type") == "theme"]
+    if theme_signals:
+        for signal in sorted(theme_signals, key=lambda s: _float(s.get("opportunity_score")), reverse=True)[:8]:
+            lines.append(
+                f"- **{signal.get('dimension_value')}**: articles `{signal.get('article_count')}`, "
+                f"sentiment `{signal.get('weighted_sentiment_score')}`, "
+                f"opportunity `{signal.get('opportunity_score')}`, risk `{signal.get('risk_score')}`"
+            )
+            for article_text in render_theme_articles(signal, articles_by_id):
+                lines.append(f"  - {article_text}")
+    else:
+        lines.append("No theme-level news signals are available.")
+
+    lines.extend(["", "## Risk Signals", ""])
+    risk_signals = sorted(news_signals, key=lambda s: _float(s.get("risk_score")), reverse=True)[:8]
+    if risk_signals:
+        for signal in risk_signals:
+            lines.append(
+                f"- **{signal.get('dimension_type')}={signal.get('dimension_value')}**: "
+                f"risk `{signal.get('risk_score')}`, sentiment `{signal.get('weighted_sentiment_score')}`"
+            )
+    else:
+        lines.append("No risk signals are available.")
+    if macro:
+        lines.append("- Macro moves:")
+        for row in macro[:6]:
+            lines.append(
+                f"  - {row.get('symbol')} {row.get('name')}: pct_chg `{row.get('pct_chg')}` "
+                f"close `{row.get('close')}`"
+            )
+
+    lines.extend(["", "## Opportunity Signals", ""])
+    if opportunities:
+        for signal in opportunities[:10]:
+            lines.append(
+                f"- **{signal.get('ticker')}** ({signal.get('signal_label')}): "
+                f"opportunity `{signal.get('opportunity_score')}`, risk `{signal.get('risk_score')}`, "
+                f"technical `{signal.get('technical_score')}`"
+            )
+            for reason in _as_list(signal.get("reasons"))[:4]:
+                lines.append(f"  - {reason}")
+    else:
+        lines.append("No high-conviction opportunities passed current filters.")
+
+    lines.extend(["", "## Watchlist Commentary", ""])
+    if watchlist:
+        for row in watchlist[:12]:
+            rsi = row.get("rsi_14")
+            comment = "technical data pending" if pd.isna(rsi) else f"RSI `{round(float(rsi), 2)}`"
+            lines.append(
+                f"- **{row.get('ticker')}**: close `{format_value(row.get('close'))}`, "
+                f"pct_chg `{format_value(row.get('pct_chg'))}`, {comment}"
+            )
+    else:
+        lines.append("No local watchlist equity data is available.")
+
+    lines.extend(["", "## Data Quality Notes", ""])
+    if article_count < LOW_ARTICLE_COUNT_THRESHOLD:
+        lines.append(
+            f"- Warning: article count is low (`{article_count}` articles in {window_hours}h); "
+            "treat conclusions as directional only."
+        )
+    else:
+        lines.append(f"- Article coverage looks usable for this window (`{article_count}` articles).")
+    if not opportunities:
+        lines.append("- Opportunity scanner filters are currently strict; zero passing names is an expected valid result.")
+    if not regime:
+        lines.append("- Market regime table has no matching local rows.")
+    if not news_signals:
+        lines.append("- News signal table has no matching local rows.")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def generate_investment_report(engine, *, window_hours: int) -> str:
+    return render_investment_report(collect_report_data(engine, window_hours=window_hours))
+
+
+def save_report(markdown: str, *, generated_at: datetime | None = None, reports_dir: Path | None = None) -> Path:
+    timestamp = (generated_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    output_dir = reports_dir or (_project_root() / "reports")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"investment_report_{timestamp}.md"
+    path.write_text(markdown, encoding="utf-8")
+    return path
