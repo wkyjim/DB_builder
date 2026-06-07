@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from db_builder.news_importance import score_news_importance, sort_classification_queue
+from db_builder.news_importance import score_event_priority, score_news_importance, sort_classification_queue
 
 
 def score(title: str, summary: str = "") -> float:
@@ -58,3 +58,39 @@ def test_queue_sorting_prioritizes_importance_over_recency():
     queue = sort_classification_queue([recent_generic, old_important])
 
     assert queue[0]["title"] == old_important["title"]
+
+
+def test_event_priority_detects_top_tier_events():
+    assert score_event_priority("FOMC decision keeps rates unchanged")["event_type_priority"] == 100
+    assert score_event_priority("CPI report hotter than expected")["event_type_priority"] == 100
+    assert score_event_priority("New tariffs announced on China imports")["event_type_priority"] == 95
+    assert score_event_priority("Iran war escalates after missile strikes")["event_type_priority"] == 95
+
+
+def test_event_priority_detects_mid_and_low_priority_events():
+    assert score_event_priority("Company reports earnings and revenue beat")["event_type_priority"] == 90
+    assert score_event_priority("Chipmaker announces acquisition")["event_type_priority"] == 90
+    assert score_event_priority("Analyst says stock has upside")["event_type_priority"] == 40
+    assert score_event_priority("Stocks rise in market today")["event_type_priority"] == 20
+
+
+def test_classification_priority_uses_event_and_source_priority():
+    fomc = {
+        "title": "FOMC decision keeps rates unchanged after CPI report",
+        "summary": "",
+        "source_priority": 90,
+        "published_at": datetime(2026, 6, 1, tzinfo=timezone.utc),
+        "fetched_at": datetime(2026, 6, 1, tzinfo=timezone.utc),
+    }
+    recap = {
+        "title": "Stocks rise in market today after a strong week",
+        "summary": "",
+        "source_priority": 90,
+        "published_at": datetime(2026, 6, 7, tzinfo=timezone.utc),
+        "fetched_at": datetime(2026, 6, 7, tzinfo=timezone.utc),
+    }
+
+    queue = sort_classification_queue([recap, fomc])
+
+    assert queue[0]["title"] == fomc["title"]
+    assert queue[0]["classification_priority"] > queue[1]["classification_priority"]

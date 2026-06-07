@@ -43,10 +43,17 @@ def print_queue(articles: list[dict]) -> None:
             f"{rank}. {article.get('title')} | source={article.get('source_name')} "
             f"source_priority={article.get('source_priority')} "
             f"source_category={article.get('source_category')} "
-            f"importance_score={article.get('importance_score')}"
+            f"importance_score={article.get('importance_score')} "
+            f"event_priority={article.get('event_type_priority')} "
+            f"classification_priority={article.get('classification_priority')}"
         )
+        if article.get("event_priority_label"):
+            print(f"   event={article.get('event_priority_label')}")
         if reasons:
             print(f"   importance_reasons={'; '.join(reasons)}")
+        event_reasons = article.get("event_priority_reasons") or []
+        if event_reasons:
+            print(f"   event_reasons={'; '.join(event_reasons)}")
 
 
 def time_budget_reached(start_time: float, max_seconds: float | None, *, now_fn=time.monotonic) -> bool:
