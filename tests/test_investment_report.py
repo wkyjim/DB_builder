@@ -61,6 +61,18 @@ def sample_data(opportunities=None, article_count=2):
             },
         ],
         "opportunities": opportunities or [],
+        "sector_signals": [
+            {
+                "sector_name": "Semiconductors",
+                "related_etfs": ["SMH", "SOXX"],
+                "opportunity_score": 81,
+                "risk_score": 22,
+                "momentum_score": 72,
+                "trend_score": 70,
+                "final_score": 65.5,
+                "top_themes": ["AI", "Semiconductors"],
+            }
+        ],
         "articles": articles,
         "macro": [{"symbol": "^VIX", "name": "Volatility", "pct_chg": 4.0, "close": 20}],
         "watchlist": [{"ticker": "SMH", "close": 250, "pct_chg": 1.2, "rsi_14": 55.2}],
@@ -75,6 +87,7 @@ def test_report_includes_required_sections_and_regime_confidence():
     assert "## Top News Themes" in markdown
     assert "## Risk Signals" in markdown
     assert "## Opportunity Signals" in markdown
+    assert "## Sector Intelligence" in markdown
     assert "## Watchlist Commentary" in markdown
     assert "## Data Quality Notes" in markdown
     assert "Confidence: `0.42`" in markdown
@@ -116,6 +129,22 @@ def test_report_renders_opportunity_signals_when_available():
 
     assert "**SMH** (opportunity)" in markdown
     assert "news opportunity=33 risk=10" in markdown
+
+
+def test_report_renders_sector_intelligence():
+    markdown = render_investment_report(sample_data())
+
+    assert "**Semiconductors**: final `65.5`" in markdown
+    assert "ETFs `SMH, SOXX`" in markdown
+    assert "Top themes: AI, Semiconductors" in markdown
+
+
+def test_report_sector_intelligence_fallback():
+    data = sample_data()
+    data["sector_signals"] = []
+    markdown = render_investment_report(data)
+
+    assert "No sector intelligence signals are available yet." in markdown
 
 
 def test_save_report_uses_timestamped_markdown_name(tmp_path):

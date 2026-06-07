@@ -97,6 +97,26 @@ def fetch_latest_opportunity_signals(engine, *, window_hours: int, limit: int = 
     return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
 
 
+def fetch_latest_sector_signals(engine, *, window_hours: int, limit: int = 20) -> pd.DataFrame:
+    sql = text("""
+        WITH latest_run AS (
+            SELECT MAX(run_time) AS run_time
+            FROM public.sector_signals
+            WHERE window_hours = :window_hours
+        )
+        SELECT s.*
+        FROM public.sector_signals s
+        JOIN latest_run r ON r.run_time = s.run_time
+        WHERE s.window_hours = :window_hours
+        ORDER BY s.rank ASC, s.final_score DESC, s.sector_name
+        LIMIT :limit
+    """)
+    try:
+        return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+    except Exception:
+        return pd.DataFrame()
+
+
 def fetch_recent_articles(engine, *, window_hours: int, limit: int = 50) -> pd.DataFrame:
     sql = text("""
         SELECT
@@ -187,6 +207,7 @@ def collect_report_data(engine, *, window_hours: int) -> dict:
     regime = fetch_latest_market_regime(engine, window_hours=window_hours)
     news_signals = fetch_latest_news_signals(engine, window_hours=window_hours)
     opportunities = fetch_latest_opportunity_signals(engine, window_hours=window_hours)
+    sector_signals = fetch_latest_sector_signals(engine, window_hours=window_hours)
     articles = fetch_recent_articles(engine, window_hours=window_hours)
     macro = fetch_latest_macro(engine)
     watchlist = fetch_latest_watchlist_quality(engine)
@@ -196,6 +217,7 @@ def collect_report_data(engine, *, window_hours: int) -> dict:
         "regime": regime.to_dict(orient="records"),
         "news_signals": news_signals.to_dict(orient="records"),
         "opportunities": opportunities.to_dict(orient="records"),
+        "sector_signals": sector_signals.to_dict(orient="records"),
         "articles": articles.to_dict(orient="records"),
         "macro": macro.to_dict(orient="records"),
         "watchlist": watchlist.to_dict(orient="records"),
@@ -230,6 +252,7 @@ def render_investment_report(data: dict) -> str:
     regime_rows = data.get("regime") or []
     news_signals = data.get("news_signals") or []
     opportunities = data.get("opportunities") or []
+    sector_signals = data.get("sector_signals") or []
     articles = data.get("articles") or []
     macro = data.get("macro") or []
     watchlist = data.get("watchlist") or []
@@ -323,6 +346,21 @@ def render_investment_report(data: dict) -> str:
                 lines.append(f"  - {reason}")
     else:
         lines.append("No high-conviction opportunities passed current filters.")
+
+    lines.extend(["", "## Sector Intelligence", ""])
+    if sector_signals:
+        for signal in sorted(sector_signals, key=lambda s: _float(s.get("final_score")), reverse=True)[:5]:
+            etfs = ", ".join(_as_list(signal.get("related_etfs"))) or "n/a"
+            themes = ", ".join(_as_list(signal.get("top_themes"))) or "n/a"
+            lines.append(
+                f"- **{signal.get('sector_name')}**: final `{signal.get('final_score')}`, "
+                f"ETFs `{etfs}`, opportunity `{signal.get('opportunity_score')}`, "
+                f"risk `{signal.get('risk_score')}`, momentum `{signal.get('momentum_score')}`, "
+                f"trend `{signal.get('trend_score')}`"
+            )
+            lines.append(f"  - Top themes: {themes}")
+    else:
+        lines.append("No sector intelligence signals are available yet.")
 
     lines.extend(["", "## Watchlist Commentary", ""])
     if watchlist:
