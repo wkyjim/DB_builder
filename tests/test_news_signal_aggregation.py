@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from db_builder.news_signal_aggregation import aggregate_signal_records, expand_signal_dimensions, source_weight_factor
-from db_builder.news_taxonomy import canonical_theme, normalize_ticker
+from db_builder.news_taxonomy import canonical_theme, normalize_theme_key, normalize_ticker
 
 
 RUN_TIME = datetime(2026, 6, 6, 12, tzinfo=timezone.utc)
@@ -104,6 +104,33 @@ def test_canonical_theme_mapping():
     assert canonical_theme("healthcare sector") == "Healthcare"
     assert canonical_theme("energy sector") == "Energy"
     assert canonical_theme("retail sector") == "Consumer Discretionary"
+    assert canonical_theme("geo-political") == "Geopolitics"
+    assert canonical_theme("geopolitical risk") == "Geopolitics"
+    assert canonical_theme("geopolitical_risk") == "Geopolitics"
+    assert canonical_theme("war risk") == "Geopolitics"
+    assert canonical_theme("middle east risk") == "Geopolitics"
+    assert canonical_theme("iran risk") == "Geopolitics"
+    assert canonical_theme("oil_market") == "Oil"
+    assert canonical_theme("oil market") == "Oil"
+    assert canonical_theme("oil_prices") == "Oil"
+    assert canonical_theme("oil prices") == "Oil"
+    assert canonical_theme("crude oil prices") == "Oil"
+    assert canonical_theme("brent crude") == "Oil"
+    assert canonical_theme("wti crude") == "Oil"
+    assert canonical_theme("inflation expectations") == "Inflation"
+    assert canonical_theme("interest rate policy") == "Interest Rates"
+    assert canonical_theme("fed policy") == "Monetary Policy"
+    assert canonical_theme("central bank policy") == "Central Banks"
+    assert canonical_theme("trade war") == "Trade Policy"
+    assert canonical_theme("tariff risk") == "Trade Policy"
+    assert canonical_theme("regulatory risk") == "Regulation"
+    assert canonical_theme("sec enforcement") == "Regulation"
+
+
+def test_theme_key_normalization_handles_separators_and_spaces():
+    assert normalize_theme_key(" geopolitical_risk ") == "geopolitical risk"
+    assert normalize_theme_key("geo-political") == "geo political"
+    assert normalize_theme_key("oil   prices") == "oil prices"
 
 
 def test_ticker_normalization_rejects_generic_regions_and_bad_dotted_values():

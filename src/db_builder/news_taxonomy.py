@@ -13,6 +13,7 @@ CANONICAL_THEME_MAP = {
     "bank regulation": "Bank Regulation",
     "capital markets": "Capital Markets",
     "central bank": "Central Banks",
+    "central bank policy": "Central Banks",
     "central banks": "Central Banks",
     "crypto regulation": "Crypto Regulation",
     "cryptocurrency market": "Crypto",
@@ -20,29 +21,47 @@ CANONICAL_THEME_MAP = {
     "stock market": "Market Sentiment",
     "stocks": "Market Sentiment",
     "investment performance": "Market Sentiment",
+    "inflation expectations": "Inflation",
     "interest rates": "Interest Rates",
+    "interest rate policy": "Interest Rates",
     "inflation": "Inflation",
     "treasury yields": "Rates",
     "treasury market": "Treasury Market",
     "federal reserve": "Fed",
     "fed": "Fed",
+    "fed policy": "Monetary Policy",
     "fomc": "Monetary Policy",
     "monetary policy": "Monetary Policy",
     "financial stability": "Financial Stability",
     "etf regulation": "ETF Regulation",
+    "regulation": "Regulation",
+    "regulatory risk": "Regulation",
+    "sec enforcement": "Regulation",
+    "tariff risk": "Trade Policy",
     "trade policy": "Trade Policy",
+    "trade war": "Trade Policy",
     "fiscal policy": "Fiscal Policy",
     "labor market": "Labor Market",
     "jobs report": "Labor Market",
     "housing market": "Housing",
     "housing": "Housing",
     "crude oil": "Oil",
+    "crude oil prices": "Oil",
+    "brent crude": "Oil",
+    "oil market": "Oil",
+    "oil prices": "Oil",
+    "wti crude": "Oil",
     "natural gas": "Natural Gas",
     "energy security": "Energy Security",
     "defense spending": "Defense",
     "military spending": "Defense Spending",
     "national security": "National Security",
+    "geo political": "Geopolitics",
     "geopolitics": "Geopolitics",
+    "geopolitical risk": "Geopolitics",
+    "iran risk": "Geopolitics",
+    "middle east risk": "Geopolitics",
+    "war risk": "Geopolitics",
     "nuclear energy": "Nuclear",
     "power grid": "Power Infrastructure",
     "electric grid": "Power Infrastructure",
@@ -78,11 +97,19 @@ KNOWN_DOTTED_TICKERS = {
 TICKER_RE = re.compile(r"^[A-Z][A-Z0-9_-]{0,9}$")
 
 
+def normalize_theme_key(value: str) -> str:
+    theme = str(value).strip().lower()
+    theme = re.sub(r"[_]+", " ", theme)
+    theme = re.sub(r"(?<=\w)-(?=\w)", " ", theme)
+    theme = re.sub(r"\s+", " ", theme)
+    return theme.strip()
+
+
 def canonical_theme(value: str) -> str | None:
     theme = " ".join(str(value).strip().split())
     if not theme:
         return None
-    return CANONICAL_THEME_MAP.get(theme.lower(), theme)
+    return CANONICAL_THEME_MAP.get(normalize_theme_key(theme), theme)
 
 
 def normalize_ticker(value: str) -> str | None:
