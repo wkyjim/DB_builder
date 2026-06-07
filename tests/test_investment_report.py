@@ -115,6 +115,18 @@ def sample_data(opportunities=None, article_count=2):
                 "recommended_action": "trim",
             },
         ],
+        "secular_themes": [
+            {
+                "theme_name": "AI Infrastructure",
+                "parent_theme": "AI & Compute",
+                "secular_score": 72,
+                "tactical_score": 44,
+                "theme_phase": "correction",
+                "confidence": 0.7,
+                "related_etfs": ["QQQ", "XLK", "SMH", "SOXX"],
+                "top_subthemes": ["AI infrastructure", "data center"],
+            }
+        ],
         "articles": articles,
         "macro": [{"symbol": "^VIX", "name": "Volatility", "pct_chg": 4.0, "close": 20}],
         "watchlist": [{"ticker": "SMH", "close": 250, "pct_chg": 1.2, "rsi_14": 55.2}],
@@ -133,6 +145,8 @@ def test_report_includes_required_sections_and_regime_confidence():
     assert "## Sector Intelligence" in markdown
     assert "## Sector Regimes" in markdown
     assert "## Sector Rotation" in markdown
+    assert "## Secular Themes" in markdown
+    assert "## Tactical vs Secular Divergence" in markdown
     assert "## Watchlist Commentary" in markdown
     assert "## Data Quality Notes" in markdown
     assert "Confidence: `0.42`" in markdown
@@ -200,6 +214,14 @@ def test_report_renders_sector_regimes_and_rotation():
     assert "**Semiconductors**: rank `1`, score `70`" in markdown
     assert "Underweight / avoid candidates:" in markdown
     assert "**Real Estate**: bias `underweight`" in markdown
+
+
+def test_report_renders_secular_themes_and_divergence():
+    markdown = render_investment_report(sample_data())
+
+    assert "**AI Infrastructure** (AI & Compute)" in markdown
+    assert "Top subthemes: AI infrastructure, data center" in markdown
+    assert "long-term bullish, short-term correction" in markdown
 
 
 def test_report_sector_intelligence_fallback():

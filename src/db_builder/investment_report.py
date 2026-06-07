@@ -171,6 +171,26 @@ def fetch_latest_sector_rotation(engine, *, window_hours: int, limit: int = 30) 
         return pd.DataFrame()
 
 
+def fetch_latest_secular_theme_signals(engine, *, window_hours: int, limit: int = 20) -> pd.DataFrame:
+    sql = text("""
+        WITH latest_run AS (
+            SELECT MAX(run_time) AS run_time
+            FROM public.secular_theme_signals
+            WHERE window_hours = :window_hours
+        )
+        SELECT s.*
+        FROM public.secular_theme_signals s
+        JOIN latest_run r ON r.run_time = s.run_time
+        WHERE s.window_hours = :window_hours
+        ORDER BY s.secular_score DESC, s.tactical_score DESC, s.theme_name
+        LIMIT :limit
+    """)
+    try:
+        return pd.read_sql(sql, engine, params={"window_hours": window_hours, "limit": limit})
+    except Exception:
+        return pd.DataFrame()
+
+
 def fetch_recent_articles(engine, *, window_hours: int, limit: int = 50) -> pd.DataFrame:
     sql = text("""
         SELECT
@@ -265,6 +285,7 @@ def collect_report_data(engine, *, window_hours: int) -> dict:
     sector_signals = fetch_latest_sector_signals(engine, window_hours=window_hours)
     sector_regimes = fetch_latest_sector_regimes(engine, window_hours=window_hours)
     sector_rotation = fetch_latest_sector_rotation(engine, window_hours=window_hours)
+    secular_themes = fetch_latest_secular_theme_signals(engine, window_hours=window_hours)
     articles = fetch_recent_articles(engine, window_hours=window_hours)
     macro = fetch_latest_macro(engine)
     watchlist = fetch_latest_watchlist_quality(engine)
@@ -278,6 +299,7 @@ def collect_report_data(engine, *, window_hours: int) -> dict:
         "sector_signals": sector_signals.to_dict(orient="records"),
         "sector_regimes": sector_regimes.to_dict(orient="records"),
         "sector_rotation": sector_rotation.to_dict(orient="records"),
+        "secular_themes": secular_themes.to_dict(orient="records"),
         "articles": articles.to_dict(orient="records"),
         "macro": macro.to_dict(orient="records"),
         "watchlist": watchlist.to_dict(orient="records"),
@@ -333,6 +355,7 @@ def render_investment_report(data: dict) -> str:
     sector_signals = data.get("sector_signals") or []
     sector_regimes = data.get("sector_regimes") or []
     sector_rotation = data.get("sector_rotation") or []
+    secular_themes = data.get("secular_themes") or []
     articles = data.get("articles") or []
     macro = data.get("macro") or []
     watchlist = data.get("watchlist") or []
@@ -511,6 +534,49 @@ def render_investment_report(data: dict) -> str:
     else:
         lines.append("No sector rotation signals are available yet.")
 
+    lines.extend(["", "## Secular Themes", ""])
+    if secular_themes:
+        for signal in sorted(secular_themes, key=lambda s: _float(s.get("secular_score")), reverse=True)[:8]:
+            etfs = ", ".join(_as_list(signal.get("related_etfs"))) or "n/a"
+            subthemes = ", ".join(_as_list(signal.get("top_subthemes"))) or "n/a"
+            lines.append(
+                f"- **{signal.get('theme_name')}** ({signal.get('parent_theme')}): "
+                f"secular `{format_value(signal.get('secular_score'))}`, "
+                f"tactical `{format_value(signal.get('tactical_score'))}`, "
+                f"phase `{signal.get('theme_phase')}`, confidence `{format_value(signal.get('confidence'))}`, "
+                f"ETFs `{etfs}`"
+            )
+            lines.append(f"  - Top subthemes: {subthemes}")
+    else:
+        lines.append("No secular theme signals are available yet.")
+
+    lines.extend(["", "## Tactical vs Secular Divergence", ""])
+    if secular_themes:
+        divergences = [
+            signal for signal in secular_themes
+            if abs(_float(signal.get("secular_score")) - _float(signal.get("tactical_score"))) >= 12
+        ]
+        if divergences:
+            for signal in sorted(
+                divergences,
+                key=lambda s: abs(_float(s.get("secular_score")) - _float(s.get("tactical_score"))),
+                reverse=True,
+            )[:6]:
+                secular = _float(signal.get("secular_score"))
+                tactical = _float(signal.get("tactical_score"))
+                if secular > tactical:
+                    label = "long-term bullish, short-term correction"
+                else:
+                    label = "tactical rally, not yet structural"
+                lines.append(
+                    f"- **{signal.get('theme_name')}**: {label}; "
+                    f"secular `{format_value(secular)}`, tactical `{format_value(tactical)}`"
+                )
+        else:
+            lines.append("No major tactical/secular divergences are visible in the current window.")
+    else:
+        lines.append("No secular theme data is available for divergence analysis.")
+
     lines.extend(["", "## Watchlist Commentary", ""])
     if watchlist:
         for row in watchlist[:12]:
@@ -539,6 +605,8 @@ def render_investment_report(data: dict) -> str:
         lines.append("- Market Regime 2.0 table has no matching local rows.")
     if not news_signals:
         lines.append("- News signal table has no matching local rows.")
+    if not secular_themes:
+        lines.append("- Secular theme table has no matching local rows.")
 
     return "\n".join(lines).rstrip() + "\n"
 
