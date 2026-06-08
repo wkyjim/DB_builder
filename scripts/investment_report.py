@@ -13,6 +13,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-hours", type=int, default=24, help="Input signal window in hours.")
     parser.add_argument("--summary-timeout", type=int, default=120, help="DeepSeek/Ollama summary timeout in seconds.")
     parser.add_argument("--no-quality-summary", action="store_true", help="Skip DeepSeek report quality summary.")
+    parser.add_argument("--with-qwen-overlay", action="store_true", help="Append optional Qwen analyst overlay.")
+    parser.add_argument("--with-deepseek-cio", action="store_true", help="Append optional DeepSeek CIO commentary.")
+    parser.add_argument("--qwen-timeout", type=int, default=120, help="Qwen overlay timeout in seconds.")
+    parser.add_argument("--deepseek-timeout", type=int, default=300, help="DeepSeek CIO timeout in seconds.")
     parser.add_argument("--dry-run", action="store_true", help="Print markdown report; do not save.")
     parser.add_argument("--save", action="store_true", help="Save report under reports/.")
     return parser.parse_args()
@@ -26,6 +30,10 @@ def main() -> None:
         window_hours=args.window_hours,
         quality_summary=not args.no_quality_summary,
         timeout=args.summary_timeout,
+        with_qwen_overlay=args.with_qwen_overlay,
+        with_deepseek_cio=args.with_deepseek_cio,
+        qwen_timeout=args.qwen_timeout,
+        deepseek_timeout=args.deepseek_timeout,
     )
 
     if args.save:

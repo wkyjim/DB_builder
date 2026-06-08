@@ -9,6 +9,7 @@ import pytest
 from db_builder.news_classifier import (
     ClassificationError,
     classify_with_ollama,
+    ollama_model,
     parse_model_response,
     persist_classification,
     reset_new_for_premium_sources,
@@ -48,6 +49,13 @@ def test_valid_json_parse():
 
     assert result["sentiment_score"] == 0.25
     assert result["themes"] == ["AI", "earnings"]
+
+
+def test_ollama_model_defaults_to_fast_model(monkeypatch):
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+    monkeypatch.delenv("OLLAMA_FAST_MODEL", raising=False)
+
+    assert ollama_model() == "qwen2.5:7b"
 
 
 def test_invalid_json_rejected():

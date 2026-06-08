@@ -15,7 +15,8 @@ from db_builder.news_importance import sort_classification_queue
 
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/chat"
-DEFAULT_OLLAMA_MODEL = "deepseek-r1:14b"
+DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
+DEFAULT_OLLAMA_DEEP_MODEL = "deepseek-r1:14b"
 REQUIRED_FIELDS = {
     "sentiment_score",
     "impact_score",
@@ -42,7 +43,11 @@ def ollama_url() -> str:
 
 
 def ollama_model() -> str:
-    return os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+    return os.getenv("OLLAMA_FAST_MODEL") or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+
+
+def ollama_deep_model() -> str:
+    return os.getenv("OLLAMA_DEEP_MODEL") or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_DEEP_MODEL)
 
 
 def select_articles_for_classification(
@@ -282,15 +287,27 @@ def repair_prompt(raw_response: str) -> list[dict]:
     ]
 
 
-def _ollama_chat(messages: list[dict], *, url: str, model: str, timeout: int) -> dict:
+def _ollama_chat(
+    messages: list[dict],
+    *,
+    url: str,
+    model: str,
+    timeout: int,
+    options: dict | None = None,
+    response_format: str | None = "json",
+) -> dict:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if response_format:
+        payload["format"] = response_format
+    if options:
+        payload["options"] = options
     response = requests.post(
         url,
-        json={
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "format": "json",
-        },
+        json=payload,
         timeout=timeout,
     )
     response.raise_for_status()

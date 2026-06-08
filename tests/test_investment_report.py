@@ -297,3 +297,46 @@ def test_append_quality_summary_falls_back_on_model_error():
 
     assert "Quality summary could not be generated" in markdown
     assert "ollama unavailable" in markdown
+
+
+def test_report_renders_without_llm():
+    markdown = render_investment_report(sample_data())
+
+    assert "## LLM Analyst Overlay" not in markdown
+    assert "## CIO Commentary" not in markdown
+
+
+def test_report_can_append_qwen_overlay(monkeypatch):
+    from db_builder.investment_report import generate_investment_report
+
+    class Engine:
+        pass
+
+    monkeypatch.setattr(
+        "db_builder.investment_report.collect_report_data",
+        lambda engine, window_hours: sample_data(),
+    )
+    monkeypatch.setattr(
+        "db_builder.investment_report.generate_qwen_overlay",
+        lambda engine, window_hours, timeout: {
+            "market_view": "neutral",
+            "positioning": "selective_risk",
+            "risk_level": "moderate",
+            "confidence": 0.5,
+            "summary": "Market is mixed.",
+            "top_risk": "Breadth is weak.",
+            "top_opportunity": "Cybersecurity leads.",
+            "preferred_sectors": ["Cybersecurity"],
+            "avoid_sectors": [],
+        },
+    )
+
+    markdown = generate_investment_report(
+        Engine(),
+        window_hours=24,
+        quality_summary=False,
+        with_qwen_overlay=True,
+    )
+
+    assert "## LLM Analyst Overlay" in markdown
+    assert "Positioning: `selective_risk`" in markdown

@@ -9,6 +9,11 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy import text
 
+from db_builder.llm_analyst_overlay import (
+    generate_deepseek_cio_commentary,
+    generate_qwen_overlay,
+    render_qwen_overlay_markdown,
+)
 from db_builder.news_classifier import _ollama_chat, extract_json_object, ollama_model, ollama_url
 from db_builder.opportunity_scanner import WATCHLIST_UNIVERSE
 
@@ -711,8 +716,31 @@ def append_quality_summary(markdown: str, *, timeout: int = 120, summarizer=summ
         return markdown.rstrip() + "\n\n" + render_quality_summary(fallback)
 
 
-def generate_investment_report(engine, *, window_hours: int, quality_summary: bool = True, timeout: int = 120) -> str:
+def generate_investment_report(
+    engine,
+    *,
+    window_hours: int,
+    quality_summary: bool = True,
+    timeout: int = 120,
+    with_qwen_overlay: bool = False,
+    with_deepseek_cio: bool = False,
+    qwen_timeout: int = 120,
+    deepseek_timeout: int = 300,
+) -> str:
     markdown = render_investment_report(collect_report_data(engine, window_hours=window_hours))
+    qwen_overlay = None
+    if with_qwen_overlay:
+        qwen_overlay = generate_qwen_overlay(engine, window_hours=window_hours, timeout=qwen_timeout)
+        markdown = markdown.rstrip() + "\n\n" + render_qwen_overlay_markdown(qwen_overlay)
+    if with_deepseek_cio:
+        commentary = generate_deepseek_cio_commentary(
+            markdown,
+            engine=engine,
+            window_hours=window_hours,
+            qwen_overlay=qwen_overlay,
+            timeout=deepseek_timeout,
+        )
+        markdown = markdown.rstrip() + "\n\n" + commentary.rstrip() + "\n"
     if not quality_summary:
         return markdown
     return append_quality_summary(markdown, timeout=timeout)

@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=5, help="Limit articles classified.")
     parser.add_argument("--article-id", default=None, help="Classify one article UUID.")
     parser.add_argument("--timeout", type=int, default=120, help="Ollama request timeout in seconds.")
+    parser.add_argument("--model", default=None, help="Ollama model override; defaults to OLLAMA_FAST_MODEL.")
     parser.add_argument("--max-seconds", type=float, default=None, help="Stop cleanly after this many elapsed seconds.")
     parser.add_argument("--min-importance", type=float, default=None, help="Only classify articles at or above this importance score.")
     parser.add_argument("--source-priority-min", type=float, default=None, help="Only classify sources at or above this priority.")
@@ -149,7 +150,7 @@ def main() -> None:
     if dry_run:
         print("[dry-run] classifications will not be written")
 
-    model = ollama_model()
+    model = args.model or ollama_model()
     classify_articles(
         engine,
         articles,
