@@ -210,7 +210,7 @@ def snapshot_hash(snapshot: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def qwen_input_snapshot(snapshot: dict) -> dict:
+def qwen_input_snapshot(snapshot: dict, critical_pm_view: dict | None = None) -> dict:
     market_rows = snapshot.get("market_regime_v2") or []
     market_summary = {}
     if market_rows:
@@ -232,14 +232,21 @@ def qwen_input_snapshot(snapshot: dict) -> dict:
         "bottom_sector_rotation": (snapshot.get("sector_rotation_bottom") or [])[:3],
         "top_secular_themes": (snapshot.get("secular_themes") or [])[:5],
         "top_risk_signals": (snapshot.get("news_signals") or [])[:5],
+        "critical_pm_view": {
+            "market_view": (critical_pm_view or {}).get("market_view"),
+            "positioning_bias": (critical_pm_view or {}).get("positioning_bias"),
+            "final_house_view": (critical_pm_view or {}).get("final_house_view"),
+            "contradiction_flags": (critical_pm_view or {}).get("contradiction_flags", [])[:3],
+        },
     }
 
 
-def qwen_prompt(snapshot: dict) -> list[dict]:
+def qwen_prompt(snapshot: dict, critical_pm_view: dict | None = None) -> list[dict]:
     system = (
         "Return ONE JSON object only. No markdown. No prose. No code fence. "
         "Use only provided data. If unsure, use unclear and empty arrays. "
-        "Return exactly the requested keys and do not copy the input data."
+        "Return exactly the requested keys and do not copy the input data. "
+        "The deterministic Critical PM View is primary; summarize it, do not override it."
     )
     example = {
         "market_view": "neutral",
@@ -254,6 +261,7 @@ def qwen_prompt(snapshot: dict) -> list[dict]:
     }
     user = (
         "Write a compact analyst overlay from deterministic investment signals. Do not invent facts.\n"
+        "If you disagree with the Critical PM View, include 'LLM disagreement noted' in the summary, but keep the deterministic view primary.\n"
         "Return exactly these keys and no other keys:\n"
         "market_view, positioning, risk_level, confidence, summary, top_risk, top_opportunity, preferred_sectors, avoid_sectors.\n"
         "Allowed market_view: risk_on, neutral, risk_off, correction_in_bull, unclear.\n"
@@ -263,7 +271,7 @@ def qwen_prompt(snapshot: dict) -> list[dict]:
         "Valid example JSON:\n"
         f"{json.dumps(example, ensure_ascii=True)}\n"
         "Input data, for evidence only. Do not copy these keys into the output:\n"
-        f"{json.dumps(qwen_input_snapshot(snapshot), ensure_ascii=True)}"
+        f"{json.dumps(qwen_input_snapshot(snapshot, critical_pm_view), ensure_ascii=True)}"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -307,12 +315,13 @@ def generate_qwen_overlay(
     timeout: int = 120,
     model: str | None = None,
     chat_fn=_ollama_chat,
+    critical_pm_view: dict | None = None,
 ) -> dict:
     snapshot = collect_overlay_snapshot(engine, window_hours=window_hours)
     selected_model = model or ollama_model()
     try:
         body = chat_fn(
-            qwen_prompt(snapshot),
+            qwen_prompt(snapshot, critical_pm_view),
             url=ollama_url(),
             model=selected_model,
             timeout=timeout,

@@ -9,6 +9,12 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy import text
 
+from db_builder.critical_house_view import (
+    build_critical_house_view,
+    render_critical_pm_view,
+    render_final_house_view,
+    render_sector_critical_table,
+)
 from db_builder.llm_analyst_overlay import (
     generate_deepseek_cio_commentary,
     generate_qwen_overlay,
@@ -366,6 +372,8 @@ def render_investment_report(data: dict) -> str:
     watchlist = data.get("watchlist") or []
     articles_by_id = article_lookup(articles)
     article_count = len(articles)
+    critical_view = data.get("critical_house_view") or build_critical_house_view(data)
+    data["critical_house_view"] = critical_view
 
     regime = regime_rows[0] if regime_rows else {}
     regime_label = regime.get("regime_label", "unknown")
@@ -432,6 +440,10 @@ def render_investment_report(data: dict) -> str:
             lines.extend([f"  - {driver}" for driver in drivers[:8]])
     else:
         lines.append("No Market Regime 2.0 signal is available yet.")
+
+    lines.extend(["", render_critical_pm_view(critical_view).rstrip(), ""])
+    lines.extend([render_sector_critical_table(critical_view).rstrip(), ""])
+    lines.extend([render_final_house_view(critical_view).rstrip(), ""])
 
     lines.extend(["", "## Top News Themes", ""])
     theme_signals = [s for s in news_signals if s.get("dimension_type") == "theme"]
@@ -727,10 +739,16 @@ def generate_investment_report(
     qwen_timeout: int = 120,
     deepseek_timeout: int = 300,
 ) -> str:
-    markdown = render_investment_report(collect_report_data(engine, window_hours=window_hours))
+    data = collect_report_data(engine, window_hours=window_hours)
+    markdown = render_investment_report(data)
     qwen_overlay = None
     if with_qwen_overlay:
-        qwen_overlay = generate_qwen_overlay(engine, window_hours=window_hours, timeout=qwen_timeout)
+        qwen_overlay = generate_qwen_overlay(
+            engine,
+            window_hours=window_hours,
+            timeout=qwen_timeout,
+            critical_pm_view=data.get("critical_house_view"),
+        )
         markdown = markdown.rstrip() + "\n\n" + render_qwen_overlay_markdown(qwen_overlay)
     if with_deepseek_cio:
         commentary = generate_deepseek_cio_commentary(

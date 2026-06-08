@@ -139,6 +139,9 @@ def test_report_includes_required_sections_and_regime_confidence():
     assert "## Executive Summary" in markdown
     assert "## Market Regime" in markdown
     assert "## Market Regime 2.0" in markdown
+    assert "## Critical PM View" in markdown
+    assert "## Sector-by-Sector Critical View" in markdown
+    assert "## Final House View" in markdown
     assert "## Top News Themes" in markdown
     assert "## Risk Signals" in markdown
     assert "## Opportunity Signals" in markdown
@@ -204,6 +207,27 @@ def test_report_renders_market_regime_v2():
     assert "Market regime: **risk_off**" in markdown
     assert "Market phase: **correction_in_bull**" in markdown
     assert "risk_appetite: VIX close=24 pct_chg=6" in markdown
+
+
+def test_report_includes_critical_pm_view_sections():
+    markdown = render_investment_report(sample_data())
+
+    assert "Market interpretation:" in markdown
+    assert "Confidence interpretation:" in markdown
+    assert "Positioning bias:" in markdown
+
+
+def test_report_includes_sector_by_sector_critical_table():
+    markdown = render_investment_report(sample_data())
+
+    assert "| Sector | Report Bias | Critical View | Opportunities | Key Risks | Portfolio Bias |" in markdown
+    assert "| Semiconductors |" in markdown
+
+
+def test_report_includes_final_house_view():
+    markdown = render_investment_report(sample_data())
+
+    assert "The house view" in markdown or "The market is neutral/range-bound" in markdown
 
 
 def test_report_renders_sector_regimes_and_rotation():
@@ -318,7 +342,7 @@ def test_report_can_append_qwen_overlay(monkeypatch):
     )
     monkeypatch.setattr(
         "db_builder.investment_report.generate_qwen_overlay",
-        lambda engine, window_hours, timeout: {
+        lambda engine, window_hours, timeout, critical_pm_view=None: {
             "market_view": "neutral",
             "positioning": "selective_risk",
             "risk_level": "moderate",
