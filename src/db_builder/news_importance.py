@@ -176,6 +176,7 @@ CATEGORY_WEIGHTS = {
 GENERIC_PENALTY = 25
 MAX_SCORE = 100
 DEFAULT_EVENT_PRIORITY = 50
+DEFAULT_MARKET_RELEVANCE_MULTIPLIER = 1.0
 
 EVENT_PRIORITY_RULES = [
     ("FOMC decision", 100, ["FOMC decision", "FOMC statement", "Fed rate decision", "Federal Reserve decision"]),
@@ -188,6 +189,63 @@ EVENT_PRIORITY_RULES = [
     ("Regulatory action", 90, ["SEC enforcement", "enforcement action", "DOJ", "FTC", "antitrust", "lawsuit", "approval"]),
     ("Analyst note", 40, ["analyst says", "analyst note", "price target", "upgraded", "downgraded"]),
     ("Generic market recap", 20, ["stocks rise", "stocks fall", "market today", "what to watch", "things to know"]),
+]
+
+MARKET_RELEVANCE_RULES = [
+    (
+        "Top macro / central bank event",
+        1.50,
+        [
+            "FOMC",
+            "CPI",
+            "PPI",
+            "NFP",
+            "Fed speech",
+            "Federal Reserve speech",
+            "ECB decision",
+            "BOJ decision",
+            "rate decision",
+        ],
+    ),
+    (
+        "Policy / geopolitical shock",
+        1.40,
+        [
+            "tariffs",
+            "trade war",
+            "military escalation",
+            "sanctions",
+            "oil supply shock",
+            "supply disruption",
+            "missile strikes",
+        ],
+    ),
+    (
+        "Corporate / regulatory event",
+        1.25,
+        [
+            "earnings release",
+            "earnings",
+            "guidance change",
+            "raises guidance",
+            "cuts guidance",
+            "merger",
+            "acquisition",
+            "regulatory action",
+            "SEC enforcement",
+        ],
+    ),
+    (
+        "Generic market recap",
+        0.50,
+        [
+            "stocks rise",
+            "stocks fall",
+            "market today",
+            "what to watch",
+            "things to know",
+        ],
+    ),
 ]
 
 
@@ -204,6 +262,10 @@ GENERIC_PATTERNS = [(term, _term_pattern(term)) for term in GENERIC_TERMS]
 EVENT_PRIORITY_PATTERNS = [
     (event_type, priority, [(term, _term_pattern(term)) for term in terms])
     for event_type, priority, terms in EVENT_PRIORITY_RULES
+]
+MARKET_RELEVANCE_PATTERNS = [
+    (label, multiplier, [(term, _term_pattern(term)) for term in terms])
+    for label, multiplier, terms in MARKET_RELEVANCE_RULES
 ]
 
 
@@ -286,17 +348,41 @@ def source_priority_score(article: dict) -> float:
     return max(0.0, min(priority, 100.0))
 
 
+def score_market_relevance_multiplier(title: str | None, summary: str | None = None) -> dict:
+    text = f"{title or ''} {summary or ''}".lower()
+    matches = []
+    for label, multiplier, patterns in MARKET_RELEVANCE_PATTERNS:
+        terms = [term for term, pattern in patterns if pattern.search(text)]
+        if terms:
+            matches.append((multiplier, label, terms))
+    if not matches:
+        return {
+            "market_relevance_multiplier": DEFAULT_MARKET_RELEVANCE_MULTIPLIER,
+            "market_relevance_label": "Standard",
+            "market_relevance_reasons": [],
+        }
+
+    multiplier, label, terms = max(matches, key=lambda match: match[0])
+    return {
+        "market_relevance_multiplier": float(multiplier),
+        "market_relevance_label": label,
+        "market_relevance_reasons": [f"{label}: {', '.join(terms[:4])}"],
+    }
+
+
 def classification_priority(article: dict) -> float:
     importance = float(article.get("importance_score") or 0)
     event_priority = float(article.get("event_type_priority") or DEFAULT_EVENT_PRIORITY)
     source_priority = source_priority_score(article)
-    return round(importance * (event_priority / 100.0) * (source_priority / 100.0), 4)
+    market_relevance_multiplier = float(article.get("market_relevance_multiplier") or DEFAULT_MARKET_RELEVANCE_MULTIPLIER)
+    return round(importance * (event_priority / 100.0) * (source_priority / 100.0) * market_relevance_multiplier, 4)
 
 
 def annotate_article_importance(article: dict) -> dict:
     row = article.copy()
     row.update(score_news_importance(row.get("title"), row.get("summary")))
     row.update(score_event_priority(row.get("title"), row.get("summary")))
+    row.update(score_market_relevance_multiplier(row.get("title"), row.get("summary")))
     row["classification_priority"] = classification_priority(row)
     return row
 
@@ -313,6 +399,7 @@ def sort_classification_queue(articles: list[dict], *, min_importance: float | N
             article.get("importance_score") or 0,
             article.get("event_type_priority") or 0,
             article.get("source_priority") or 0,
+            article.get("market_relevance_multiplier") or 0,
             article.get("published_at") is not None,
             article.get("published_at"),
             article.get("fetched_at") is not None,

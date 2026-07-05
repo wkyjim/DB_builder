@@ -46,6 +46,8 @@ def test_health_sql_marks_review_after_five_consecutive_failures():
 
     assert "consecutive_failure_count + 1 >= 5" in source
     assert "enabled_recommendation" in source
+    assert "avg_response_time" in source
+    assert "latest_status" in source
 
 
 def test_health_event_requires_source_identity():
@@ -58,3 +60,18 @@ def test_health_event_requires_source_identity():
     )
 
     assert event.as_row()["source_name"] == "Federal Reserve Press Releases"
+
+
+def test_investing_source_health_event_tracks_identity():
+    event = source_health_success(
+        source_name="Investing.com Economic Indicators",
+        feed_url="https://www.investing.com/rss/news_14.rss",
+        fetch_seconds=0.8,
+        article_count=10,
+    )
+
+    row = event.as_row()
+
+    assert row["source_name"] == "Investing.com Economic Indicators"
+    assert row["feed_url"] == "https://www.investing.com/rss/news_14.rss"
+    assert row["succeeded"] is True

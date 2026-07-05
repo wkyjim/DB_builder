@@ -1,4 +1,5 @@
 import feedparser
+from pathlib import Path
 
 from db_builder.news_fetcher import clean_html, parse_feed_entries
 from db_builder.news_sources import NewsSource
@@ -34,3 +35,11 @@ def test_parse_feed_entries_normalizes_article():
     assert "AI" in articles[0]["matched_keywords"]
     assert articles[0]["source_priority"] == 95
     assert articles[0]["source_category"] == "markets"
+
+
+def test_news_fetch_cli_continues_after_feed_failure():
+    source = Path("scripts/news_fetch.py").read_text(encoding="utf-8")
+
+    assert "except Exception as exc" in source
+    assert "source_health_failure" in source
+    assert "continue" in source

@@ -362,5 +362,41 @@ def test_report_can_append_qwen_overlay(monkeypatch):
         with_qwen_overlay=True,
     )
 
-    assert "## LLM Analyst Overlay" in markdown
-    assert "Positioning: `selective_risk`" in markdown
+    assert "## Qwen Analyst Overlay" in markdown
+    assert "Positioning: **selective_risk**" in markdown
+
+
+def test_generate_daily_report_with_qwen_fallback_does_not_break(monkeypatch):
+    from db_builder.investment_report import generate_investment_report
+
+    class Engine:
+        pass
+
+    monkeypatch.setattr(
+        "db_builder.investment_report.collect_report_data",
+        lambda engine, window_hours: sample_data(),
+    )
+    monkeypatch.setattr(
+        "db_builder.investment_report.generate_qwen_overlay",
+        lambda engine, window_hours, timeout, critical_pm_view=None: {
+            "market_view": "unclear",
+            "positioning": "selective_risk",
+            "risk_level": "moderate",
+            "confidence": 0,
+            "summary": "Local analyst overlay unavailable.",
+            "top_risk": "LLM overlay unavailable.",
+            "top_opportunity": "No model-generated opportunity summary is available.",
+            "preferred_sectors": [],
+            "avoid_sectors": [],
+        },
+    )
+
+    markdown = generate_investment_report(
+        Engine(),
+        window_hours=24,
+        quality_summary=False,
+        with_qwen_overlay=True,
+    )
+
+    assert "## Qwen Analyst Overlay" in markdown
+    assert "Local analyst overlay unavailable." in markdown

@@ -16,7 +16,7 @@ BREADTH_ETFS = [
     "SPY", "QQQ", "IWM", "XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP",
     "XLU", "XLRE", "SMH", "SOXX", "CIBR", "XAR", "NLR", "GRID", "UTES",
 ]
-MACRO_SYMBOLS = ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX", "NQ=F", "ES=F", "RTY=F", "GC=F", "CL=F", "BZ=F", "BTC-USD", "ETH-USD", "^TNX", "^TYX", "DXY"]
+MACRO_SYMBOLS = ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX", "^MOVE", "NQ=F", "ES=F", "RTY=F", "GC=F", "CL=F", "BZ=F", "BTC-USD", "ETH-USD", "^TNX", "^TYX", "DXY", "DX-Y.NYB", "HYG", "LQD", "JNK", "RSP", "IWF", "IWD", "TLT", "IEF", "SHY"]
 RISK_ON_THEMES = {"AI", "Market Sentiment", "Mergers & Acquisitions", "Technology", "Semiconductors", "Financials", "Consumer Discretionary"}
 RISK_OFF_THEMES = {"Geopolitics", "Oil", "Inflation", "Interest Rates", "Monetary Policy", "Regulation", "Credit Stress", "Trade Policy", "Tariffs"}
 

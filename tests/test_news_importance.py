@@ -1,6 +1,11 @@
 from datetime import datetime, timezone
 
-from db_builder.news_importance import score_event_priority, score_news_importance, sort_classification_queue
+from db_builder.news_importance import (
+    score_event_priority,
+    score_market_relevance_multiplier,
+    score_news_importance,
+    sort_classification_queue,
+)
 
 
 def score(title: str, summary: str = "") -> float:
@@ -94,3 +99,44 @@ def test_classification_priority_uses_event_and_source_priority():
 
     assert queue[0]["title"] == fomc["title"]
     assert queue[0]["classification_priority"] > queue[1]["classification_priority"]
+
+
+def test_market_relevance_multiplier_logic_works():
+    assert score_market_relevance_multiplier("FOMC decision after CPI report")["market_relevance_multiplier"] == 1.5
+    assert score_market_relevance_multiplier("New tariffs deepen trade war")["market_relevance_multiplier"] == 1.4
+    assert score_market_relevance_multiplier("Company earnings release raises guidance")["market_relevance_multiplier"] == 1.25
+    assert score_market_relevance_multiplier("Stocks rise in market today")["market_relevance_multiplier"] == 0.5
+
+
+def test_fomc_outranks_generic_recap_with_multiplier():
+    queue = sort_classification_queue(
+        [
+            {
+                "title": "Stocks rise in market today after strong week",
+                "summary": "",
+                "source_priority": 100,
+                "published_at": datetime(2026, 6, 9, tzinfo=timezone.utc),
+            },
+            {
+                "title": "FOMC decision and CPI report shift rate cut expectations",
+                "summary": "",
+                "source_priority": 80,
+                "published_at": datetime(2026, 6, 8, tzinfo=timezone.utc),
+            },
+        ]
+    )
+
+    assert queue[0]["title"].startswith("FOMC decision")
+    assert queue[0]["market_relevance_multiplier"] == 1.5
+
+
+def test_tariff_article_outranks_market_recap():
+    queue = sort_classification_queue(
+        [
+            {"title": "Stocks rise in market today", "summary": "", "source_priority": 100},
+            {"title": "New tariffs trigger trade war fears", "summary": "", "source_priority": 85},
+        ]
+    )
+
+    assert queue[0]["title"].startswith("New tariffs")
+    assert queue[0]["market_relevance_multiplier"] == 1.4

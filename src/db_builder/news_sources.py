@@ -188,6 +188,62 @@ DEFAULT_RSS_SOURCES = [
         category="markets",
         priority=50,
     ),
+    NewsSource(
+        source_name="Investing.com Markets",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_356.rss",
+        category="markets",
+        priority=85,
+    ),
+    NewsSource(
+        source_name="Investing.com Economy",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_357.rss",
+        category="economy",
+        priority=92,
+    ),
+    NewsSource(
+        source_name="Investing.com Commodities",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_1062.rss",
+        category="commodities",
+        priority=80,
+    ),
+    NewsSource(
+        source_name="Investing.com Forex",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_1063.rss",
+        category="forex",
+        priority=80,
+    ),
+    NewsSource(
+        source_name="Investing.com Stock Market",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_11.rss",
+        category="stock_market",
+        priority=90,
+    ),
+    NewsSource(
+        source_name="Investing.com World News",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_25.rss",
+        category="world_news",
+        priority=90,
+    ),
+    NewsSource(
+        source_name="Investing.com Technology",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_95.rss",
+        category="technology",
+        priority=85,
+    ),
+    NewsSource(
+        source_name="Investing.com Economic Indicators",
+        source_type="rss",
+        feed_url="https://www.investing.com/rss/news_14.rss",
+        category="economic_indicators",
+        priority=95,
+    ),
 ]
 
 

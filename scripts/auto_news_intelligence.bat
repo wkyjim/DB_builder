@@ -25,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if (-not (Invoke-RetryPython 'scripts\sector_regime.py' 'sector_regime.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_regime.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\sector_rotation.py' 'sector_rotation.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_rotation.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\secular_themes.py' 'secular_themes.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'secular_themes.py failed after 3 retries'; exit 1 }" ^
-  "if (-not (Invoke-RetryPython 'scripts\investment_report.py' 'investment_report.py' @('--save', '--window-hours', '24', '--no-quality-summary'))) { Write-Log 'ERROR' 'investment_report.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\rule_based_market_update.py' 'rule_based_market_update.py' @('--save', '--window-hours', '24'))) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; exit 1 }" ^
   "Write-Log 'SUCCESS' 'auto_news_intelligence workflow complete'; exit 0"
 
 exit /b %ERRORLEVEL%

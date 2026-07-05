@@ -2,6 +2,7 @@ import time
 import random
 import pandas as pd
 import yfinance as yf
+import argparse
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -41,6 +42,7 @@ ASSETS = [
     ("^DJI", "Dow Jones Industrial Average", "stock_index"),
     ("^RUT", "Russell 2000 Index", "stock_index"),
     ("^VIX", "CBOE Volatility Index", "stock_index"),
+    ("^MOVE", "ICE BofA MOVE Index", "volatility"),
     ("^HSI", "HANG SENG INDEX", "stock_index"),
     ("^N225", "Nikkei 225", "stock_index"),
     ("^KS11", "KOSPI Composite Index", "stock_index"),
@@ -65,6 +67,7 @@ ASSETS = [
     ("^TYX", "Treasury Yield 30 Years", "ust_yield"),
 
     ("EURUSD=X", "EUR/USD", "fx"),
+    ("DX-Y.NYB", "US Dollar Index", "fx"),
     ("JPY=X", "USD/JPY", "fx"),
     ("GBPUSD=X", "GBP/USD", "fx"),
     ("AUDUSD=X", "AUD/USD", "fx"),
@@ -75,6 +78,16 @@ ASSETS = [
 
     ("BTC-USD", "Bitcoin USD", "crypto"),
     ("ETH-USD", "Ethereum USD", "crypto"),
+
+    ("HYG", "iShares iBoxx High Yield Corporate Bond ETF", "credit_proxy"),
+    ("LQD", "iShares iBoxx Investment Grade Corporate Bond ETF", "credit_proxy"),
+    ("JNK", "SPDR Bloomberg High Yield Bond ETF", "credit_proxy"),
+    ("RSP", "Invesco S&P 500 Equal Weight ETF", "equity_style"),
+    ("IWF", "iShares Russell 1000 Growth ETF", "equity_style"),
+    ("IWD", "iShares Russell 1000 Value ETF", "equity_style"),
+    ("TLT", "iShares 20+ Year Treasury Bond ETF", "duration_rates"),
+    ("IEF", "iShares 7-10 Year Treasury Bond ETF", "duration_rates"),
+    ("SHY", "iShares 1-3 Year Treasury Bond ETF", "duration_rates"),
 ]
 
 
@@ -94,6 +107,7 @@ SYMBOL_CLOSE_MAP = {
     "^N225": {"tz": "Asia/Tokyo", "close_time": "15:30"},
     "^RUT": {"tz": "America/New_York", "close_time": "16:00"},
     "^VIX": {"tz": "America/Chicago", "close_time": "15:15"},
+    "^MOVE": {"tz": "America/New_York", "close_time": "16:00"},
     "000001.SS": {"tz": "Asia/Shanghai", "close_time": "15:00"},
 
     "NQ=F": {"tz": "America/New_York", "close_time": "17:00"},
@@ -112,6 +126,7 @@ SYMBOL_CLOSE_MAP = {
     "^TYX": {"tz": "America/New_York", "close_time": "16:00"},
 
     "EURUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "DX-Y.NYB": {"tz": "America/New_York", "close_time": "17:00"},
     "JPY=X": {"tz": "America/New_York", "close_time": "17:00"},
     "GBPUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
     "AUDUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
@@ -122,6 +137,16 @@ SYMBOL_CLOSE_MAP = {
 
     "BTC-USD": {"tz": "UTC", "close_time": "23:59"},
     "ETH-USD": {"tz": "UTC", "close_time": "23:59"},
+
+    "HYG": {"tz": "America/New_York", "close_time": "16:00"},
+    "LQD": {"tz": "America/New_York", "close_time": "16:00"},
+    "JNK": {"tz": "America/New_York", "close_time": "16:00"},
+    "RSP": {"tz": "America/New_York", "close_time": "16:00"},
+    "IWF": {"tz": "America/New_York", "close_time": "16:00"},
+    "IWD": {"tz": "America/New_York", "close_time": "16:00"},
+    "TLT": {"tz": "America/New_York", "close_time": "16:00"},
+    "IEF": {"tz": "America/New_York", "close_time": "16:00"},
+    "SHY": {"tz": "America/New_York", "close_time": "16:00"},
 }
 
 # ============================================================
@@ -367,10 +392,10 @@ def filter_duplicate_symbol_dates(rows, existing_df):
 # YFINANCE
 # ============================================================
 
-def download_recent_batch(symbols, max_retries=5):
+def download_recent_batch(symbols, max_retries=5, start_date=None):
     end_date = datetime.now().date() + timedelta(days=1)
 
-    target_start_date = datetime.now().date() - timedelta(days=LOOKBACK_DAYS)
+    target_start_date = start_date or (datetime.now().date() - timedelta(days=LOOKBACK_DAYS))
     fetch_start_date = target_start_date - timedelta(days=CALC_BUFFER_DAYS)
 
     print(
@@ -449,9 +474,10 @@ def extract_symbol_df_from_batch(batch_df, symbol):
 # DAILY UPDATE
 # ============================================================
 
-def run_daily_update():
+def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_run=False):
     create_macro_table(local_engine)
-    create_macro_table(neon_engine)
+    if upsert_neon:
+        create_macro_table(neon_engine)
 
     asset_map = {
         symbol: {
@@ -462,17 +488,29 @@ def run_daily_update():
     }
 
     symbols = list(asset_map.keys())
+    if symbol_filter:
+        requested = set(symbol_filter)
+        unknown = sorted(requested - set(symbols))
+        if unknown:
+            raise ValueError(f"Unknown macro symbols requested: {unknown}")
+        symbols = [symbol for symbol in symbols if symbol in requested]
 
     print(
         f"Running macro update for {len(symbols)} symbols "
         f"in batches of {BATCH_SIZE}..."
     )
+    if start_date:
+        print(f"[START DATE OVERRIDE] target_start={start_date}")
+    if dry_run:
+        print("[DRY RUN] No rows will be upserted.")
+    if not upsert_neon:
+        print("[LOCAL ONLY] Neon upsert disabled.")
 
     for batch in chunk_list(symbols, BATCH_SIZE):
         print(f"\n[BATCH] {batch[0]} -> {batch[-1]} | {len(batch)} symbols")
 
         try:
-            batch_df, target_start_date = download_recent_batch(batch)
+            batch_df, target_start_date = download_recent_batch(batch, start_date=start_date)
         except Exception as e:
             print(f"[BATCH ERROR] {e}")
             time.sleep(random.uniform(5.0, 15.0))
@@ -569,11 +607,16 @@ def run_daily_update():
             .to_string()
         )
 
+        if dry_run:
+            print(f"[DRY RUN SKIP UPSERT] rows={len(missing_rows):,}")
+            continue
+
         print(f"[UPSERT LOCAL] rows={len(missing_rows):,}")
         upsert_macro(local_engine, missing_rows)
 
-        print(f"[UPSERT NEON] rows={len(missing_rows):,}")
-        upsert_macro(neon_engine, missing_rows)
+        if upsert_neon:
+            print(f"[UPSERT NEON] rows={len(missing_rows):,}")
+            upsert_macro(neon_engine, missing_rows)
 
         print("[BATCH DONE]")
 
@@ -582,7 +625,23 @@ def run_daily_update():
     print("\n[DAILY UPDATE DONE]")
 
 
-if __name__ == "__main__":
-    run_daily_update()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fetch macro/index/ETF data into public.macro.")
+    parser.add_argument("--symbols", default=None, help="Comma-separated symbol subset.")
+    parser.add_argument("--start-date", default=None, help="Target start date in YYYY-MM-DD format.")
+    parser.add_argument("--local-only", action="store_true", help="Upsert local PostgreSQL only.")
+    parser.add_argument("--dry-run", action="store_true", help="Fetch and calculate rows without upserting.")
+    return parser.parse_args()
 
+
+if __name__ == "__main__":
+    args = parse_args()
+    requested_symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()] if args.symbols else None
+    start = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
+    run_daily_update(
+        symbol_filter=requested_symbols,
+        start_date=start,
+        upsert_neon=not args.local_only,
+        dry_run=args.dry_run,
+    )
 

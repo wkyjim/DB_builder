@@ -20,6 +20,10 @@ from db_builder.llm_analyst_overlay import (
     generate_qwen_overlay,
     render_qwen_overlay_markdown,
 )
+from db_builder.market_intelligence_report import (
+    render_daily_house_view_report,
+    render_market_pulse_report,
+)
 from db_builder.news_classifier import _ollama_chat, extract_json_object, ollama_model, ollama_url
 from db_builder.opportunity_scanner import WATCHLIST_UNIVERSE
 
@@ -207,9 +211,14 @@ def fetch_recent_articles(engine, *, window_hours: int, limit: int = 50) -> pd.D
         SELECT
             a.article_id,
             a.title,
+            a.summary,
             a.source_name,
+            a.source_type,
+            a.source_priority,
+            a.source_category,
             a.url,
             a.published_at,
+            a.fetched_at,
             c.sentiment_score,
             c.impact_score,
             c.confidence_score,
@@ -243,7 +252,44 @@ def fetch_latest_macro(engine, *, limit: int = 12) -> pd.DataFrame:
     if df.empty:
         return df
     df["_abs_move"] = df["pct_chg"].astype(float).abs()
-    return df.sort_values("_abs_move", ascending=False).head(limit).drop(columns=["_abs_move"])
+    key_symbols = [
+        "^GSPC",
+        "^IXIC",
+        "^RUT",
+        "^MOVE",
+        "^FVX",
+        "^TNX",
+        "^TYX",
+        "DXY",
+        "DX-Y.NYB",
+        "GC=F",
+        "CL=F",
+        "BZ=F",
+        "HG=F",
+        "^VIX",
+        "BTC-USD",
+        "ETH-USD",
+        "HYG",
+        "LQD",
+        "JNK",
+        "RSP",
+        "IWF",
+        "IWD",
+        "TLT",
+        "IEF",
+        "SHY",
+    ]
+    key_rows = df[df["symbol"].isin(key_symbols)].copy()
+    top_movers = df.sort_values("_abs_move", ascending=False).head(limit)
+    combined = pd.concat([key_rows, top_movers], ignore_index=True)
+    combined["_symbol_order"] = combined["symbol"].apply(
+        lambda symbol: key_symbols.index(symbol) if symbol in key_symbols else len(key_symbols)
+    )
+    return (
+        combined.sort_values(["_symbol_order", "_abs_move"], ascending=[True, False])
+        .drop_duplicates(subset=["symbol"], keep="first")
+        .drop(columns=["_abs_move", "_symbol_order"])
+    )
 
 
 def fetch_latest_watchlist_quality(engine, *, tickers: list[str] | None = None) -> pd.DataFrame:
@@ -738,9 +784,10 @@ def generate_investment_report(
     with_deepseek_cio: bool = False,
     qwen_timeout: int = 120,
     deepseek_timeout: int = 300,
+    report_type: str = "daily",
+    include_appendix: bool = False,
 ) -> str:
     data = collect_report_data(engine, window_hours=window_hours)
-    markdown = render_investment_report(data)
     qwen_overlay = None
     if with_qwen_overlay:
         qwen_overlay = generate_qwen_overlay(
@@ -749,7 +796,20 @@ def generate_investment_report(
             timeout=qwen_timeout,
             critical_pm_view=data.get("critical_house_view"),
         )
-        markdown = markdown.rstrip() + "\n\n" + render_qwen_overlay_markdown(qwen_overlay)
+    if report_type == "pulse":
+        markdown = render_market_pulse_report(data, qwen_overlay=qwen_overlay)
+    elif report_type in {"daily", "house_view"}:
+        markdown = render_daily_house_view_report(
+            data,
+            qwen_overlay=qwen_overlay,
+            include_appendix=include_appendix,
+        )
+    elif report_type == "legacy":
+        markdown = render_investment_report(data)
+        if qwen_overlay:
+            markdown = markdown.rstrip() + "\n\n" + render_qwen_overlay_markdown(qwen_overlay)
+    else:
+        raise ValueError(f"Unknown report_type: {report_type}")
     if with_deepseek_cio:
         commentary = generate_deepseek_cio_commentary(
             markdown,
@@ -764,10 +824,16 @@ def generate_investment_report(
     return append_quality_summary(markdown, timeout=timeout)
 
 
-def save_report(markdown: str, *, generated_at: datetime | None = None, reports_dir: Path | None = None) -> Path:
+def save_report(
+    markdown: str,
+    *,
+    generated_at: datetime | None = None,
+    reports_dir: Path | None = None,
+    prefix: str = "investment_report",
+) -> Path:
     timestamp = (generated_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
     output_dir = reports_dir or (_project_root() / "reports")
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"investment_report_{timestamp}.md"
+    path = output_dir / f"{prefix}_{timestamp}.md"
     path.write_text(markdown, encoding="utf-8")
     return path
