@@ -17,6 +17,7 @@ from db_builder.config import neon_engine as make_neon_engine
 # ============================================================
 
 TABLE_NAME = MACRO_TABLE
+LIVE_TABLE_NAME = "public.macro_live"
 
 BATCH_SIZE = 50
 GLOBAL_BUFFER_MINUTES = 30
@@ -181,6 +182,63 @@ def create_macro_table(engine):
         conn.execute(sql)
 
 
+def create_macro_live_table(engine):
+    sql = text("""
+        CREATE TABLE IF NOT EXISTS public.macro_live (
+            symbol TEXT PRIMARY KEY,
+            market_date DATE NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL,
+            name TEXT,
+            asset_type TEXT,
+
+            open NUMERIC(20,4),
+            high NUMERIC(20,4),
+            low NUMERIC(20,4),
+            close NUMERIC(20,4),
+            adj_close NUMERIC(20,4),
+            volume NUMERIC(20,4),
+
+            prev_close NUMERIC(20,4),
+            change NUMERIC(20,4),
+            pct_chg NUMERIC(20,4),
+            amplitude NUMERIC(20,4),
+            is_market_closed BOOLEAN NOT NULL DEFAULT FALSE,
+            source TEXT NOT NULL DEFAULT 'yfinance'
+        );
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(sql)
+
+
+def replace_macro_live(engine, rows):
+    """Atomically replace the transient intraday snapshot."""
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.where(pd.notna(df), None)
+
+    insert_sql = text("""
+        INSERT INTO public.macro_live (
+            symbol, market_date, observed_at, name, asset_type,
+            open, high, low, close, adj_close, volume,
+            prev_close, change, pct_chg, amplitude,
+            is_market_closed, source
+        )
+        VALUES (
+            :symbol, :market_date, :observed_at, :name, :asset_type,
+            :open, :high, :low, :close, :adj_close, :volume,
+            :prev_close, :change, :pct_chg, :amplitude,
+            :is_market_closed, :source
+        );
+    """)
+
+    with engine.begin() as conn:
+        # This table intentionally contains only the latest fetch snapshot.
+        conn.execute(text("DELETE FROM public.macro_live"))
+        if not df.empty:
+            conn.execute(insert_sql, df.to_dict(orient="records"))
+
+
 def fetch_existing_symbol_dates(engine, symbols, min_date, max_date):
     sql = text("""
         SELECT symbol, date
@@ -305,6 +363,36 @@ def remove_unfinished_bars(df, symbol):
         keep_mask.append(symbol_date_has_closed(symbol, bar_date))
 
     return df[keep_mask].copy()
+
+
+def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None):
+    """Return the latest incomplete daily bar as a transient live snapshot."""
+    if df.empty or len(df) < 2:
+        return None
+
+    ordered = df.sort_values("Date").copy()
+    latest_date = pd.to_datetime(ordered.iloc[-1]["Date"]).date()
+    if symbol_date_has_closed(symbol, latest_date):
+        return None
+
+    calculated = calculate_rows_for_symbol(
+        df=ordered,
+        symbol=symbol,
+        name=name,
+        asset_type=asset_type,
+    )
+    if not calculated:
+        return None
+
+    latest = calculated[-1]
+    if latest["date"] != latest_date:
+        return None
+
+    latest["market_date"] = latest.pop("date")
+    latest["observed_at"] = observed_at or datetime.now(ZoneInfo("UTC"))
+    latest["is_market_closed"] = False
+    latest["source"] = "yfinance"
+    return latest
 
 
 def calculate_rows_for_symbol(df, symbol, name, asset_type):
@@ -475,9 +563,12 @@ def extract_symbol_df_from_batch(batch_df, symbol):
 # ============================================================
 
 def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_run=False):
-    create_macro_table(local_engine)
-    if upsert_neon:
-        create_macro_table(neon_engine)
+    if not dry_run:
+        create_macro_table(local_engine)
+        create_macro_live_table(local_engine)
+        if upsert_neon:
+            create_macro_table(neon_engine)
+            create_macro_live_table(neon_engine)
 
     asset_map = {
         symbol: {
@@ -506,6 +597,9 @@ def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_
     if not upsert_neon:
         print("[LOCAL ONLY] Neon upsert disabled.")
 
+    all_live_rows = []
+    observed_at = datetime.now(ZoneInfo("UTC"))
+
     for batch in chunk_list(symbols, BATCH_SIZE):
         print(f"\n[BATCH] {batch[0]} -> {batch[-1]} | {len(batch)} symbols")
 
@@ -533,6 +627,21 @@ def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_
                     f"[YF DATES RAW] {symbol} | "
                     f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
                 )
+
+                live_row = extract_latest_unfinished_row(
+                    df=symbol_df,
+                    symbol=symbol,
+                    name=meta["name"],
+                    asset_type=meta["asset_type"],
+                    observed_at=observed_at,
+                )
+                if live_row:
+                    all_live_rows.append(live_row)
+                    print(
+                        f"[LIVE SNAPSHOT] {symbol} | "
+                        f"market_date={live_row['market_date']} "
+                        f"close={live_row['close']}"
+                    )
 
                 symbol_df = remove_unfinished_bars(symbol_df, symbol)
 
@@ -622,6 +731,16 @@ def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_
 
         time.sleep(random.uniform(1.0, 3.0))
 
+    print(f"\n[LIVE SNAPSHOT TOTAL] rows={len(all_live_rows):,}")
+    if dry_run:
+        print("[DRY RUN SKIP LIVE REPLACE]")
+    else:
+        print(f"[REPLACE LOCAL LIVE] rows={len(all_live_rows):,}")
+        replace_macro_live(local_engine, all_live_rows)
+        if upsert_neon:
+            print(f"[REPLACE NEON LIVE] rows={len(all_live_rows):,}")
+            replace_macro_live(neon_engine, all_live_rows)
+
     print("\n[DAILY UPDATE DONE]")
 
 
@@ -644,4 +763,3 @@ if __name__ == "__main__":
         upsert_neon=not args.local_only,
         dry_run=args.dry_run,
     )
-

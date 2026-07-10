@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from db_builder.contradiction_audit import audit_report_scores
@@ -17,7 +18,10 @@ from db_builder.theme_strength import rank_themes
 
 def fmt(value, digits: int = 2) -> str:
     try:
-        return str(round(float(value), digits))
+        numeric = float(value)
+        if math.isnan(numeric) or math.isinf(numeric):
+            return "n/a"
+        return str(round(numeric, digits))
     except (TypeError, ValueError):
         return "n/a" if value is None else str(value)
 
@@ -415,6 +419,70 @@ def _sector_dispersion_lines(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _positioning_flow_lines(rows: list[dict]) -> list[str]:
+    if not rows:
+        return [
+            "No positioning/flow signals are available yet.",
+            "",
+            "Phase 1 sources expected here after ingestion: CFTC COT futures positioning and FINRA daily short-sale volume.",
+        ]
+    by_source: dict[str, list[dict]] = {}
+    for row in rows:
+        by_source.setdefault(row.get("source", "Other"), []).append(row)
+    lines = [
+        "Positioning and flow data is used as confirmation only. FINRA short-sale volume is not short interest.",
+        "",
+    ]
+    if by_source.get("CFTC COT"):
+        lines.extend(["### Futures Positioning", ""])
+        lines.extend(
+            table(
+                ["Date", "Asset", "Signal", "Value", "Z", "Percentile", "Interpretation"],
+                [
+                    [
+                        row.get("signal_date", "n/a"),
+                        row.get("asset_id", "n/a"),
+                        row.get("signal_name", "n/a"),
+                        fmt(row.get("signal_value"), 4),
+                        fmt(row.get("z_score")),
+                        fmt(row.get("percentile")),
+                        row.get("interpretation", ""),
+                    ]
+                    for row in by_source["CFTC COT"][:12]
+                ],
+            )
+        )
+        lines.append("")
+    if by_source.get("FINRA short-sale volume"):
+        lines.extend(["### Short-Sale Pressure", ""])
+        lines.extend(
+            table(
+                ["Date", "Ticker", "Signal", "Ratio", "Z", "Interpretation"],
+                [
+                    [
+                        row.get("signal_date", "n/a"),
+                        row.get("asset_id", "n/a"),
+                        row.get("signal_name", "n/a"),
+                        fmt(row.get("signal_value"), 4),
+                        fmt(row.get("z_score")),
+                        row.get("interpretation", ""),
+                    ]
+                    for row in by_source["FINRA short-sale volume"][:15]
+                ],
+            )
+        )
+        lines.append("")
+    missing_sections = [
+        "ETF / Fund Flows: not available until ICI and issuer holdings pipelines are implemented.",
+        "Institutional Ownership: not available until SEC 13F ingestion is implemented.",
+        "Crowding / Squeeze Risks: initial coverage uses CFTC crowded positioning and FINRA elevated short-sale volume only.",
+        "Flow-Confirmed vs Price-Only Themes: deferred until ETF/ICI flow data exists.",
+    ]
+    lines.extend(["### Deferred Flow Sections", ""])
+    lines.extend(f"- {item}" for item in missing_sections)
+    return lines
+
+
 def _sector_name_aliases(name: str) -> list[str]:
     aliases = {
         "Technology": ["Information Technology"],
@@ -553,6 +621,9 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     lines.extend(["", "### Headline Quality Checks", ""])
     lines.append("Noisy headline list: " + ", ".join(row.get("title", "Untitled")[:50] for row in news["noisy_headlines"]) if news["noisy_headlines"] else "No noisy headlines detected by current rules.")
 
+    lines.extend(["", "## Positioning & Flow Dashboard", ""])
+    lines.extend(_positioning_flow_lines(data.get("positioning_flow", [])))
+
     lines.extend(["", "## Contradiction / Audit Flags", ""])
     if flags:
         lines.extend(table(["Severity", "Section", "Issue", "Deterministic Fix"], [[row["severity"], row["section"], row["issue"], row["deterministic_fix"]] for row in flags]))
@@ -560,7 +631,7 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
         lines.append("No contradiction flags were triggered by current deterministic rules.")
 
     lines.extend(["", "## Data Quality Notes", ""])
-    lines.extend([f"- Technical rows loaded: `{len(data.get('technicals', []))}`", f"- S&P 500 constituent technical rows loaded: `{len(data.get('sp500_technicals', []))}`", f"- Macro rows loaded: `{len(data.get('macro', []))}`", f"- Economic rows loaded: `{len(data.get('economic', []))}`", f"- News rows loaded: `{len(data.get('news', []))}`"])
+    lines.extend([f"- Technical rows loaded: `{len(data.get('technicals', []))}`", f"- S&P 500 constituent technical rows loaded: `{len(data.get('sp500_technicals', []))}`", f"- Macro rows loaded: `{len(data.get('macro', []))}`", f"- Economic rows loaded: `{len(data.get('economic', []))}`", f"- News rows loaded: `{len(data.get('news', []))}`", f"- Positioning/flow rows loaded: `{len(data.get('positioning_flow', []))}`"])
     for warning in confidence["warning_flags"][:8]:
         lines.append(f"- {warning}")
     return "\n".join(lines).rstrip() + "\n"

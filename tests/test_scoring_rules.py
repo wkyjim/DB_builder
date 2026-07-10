@@ -200,6 +200,7 @@ def test_rule_based_report_renders_required_sections():
         "### Sector / Theme Alignment",
         "## Three-Month Outperformance Setup",
         "## News Analytics",
+        "## Positioning & Flow Dashboard",
         "## Contradiction / Audit Flags",
         "## Data Quality Notes",
     ]:
@@ -237,3 +238,34 @@ def test_rule_based_report_includes_latest_economic_data_analysis():
     assert "### Global Structural Snapshot" in markdown
     assert "China GDP growth" in markdown
     assert "### ECB FX Snapshot" in markdown
+
+
+def test_rule_based_report_renders_positioning_flow_rows():
+    data = sample_data()
+    data["positioning_flow"] = [
+        {
+            "signal_date": "2026-06-30",
+            "asset_id": "SPX",
+            "signal_name": "COT net position pct open interest",
+            "signal_value": 0.25,
+            "z_score": 2.1,
+            "percentile": 0.97,
+            "interpretation": "Crowded long positioning.",
+            "source": "CFTC COT",
+        },
+        {
+            "signal_date": "2026-07-02",
+            "asset_id": "NVDA",
+            "signal_name": "FINRA short-sale volume ratio",
+            "signal_value": 0.55,
+            "z_score": 2.4,
+            "interpretation": "Elevated short-sale volume.",
+            "source": "FINRA short-sale volume",
+        },
+    ]
+
+    markdown = render_rule_based_market_update(data)
+
+    assert "### Futures Positioning" in markdown
+    assert "### Short-Sale Pressure" in markdown
+    assert "FINRA short-sale volume is not short interest" in markdown

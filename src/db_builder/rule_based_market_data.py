@@ -8,6 +8,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from db_builder.rule_based_config import CORE_MARKET_TICKERS, MACRO_SYMBOLS
+from db_builder.positioning_flow_signals import fetch_positioning_flow_dashboard
 
 
 ECONOMIC_SNAPSHOT_SERIES = [
@@ -246,4 +247,5 @@ def collect_rule_based_inputs(engine, *, window_hours: int) -> dict:
         "economic": fetch_economic_snapshot(engine).to_dict(orient="records"),
         "news": fetch_recent_news(engine, window_hours=window_hours).to_dict(orient="records"),
         "news_signals": fetch_news_signals(engine, window_hours=window_hours).to_dict(orient="records"),
+        "positioning_flow": fetch_positioning_flow_dashboard(engine),
     }
