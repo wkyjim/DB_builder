@@ -1,0 +1,43 @@
+etf_flow:
+  windows:
+    short: 5
+    medium: 20
+    long: 60
+    percentile: 252
+
+  minimums:
+    issuer_consensus_count: 2
+    high_confidence_issuer_count: 3
+    eligible_etf_count: 2
+    history_days_for_zscore: 40
+
+  outliers:
+    max_daily_flow_pct_aum: 0.20
+    winsor_lower_quantile: 0.01
+    winsor_upper_quantile: 0.99
+
+  segment_score_weights:
+    zflow: 10.0
+    momentum: 8.0
+    persistence: 12.0
+    breadth: 10.0
+    consensus: 8.0
+    concentration_penalty: 12.0
+
+  forward_setup_weights:
+    price_trend: 0.20
+    relative_strength: 0.15
+    market_breadth: 0.15
+    etf_flow_persistence: 0.15
+    flow_acceleration: 0.10
+    cross_issuer_consensus: 0.10
+    flow_breadth: 0.10
+    regime_alignment: 0.05
+
+  regime:
+    weight_in_total_regime: 0.15
+
+  exclusions:
+    leveraged: true
+    inverse: true
+    inactive: true

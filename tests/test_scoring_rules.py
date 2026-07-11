@@ -262,10 +262,42 @@ def test_rule_based_report_renders_positioning_flow_rows():
             "interpretation": "Elevated short-sale volume.",
             "source": "FINRA short-sale volume",
         },
+        {
+            "signal_date": "2026-07-10",
+            "asset_id": "QQQ",
+            "asset_group": "Growth / Nasdaq",
+            "display_name": "QQQ - Growth / Nasdaq",
+            "flow_bucket": "Broad Market ETF Flows",
+            "signal_name": "ETF daily net fund flow",
+            "signal_value": 250000000,
+            "z_score": 400000000,
+            "flow_comment": "1D inflow; 5D inflow.",
+            "source": "ETF daily data",
+        },
+        {
+            "signal_date": "2026-07-10",
+            "asset_id": "XLK",
+            "asset_group": "Technology",
+            "display_name": "XLK - Technology",
+            "flow_bucket": "Sector / Thematic ETF Flows",
+            "signal_name": "ETF daily net fund flow",
+            "signal_value": -1250000,
+            "z_score": 2500000,
+            "flow_comment": "1D outflow; 5D inflow.",
+            "source": "ETF daily data",
+        },
     ]
 
     markdown = render_rule_based_market_update(data)
 
     assert "### Futures Positioning" in markdown
+    assert "### ETF Fund Flows" in markdown
+    assert "**Broad Market ETF Flows**" in markdown
+    assert "**Sector / Thematic ETF Flows**" in markdown
+    assert "QQQ - Growth / Nasdaq" in markdown
+    assert "XLK - Technology" in markdown
+    assert "$250,000,000" in markdown
+    assert "-$1,250,000" in markdown
+    assert "1D inflow; 5D inflow." in markdown
     assert "### Short-Sale Pressure" in markdown
     assert "FINRA short-sale volume is not short interest" in markdown

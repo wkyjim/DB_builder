@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from db_builder.contradiction_audit import audit_report_scores
+from db_builder.etf_flow.report_adapter import etf_flow_report_lines
 from db_builder.market_dispersion import compute_broad_market_dispersion, compute_sector_constituent_dispersion
 from db_builder.market_strength import flt
 from db_builder.news_scoring import score_news
@@ -24,6 +25,17 @@ def fmt(value, digits: int = 2) -> str:
         return str(round(numeric, digits))
     except (TypeError, ValueError):
         return "n/a" if value is None else str(value)
+
+
+def fmt_money(value) -> str:
+    try:
+        numeric = float(value)
+        if math.isnan(numeric) or math.isinf(numeric):
+            return "n/a"
+        sign = "-" if numeric < 0 else ""
+        return f"{sign}${abs(numeric):,.0f}"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def table(headers: list[str], rows: list[list]) -> list[str]:
@@ -453,19 +465,48 @@ def _positioning_flow_lines(rows: list[dict]) -> list[str]:
             )
         )
         lines.append("")
+    etf_flow_rows = by_source.get("ETF daily data") or by_source.get("ETF flow proxy")
+    if etf_flow_rows:
+        lines.extend(["### ETF Fund Flows", ""])
+        lines.append("Net fund flow is estimated from ETF shares outstanding changes multiplied by NAV. Flows are grouped into broad-market, fixed-income/macro, and sector/thematic ETFs.")
+        lines.append("")
+        for bucket_title in ["Broad Market ETF Flows", "Fixed Income / Macro ETF Flows", "Sector / Thematic ETF Flows"]:
+            bucket_rows = [row for row in etf_flow_rows if row.get("flow_bucket") == bucket_title]
+            if not bucket_rows:
+                continue
+            lines.extend([f"**{bucket_title}**", ""])
+            lines.extend(
+                table(
+                    ["Date", "ETF / Segment", "1D Net Flow", "5D Net Flow", "Rule-Based Comment"],
+                    [
+                        [
+                            row.get("signal_date", "n/a"),
+                            row.get("display_name") or f"{row.get('asset_id', 'n/a')} - {row.get('asset_group', 'ETF')}",
+                            fmt_money(row.get("signal_value")),
+                            fmt_money(row.get("z_score")),
+                            row.get("flow_comment", ""),
+                        ]
+                        for row in bucket_rows[:12]
+                    ],
+                )
+            )
+            lines.append("")
     if by_source.get("FINRA short-sale volume"):
         lines.extend(["### Short-Sale Pressure", ""])
+        lines.append("Curated to broad index ETFs, sector/theme ETFs, Mag 7, and high-beta chip names. FINRA short-sale volume is not short interest.")
+        lines.append("")
         lines.extend(
             table(
-                ["Date", "Ticker", "Signal", "Ratio", "Z", "Interpretation"],
+                ["Date", "Ticker", "Group", "Ratio", "Z", "Price Move", "Market Implication"],
                 [
                     [
                         row.get("signal_date", "n/a"),
                         row.get("asset_id", "n/a"),
-                        row.get("signal_name", "n/a"),
+                        row.get("asset_group", "n/a"),
                         fmt(row.get("signal_value"), 4),
                         fmt(row.get("z_score")),
-                        row.get("interpretation", ""),
+                        fmt(row.get("pct_chg")),
+                        row.get("market_implication") or row.get("interpretation", ""),
                     ]
                     for row in by_source["FINRA short-sale volume"][:15]
                 ],
@@ -473,10 +514,10 @@ def _positioning_flow_lines(rows: list[dict]) -> list[str]:
         )
         lines.append("")
     missing_sections = [
-        "ETF / Fund Flows: not available until ICI and issuer holdings pipelines are implemented.",
+        "Official ETF / fund flows: current report uses shares-outstanding-derived net fund flow estimates from free ETF metadata.",
         "Institutional Ownership: not available until SEC 13F ingestion is implemented.",
         "Crowding / Squeeze Risks: initial coverage uses CFTC crowded positioning and FINRA elevated short-sale volume only.",
-        "Flow-Confirmed vs Price-Only Themes: deferred until ETF/ICI flow data exists.",
+        "Flow-Confirmed vs Price-Only Themes: partial coverage through ETF flow proxies; stronger coverage requires issuer/ICI adapters.",
     ]
     lines.extend(["### Deferred Flow Sections", ""])
     lines.extend(f"- {item}" for item in missing_sections)
@@ -623,6 +664,9 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
 
     lines.extend(["", "## Positioning & Flow Dashboard", ""])
     lines.extend(_positioning_flow_lines(data.get("positioning_flow", [])))
+
+    lines.extend([""])
+    lines.extend(etf_flow_report_lines(data.get("etf_flow_analytics", {})))
 
     lines.extend(["", "## Contradiction / Audit Flags", ""])
     if flags:

@@ -562,7 +562,54 @@ def extract_symbol_df_from_batch(batch_df, symbol):
 # DAILY UPDATE
 # ============================================================
 
-def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_run=False):
+def run_etf_flow_update_after_macro(*, start_date=None, tickers=None, dry_run=False):
+    """Refresh local ETF daily flow data after the macro market refresh.
+
+    ETF daily flow data is maintained locally because the Neon sync contract
+    currently covers macro/live market data separately. The derived positioning
+    signals are refreshed from the latest local ETF rows.
+    """
+    from db_builder.etf_flows import ETF_FLOW_UNIVERSE, run_etf_flow_fetch
+    from db_builder.positioning_flow_signals import run_positioning_flow_signal_update, setup_flow_tables
+
+    print("\n[ETF FLOW UPDATE]")
+    selected_tickers = [ticker.strip().upper() for ticker in tickers if ticker.strip()] if tickers else None
+    print(f"[ETF FLOW UNIVERSE] tickers={len(selected_tickers) if selected_tickers else len(ETF_FLOW_UNIVERSE)}")
+    if selected_tickers:
+        print(f"[ETF FLOW TICKERS] {','.join(selected_tickers)}")
+    if start_date:
+        print(f"[ETF FLOW START DATE] {start_date}")
+    if dry_run:
+        print("[ETF FLOW DRY RUN] No rows will be upserted.")
+
+    if not dry_run:
+        setup_flow_tables(local_engine)
+
+    result = run_etf_flow_fetch(
+        local_engine,
+        tickers=selected_tickers,
+        dry_run=dry_run,
+        start_date=start_date,
+    )
+    print(
+        f"[ETF FLOW RESULT] snapshots={result['rows']:,} "
+        f"upserted={result['upserted']:,} recomputed={result['recomputed']:,}"
+    )
+    if not dry_run:
+        signal_result = run_positioning_flow_signal_update(local_engine, dry_run=False)
+        print(f"[ETF FLOW SIGNALS] positioning_flow_signals upserted={signal_result['upserted']:,}")
+    return result
+
+
+def run_daily_update(
+    symbol_filter=None,
+    start_date=None,
+    upsert_neon=True,
+    dry_run=False,
+    update_etf_flows=True,
+    etf_flow_start_date=None,
+    etf_flow_tickers=None,
+):
     if not dry_run:
         create_macro_table(local_engine)
         create_macro_live_table(local_engine)
@@ -743,6 +790,19 @@ def run_daily_update(symbol_filter=None, start_date=None, upsert_neon=True, dry_
 
     print("\n[DAILY UPDATE DONE]")
 
+    if update_etf_flows:
+        try:
+            run_etf_flow_update_after_macro(
+                start_date=etf_flow_start_date,
+                tickers=etf_flow_tickers,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            print(f"[ETF FLOW ERROR] {e}")
+            raise
+    else:
+        print("[ETF FLOW SKIP] ETF daily flow refresh disabled.")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fetch macro/index/ETF data into public.macro.")
@@ -750,6 +810,9 @@ def parse_args():
     parser.add_argument("--start-date", default=None, help="Target start date in YYYY-MM-DD format.")
     parser.add_argument("--local-only", action="store_true", help="Upsert local PostgreSQL only.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and calculate rows without upserting.")
+    parser.add_argument("--skip-etf-flows", action="store_true", help="Skip local ETF daily flow refresh after macro update.")
+    parser.add_argument("--etf-flow-start-date", default=None, help="Optional ETF flow backfill start date in YYYY-MM-DD format.")
+    parser.add_argument("--etf-flow-tickers", default=None, help="Optional comma-separated ETF subset for ETF flow refresh.")
     return parser.parse_args()
 
 
@@ -757,9 +820,14 @@ if __name__ == "__main__":
     args = parse_args()
     requested_symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()] if args.symbols else None
     start = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
+    etf_flow_start = datetime.strptime(args.etf_flow_start_date, "%Y-%m-%d").date() if args.etf_flow_start_date else None
+    etf_flow_tickers = [ticker.strip().upper() for ticker in args.etf_flow_tickers.split(",") if ticker.strip()] if args.etf_flow_tickers else None
     run_daily_update(
         symbol_filter=requested_symbols,
         start_date=start,
         upsert_neon=not args.local_only,
         dry_run=args.dry_run,
+        update_etf_flows=not args.skip_etf_flows,
+        etf_flow_start_date=etf_flow_start,
+        etf_flow_tickers=etf_flow_tickers,
     )

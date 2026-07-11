@@ -74,3 +74,67 @@ def test_extract_latest_unfinished_row_skips_completed_bar(monkeypatch):
     )
 
     assert row is None
+
+
+def test_macro_etf_flow_post_step_refreshes_local_flows_and_signals(monkeypatch):
+    calls = []
+
+    def fake_setup_flow_tables(engine):
+        calls.append(("setup", engine))
+
+    def fake_run_etf_flow_fetch(engine, *, tickers, dry_run, start_date):
+        calls.append(("fetch", engine, tickers, dry_run, start_date))
+        return {"rows": 3, "upserted": 3, "recomputed": 6, "sample": []}
+
+    def fake_run_positioning_flow_signal_update(engine, *, dry_run):
+        calls.append(("signals", engine, dry_run))
+        return {"rows": 2, "upserted": 2}
+
+    import db_builder.etf_flows as etf_flows
+    import db_builder.positioning_flow_signals as positioning_flow_signals
+
+    monkeypatch.setattr(macro_data_fetch, "local_engine", object())
+    monkeypatch.setattr(positioning_flow_signals, "setup_flow_tables", fake_setup_flow_tables)
+    monkeypatch.setattr(etf_flows, "run_etf_flow_fetch", fake_run_etf_flow_fetch)
+    monkeypatch.setattr(positioning_flow_signals, "run_positioning_flow_signal_update", fake_run_positioning_flow_signal_update)
+
+    result = macro_data_fetch.run_etf_flow_update_after_macro(
+        start_date=date(2026, 1, 1),
+        tickers=["spy", "ivv"],
+        dry_run=False,
+    )
+
+    assert result["upserted"] == 3
+    assert calls[0][0] == "setup"
+    assert calls[1][0] == "fetch"
+    assert calls[1][2] == ["SPY", "IVV"]
+    assert calls[1][3] is False
+    assert calls[1][4] == date(2026, 1, 1)
+    assert calls[2][0] == "signals"
+
+
+def test_macro_etf_flow_post_step_dry_run_does_not_refresh_signals(monkeypatch):
+    calls = []
+
+    def fake_setup_flow_tables(engine):
+        calls.append(("setup", engine))
+
+    def fake_run_etf_flow_fetch(engine, *, tickers, dry_run, start_date):
+        calls.append(("fetch", tickers, dry_run, start_date))
+        return {"rows": 1, "upserted": 0, "recomputed": 0, "sample": []}
+
+    def fake_run_positioning_flow_signal_update(engine, *, dry_run):
+        calls.append(("signals", dry_run))
+        return {"rows": 0, "upserted": 0}
+
+    import db_builder.etf_flows as etf_flows
+    import db_builder.positioning_flow_signals as positioning_flow_signals
+
+    monkeypatch.setattr(macro_data_fetch, "local_engine", object())
+    monkeypatch.setattr(positioning_flow_signals, "setup_flow_tables", fake_setup_flow_tables)
+    monkeypatch.setattr(etf_flows, "run_etf_flow_fetch", fake_run_etf_flow_fetch)
+    monkeypatch.setattr(positioning_flow_signals, "run_positioning_flow_signal_update", fake_run_positioning_flow_signal_update)
+
+    macro_data_fetch.run_etf_flow_update_after_macro(dry_run=True)
+
+    assert calls == [("fetch", None, True, None)]

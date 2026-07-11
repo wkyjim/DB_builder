@@ -36,7 +36,9 @@ Important entry points:
 
 ## Current Objective
 
-The recent work focused on making the daily pipelines more reliable and making the latest rule-based market update visible on the GitHub Pages market dashboard.
+The recent work first focused on making the daily pipelines more reliable and making the latest rule-based market update visible on the GitHub Pages market dashboard.
+
+The latest work added a production-oriented ETF flow analytics layer. The goal was to move ETF flows from a descriptive 1D/5D table into structured analytics that can support market regime interpretation, flow confidence, price/flow contradictions, leadership rotation, and forward setup scoring.
 
 Acceptance criteria from the current session:
 
@@ -47,6 +49,7 @@ Acceptance criteria from the current session:
 - Macro live snapshots should be stored locally and uploaded to Neon.
 - Economic indicators should remain local-only and not be uploaded to Neon.
 - Latest rule-based report should be copied to `market-dashboard/data/latest-report.md`, committed, and pushed so the website shows it.
+- ETF flow analytics should read existing issuer-derived ETF daily data, calculate flow features, persist analytical tables, and render a structured section in the rule-based report.
 - Document current project structure and updates for the next session.
 
 ## Work Completed
@@ -168,6 +171,109 @@ Important details:
 - `public.flow_source_health` mirrors RSS-style health tracking for fragile external sources.
 - `public.positioning_flow_signals` unifies COT and FINRA-derived signals for reporting.
 
+### ETF Flow Analytics Layer
+
+Files:
+
+- `migrations/20260711_etf_flow_analytics.sql`
+- `config/etf_flow_analytics.yaml`
+- `scripts/etf_flow_analytics.py`
+- `src/db_builder/etf_flow/__init__.py`
+- `src/db_builder/etf_flow/aggregation.py`
+- `src/db_builder/etf_flow/backtest.py`
+- `src/db_builder/etf_flow/breadth.py`
+- `src/db_builder/etf_flow/confidence.py`
+- `src/db_builder/etf_flow/config.py`
+- `src/db_builder/etf_flow/consensus.py`
+- `src/db_builder/etf_flow/feature_engineering.py`
+- `src/db_builder/etf_flow/forward_signal.py`
+- `src/db_builder/etf_flow/models.py`
+- `src/db_builder/etf_flow/momentum.py`
+- `src/db_builder/etf_flow/normalization.py`
+- `src/db_builder/etf_flow/price_flow.py`
+- `src/db_builder/etf_flow/regime.py`
+- `src/db_builder/etf_flow/report_adapter.py`
+- `src/db_builder/etf_flow/repository.py`
+- `src/db_builder/etf_flow/run.py`
+- `src/db_builder/etf_flow/validation.py`
+- `docs/etf_flow_analytics.md`
+- `tests/test_etf_flow_analytics.py`
+- Updated `src/db_builder/rule_based_market_data.py`
+- Updated `src/db_builder/report_renderer.py`
+
+Important details:
+
+- The canonical raw issuer source remains `public.etf_daily_data`.
+- New idempotent schema objects include:
+  - `public.etf_daily_raw`
+  - `public.etf_master`
+  - `public.etf_flow_daily`
+  - `public.etf_flow_features`
+  - `public.etf_flow_segment_daily`
+  - `public.etf_flow_consensus_daily`
+  - `public.etf_flow_rotation_daily`
+  - `public.etf_flow_regime_daily`
+  - `public.etf_flow_forward_signals`
+  - `public.etf_flow_audit_flags`
+- Preferred production flow estimate is:
+  - `(shares_outstanding_t - shares_outstanding_t-1) * nav_t`
+- Lag-NAV audit estimate is also calculated:
+  - `(shares_outstanding_t - shares_outstanding_t-1) * nav_t-1`
+- ETF trading volume is explicitly not treated as fund flow.
+- The analytics package implements:
+  - daily clean flow calculation;
+  - normalized flow/AUM and winsorized observations;
+  - 5D/20D/60D rolling features;
+  - EMA, slope, acceleration, persistence;
+  - cross-issuer consensus;
+  - flow breadth and concentration;
+  - price x flow state matrix;
+  - segment flow scores;
+  - ETF flow regime;
+  - confidence adjustment utilities;
+  - heuristic forward setup scoring;
+  - audit flags;
+  - backtest scaffold with no predictive claim.
+- `scripts/etf_flow_analytics.py` supports:
+  - `--dry-run`
+  - `--upsert-local`
+  - `--start-date`
+  - `--as-of-date`
+  - `--existing-regime-score`
+  - `--json`
+- `rule_based_market_data.collect_rule_based_inputs()` now loads latest persisted ETF flow analytics.
+- `report_renderer.render_rule_based_report()` now renders:
+  - ETF Flow Executive Summary
+  - Market Flow Dashboard
+  - Flow-Confirmed Forward Setups
+  - ETF Flow Contradiction Flags
+
+Recent ETF flow analytics run:
+
+```text
+python scripts/etf_flow_analytics.py --upsert-local --start-date 2026-01-01 --write-report-output
+
+as_of=2026-07-11
+raw=7,590
+daily=7,590
+features=7,590
+segments=5,861
+consensus=5,861
+rotation=5,861
+forward=5,861
+audits=25
+regime=1
+flow_regime=moderate risk-off
+score=32.70
+confidence=34.90
+```
+
+Recent ETF flow report output:
+
+- Report generated: `reports/rule_based_market_update_20260711_113336.md`
+- Dashboard pushed in separate repo:
+  - `market-dashboard` commit `47c2383 Add ETF flow analytics report section`
+
 ### Neon API and Dashboard
 
 Nested repo:
@@ -199,6 +305,8 @@ Works:
 - Targeted tests for report publishing and scoring passed.
 - Eastmoney daily dry-run showed calculated `ytd_pct_chg` in output.
 - YTD local/Neon direct updates completed for existing rows.
+- ETF flow analytics tables have been materialized in local PostgreSQL from existing issuer ETF daily data.
+- Rule-based report renders the new ETF Flow Analytics section from persisted analytical tables.
 
 Partially working:
 
@@ -211,11 +319,14 @@ Not verified:
 - Full `pytest` after all pending changes was not run in this handoff step.
 - Full scheduled `.bat` workflows were not run after the latest commit preparation.
 - GitHub Pages deployment status was not checked after the latest report push.
+- ETF flow analytics has not been wired into the scheduled macro batch yet as a separate explicit step. Macro ETF flow refresh exists, but analytical table refresh should be scheduled deliberately if desired.
+- ETF flow forward setup scores are heuristic only; no historical calibration or predictive validation has been completed.
 
 Uncommitted/generated local artifacts:
 
 - `artifacts/` contains CSV/JSON repair and YTD export outputs. These are generated local files and should not be committed.
 - `reports/` and `logs/` are ignored generated outputs.
+- `docs/` and `migrations/` are ignored by the current `.gitignore` because it has global `*.md` and `*.sql` ignores. ETF flow documentation and migration need `git add -f` when committing.
 
 ## Remaining Work
 
@@ -246,9 +357,28 @@ Priority checklist:
      - `python scripts/positioning_flow_signals.py --dry-run`
    - Then decide whether to upsert COT/FINRA and include flow dashboard in report.
 
-6. Expand market dashboard frontend only after API deployment state is confirmed.
+6. Decide how to schedule ETF flow analytics refresh.
+   - Likely files:
+     - `scripts/macro_data_fetch.py`
+     - `scripts/auto_macro_db.bat`
+     - `scripts/etf_flow_analytics.py`
+   - Suggested daily sequence:
+     - refresh ETF issuer data;
+     - run `scripts/etf_flow_analytics.py --upsert-local --start-date 2026-01-01 --write-report-output`;
+     - generate/publish rule-based market report.
+
+7. Expand market dashboard frontend only after API deployment state is confirmed.
    - Repo: `C:\Users\User\OneDrive\Coding\market-dashboard`.
    - Existing frontend now supports OHLCV chart and grouped tape using current API.
+
+8. Backtest ETF flow forward setup features before treating them as probabilities.
+   - Likely file: `src/db_builder/etf_flow/backtest.py`.
+   - Needed metrics:
+     - rank IC;
+     - hit rate;
+     - top-minus-bottom quintile spread;
+     - signal decay;
+     - regime-conditioned behavior.
 
 ## Known Issues and Risks
 
@@ -264,6 +394,8 @@ Priority checklist:
   - `DB_builder` root
   - `DB_builder/neon-api`
   - `C:\Users\User\OneDrive\Coding\market-dashboard`
+- ETF flow analytics scores can be distorted by limited issuer coverage. The report now surfaces concentration/audit flags; do not hide those.
+- Current ETF flow forward setup labels are descriptive heuristic buckets, not calibrated probabilities.
 
 ## Important Decisions and Constraints
 
@@ -272,6 +404,8 @@ Priority checklist:
 - Economic indicators are local-only to save Neon storage.
 - Latest rule-based report is published as static markdown in `market-dashboard/data/latest-report.md`.
 - Rule-based market update remains deterministic and does not use LLMs for scoring.
+- ETF flow analytics is deterministic and PostgreSQL-backed. It uses issuer-derived shares outstanding and NAV, not secondary-market trading volume.
+- ETF flow regime is a separate input. It does not overwrite the existing market regime score.
 - Daily YTD percent change from Eastmoney is not trusted. It is replaced locally before upsert.
 - Indicator generation uses staged CSV to make interruptions recoverable.
 - Non-core/no-price instruments are excluded from core coverage calculations.
@@ -318,6 +452,14 @@ Generate and publish dashboard report:
 python scripts\rule_based_market_update.py --save --window-hours 24 --publish-dashboard --push-dashboard
 ```
 
+Run ETF flow analytics:
+
+```powershell
+python scripts\etf_flow_analytics.py --dry-run --start-date 2026-01-01
+python scripts\etf_flow_analytics.py --upsert-local --start-date 2026-01-01 --write-report-output
+python scripts\etf_flow_analytics.py --dry-run --start-date 2026-01-01 --json
+```
+
 Daily scheduled report workflow:
 
 ```powershell
@@ -358,6 +500,7 @@ Start with:
 cd C:\Users\User\OneDrive\Coding\DB_builder
 git status --short
 python -m pytest tests\test_rule_based_market_update_script.py tests\test_scoring_rules.py
+python -m pytest tests\test_etf_flow_analytics.py tests\test_etf_flows.py tests\test_positioning_flow_signals.py tests\test_scoring_rules.py
 python scripts\rule_based_market_update.py --save --window-hours 24 --publish-dashboard --push-dashboard
 ```
 
@@ -366,6 +509,9 @@ Then inspect:
 - `scripts/rule_based_market_update.py`
 - `scripts/auto_news_intelligence.bat`
 - `src/db_builder/report_renderer.py`
+- `src/db_builder/etf_flow/aggregation.py`
+- `src/db_builder/etf_flow/repository.py`
+- `scripts/etf_flow_analytics.py`
 - `scripts/indicator_staged_backfill.py`
 - `scripts/pgSQL_daily_bulk_sync_to_neon.py`
 - `src/db_builder/eastmoney.py`
@@ -390,4 +536,7 @@ If the task is dashboard/API related, inspect:
 - `neon-api/`: separate FastAPI repo for Render/Neon API.
 - `notebooks/`: older exploratory notebooks.
 - `config/`: scoring/config files.
+- `migrations/`: idempotent PostgreSQL schema migrations. Currently ignored by `*.sql`; use `git add -f` for committed migrations.
+- `docs/`: implementation documentation. Currently ignored by `*.md`; use `git add -f` for committed docs.
+- `src/db_builder/etf_flow/`: ETF flow analytics package.
 - `C:\Users\User\OneDrive\Coding\market-dashboard`: separate GitHub Pages repo.
