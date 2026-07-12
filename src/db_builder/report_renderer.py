@@ -471,32 +471,6 @@ def _positioning_flow_lines(rows: list[dict]) -> list[str]:
             )
         )
         lines.append("")
-    etf_flow_rows = by_source.get("ETF daily data") or by_source.get("ETF flow proxy")
-    if etf_flow_rows:
-        lines.extend(["### ETF Fund Flows", ""])
-        lines.append("Net fund flow is estimated from ETF shares outstanding changes multiplied by NAV. Flows are grouped into broad-market, fixed-income/macro, and sector/thematic ETFs.")
-        lines.append("")
-        for bucket_title in ["Broad Market ETF Flows", "Fixed Income / Macro ETF Flows", "Sector / Thematic ETF Flows"]:
-            bucket_rows = [row for row in etf_flow_rows if row.get("flow_bucket") == bucket_title]
-            if not bucket_rows:
-                continue
-            lines.extend([f"**{bucket_title}**", ""])
-            lines.extend(
-                table(
-                    ["Date", "ETF / Segment", "1D Net Flow", "5D Net Flow", "Rule-Based Comment"],
-                    [
-                        [
-                            row.get("signal_date", "n/a"),
-                            row.get("display_name") or f"{row.get('asset_id', 'n/a')} - {row.get('asset_group', 'ETF')}",
-                            fmt_money(row.get("signal_value")),
-                            fmt_money(row.get("z_score")),
-                            row.get("flow_comment", ""),
-                        ]
-                        for row in bucket_rows[:12]
-                    ],
-                )
-            )
-            lines.append("")
     if by_source.get("FINRA short-sale volume"):
         lines.extend(["### Short-Sale Pressure", ""])
         lines.append("Curated to broad index ETFs, sector/theme ETFs, Mag 7, and high-beta chip names. FINRA short-sale volume is not short interest.")

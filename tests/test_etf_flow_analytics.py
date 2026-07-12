@@ -399,7 +399,8 @@ def test_representative_report_renders_required_sections():
         )
     )
 
-    assert "ETF Flow Market Confirmation" in rendered
-    assert "Core Asset Flow Table" in rendered
-    assert "Major Sector Flow Table" in rendered
-    assert "Industry and Subsector Rotation Table" in rendered
+    assert "ETF Flows Analysis" in rendered
+    assert "Core Flow Signals" in rendered
+    assert "Sector Flow Signals" in rendered
+    assert "Subsector Rotation Signals" in rendered
+    assert "Representative Exposure Dashboard" not in rendered

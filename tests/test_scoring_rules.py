@@ -313,13 +313,10 @@ def test_rule_based_report_renders_positioning_flow_rows():
     markdown = render_rule_based_market_update(data)
 
     assert "### Futures Positioning" in markdown
-    assert "### ETF Fund Flows" in markdown
-    assert "**Broad Market ETF Flows**" in markdown
-    assert "**Sector / Thematic ETF Flows**" in markdown
-    assert "QQQ - Growth / Nasdaq" in markdown
-    assert "XLK - Technology" in markdown
-    assert "$250,000,000" in markdown
-    assert "-$1,250,000" in markdown
-    assert "1D inflow; 5D inflow." in markdown
+    assert "### ETF Fund Flows" not in markdown
+    assert "**Broad Market ETF Flows**" not in markdown
+    assert "**Sector / Thematic ETF Flows**" not in markdown
+    assert "QQQ - Growth / Nasdaq" not in markdown
+    assert "XLK - Technology" not in markdown
     assert "### Short-Sale Pressure" in markdown
     assert "FINRA short-sale volume is not short interest" in markdown
