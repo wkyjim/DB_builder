@@ -391,6 +391,22 @@ def test_flow_state_uses_5d_and_structural_flow_before_single_day_shock():
     assert _flow_state(soxx_like, ETFAnalyticsConfig()) == "inflow"
 
 
+def test_flow_state_uses_structural_zscores_when_short_flow_is_statistically_neutral():
+    raw = synthetic_representative_raw()
+    daily = build_daily_flow_table(raw)
+    signals = build_etf_flow_signal_daily(daily, raw)
+    ivv_like = signals[signals["ticker"].eq("IVV")].iloc[-1].copy()
+    ivv_like["flow_zscore_1d"] = -0.5
+    ivv_like["flow_zscore_5d"] = -0.55
+    ivv_like["flow_pct_aum_5d"] = -0.006
+    ivv_like["flow_zscore_20d"] = 1.6
+    ivv_like["flow_zscore_60d"] = 1.6
+
+    from db_builder.etf_flow.representative import _flow_state
+
+    assert _flow_state(ivv_like, ETFAnalyticsConfig()) == "inflow"
+
+
 def test_market_flow_score_uses_representative_tickers():
     raw = synthetic_representative_raw()
     daily = build_daily_flow_table(raw)

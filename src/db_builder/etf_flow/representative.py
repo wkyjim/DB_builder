@@ -174,7 +174,7 @@ def _state_from_score(value: float | None, *, band: float = 0.0005) -> str:
 
 
 def _flow_state(row: pd.Series, cfg: ETFAnalyticsConfig) -> str:
-    """Current allocation-flow state using 5D flow first, with 1D as a shock input."""
+    """Current allocation-flow state using statistically meaningful flow evidence."""
     neutral_band = cfg.representative.neutral_flow_pct_aum
     z1 = row.get("flow_zscore_1d")
     z5 = row.get("flow_zscore_5d")
@@ -188,11 +188,6 @@ def _flow_state(row: pd.Series, cfg: ETFAnalyticsConfig) -> str:
             return "inflow"
         if z5 <= -1.0:
             return "outflow"
-    if pd.notna(pct5):
-        if pct5 > neutral_band:
-            return "inflow"
-        if pct5 < -neutral_band:
-            return "outflow"
 
     if pd.notna(z20) and pd.notna(z60):
         if z20 >= 1.0 and z60 >= 1.0:
@@ -201,11 +196,18 @@ def _flow_state(row: pd.Series, cfg: ETFAnalyticsConfig) -> str:
             return "outflow"
 
     if pd.notna(z1):
-        if z1 >= 1.0:
+        if z1 >= 2.0:
             return "inflow"
-        if z1 <= -1.0:
+        if z1 <= -2.0:
             return "outflow"
-    if pd.notna(pct1):
+
+    # Raw percent-flow fallback is used only when z-score context is unavailable.
+    if pd.isna(z5) and pd.isna(z20) and pd.isna(z60) and pd.notna(pct5):
+        if pct5 > neutral_band:
+            return "inflow"
+        if pct5 < -neutral_band:
+            return "outflow"
+    if pd.isna(z1) and pd.isna(z5) and pd.isna(z20) and pd.isna(z60) and pd.notna(pct1):
         if pct1 > neutral_band:
             return "inflow"
         if pct1 < -neutral_band:
