@@ -93,7 +93,17 @@ def dollar_score(macro_rows: list[dict]) -> tuple[float, list[str]]:
     return clamp(score), [f"DXY pct_chg={round(pct, 2)}"]
 
 
-def compute_regime(technical_rows: list[dict], macro_rows: list[dict], news_rows: list[dict], market_strength: dict) -> dict:
+def _etf_flow_score(etf_flow: dict | None) -> tuple[float, list[str]]:
+    if not etf_flow:
+        return 50.0, ["grouped ETF flow unavailable; neutral"]
+    regime = etf_flow.get("flow_regime") or {}
+    score = flt(regime.get("flow_regime_score") or regime.get("score"), 50.0)
+    reliability = flt(regime.get("flow_regime_confidence") or regime.get("confidence"), 0.0)
+    adjusted = clamp(50.0 + (score - 50.0) * reliability / 100.0)
+    return adjusted, [f"grouped ETF flow score={round(score, 2)} reliability={round(reliability, 2)}"]
+
+
+def compute_regime(technical_rows: list[dict], macro_rows: list[dict], news_rows: list[dict], market_strength: dict, etf_flow: dict | None = None) -> dict:
     weights = scoring_weights()["market_regime"]
     equity_rows = [row for row in technical_rows if row.get("ticker") in {"SPY", "QQQ", "IWM", "SMH"}]
     equity_trend = sum(score_above_ma(row) for row in equity_rows) / len(equity_rows) if equity_rows else 50.0
@@ -103,6 +113,7 @@ def compute_regime(technical_rows: list[dict], macro_rows: list[dict], news_rows
     rates, rates_drivers = rates_score(macro_rows)
     dollar, dollar_drivers = dollar_score(macro_rows)
     commodities, commodity_drivers = commodity_score(macro_rows)
+    etf_flow_subscore, etf_flow_drivers = _etf_flow_score(etf_flow)
     news = score_news(news_rows)
     credit_proxy = 50.0
     subscores = {
@@ -114,8 +125,8 @@ def compute_regime(technical_rows: list[dict], macro_rows: list[dict], news_rows
         "credit_proxy": credit_proxy,
         "dollar_fx": dollar,
         "commodity_confirmation": commodities,
+        "etf_flow": etf_flow_subscore,
         "news_confirmation": news["score"],
-        "market_strength": market_strength["score"],
     }
     score = round(sum(subscores[key] * weights[key] for key in weights), 4)
     contributors = sorted(subscores.items(), key=lambda item: item[1], reverse=True)
@@ -130,7 +141,7 @@ def compute_regime(technical_rows: list[dict], macro_rows: list[dict], news_rows
         "subscores": {key: round(value, 4) for key, value in subscores.items()},
         "positive_contributors": [f"{key}={round(value, 2)}" for key, value in contributors if value >= 60][:6],
         "negative_contributors": [f"{key}={round(value, 2)}" for key, value in reversed(contributors) if value <= 45][:6],
-        "drivers": vol_drivers + rates_drivers + dollar_drivers + commodity_drivers,
+        "drivers": vol_drivers + rates_drivers + dollar_drivers + commodity_drivers + etf_flow_drivers,
         "missing_data_warnings": missing,
         "news": news,
     }

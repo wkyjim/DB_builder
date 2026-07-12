@@ -35,9 +35,8 @@ class ETFScoreConfig:
             "zflow": 10.0,
             "momentum": 8.0,
             "persistence": 12.0,
-            "breadth": 10.0,
             "consensus": 8.0,
-            "concentration_penalty": 12.0,
+            "reliability": 10.0,
         }
     )
     forward_setup_weights: dict[str, float] = field(
@@ -45,11 +44,10 @@ class ETFScoreConfig:
             "price_trend": 0.20,
             "relative_strength": 0.15,
             "market_breadth": 0.15,
-            "etf_flow_persistence": 0.15,
+            "etf_flow_persistence": 0.20,
             "flow_acceleration": 0.10,
             "cross_issuer_consensus": 0.10,
-            "flow_breadth": 0.10,
-            "regime_alignment": 0.05,
+            "regime_alignment": 0.10,
         }
     )
 
@@ -57,6 +55,36 @@ class ETFScoreConfig:
 @dataclass(frozen=True)
 class ETFRegimeConfig:
     weight_in_total_regime: float = 0.15
+
+
+@dataclass(frozen=True)
+class ETFGroupingConfig:
+    weighting_method: str = "sqrt_aum"
+    max_single_etf_weight: float = 0.50
+
+
+@dataclass(frozen=True)
+class ETFAvailabilityConfig:
+    high_coverage_threshold: float = 0.70
+    minimum_usable_coverage: float = 0.40
+    complete_coverage_threshold: float = 0.90
+    single_issuer_reliability_cap: float = 65.0
+    stale_after_hours: float = 36.0
+    neutral_flow_pct_aum: float = 0.0005
+
+
+@dataclass(frozen=True)
+class ETFRepresentativeConfig:
+    horizons: tuple[int, ...] = (1, 5, 20, 60)
+    short_zscore_lookback: int = 60
+    long_zscore_lookback: int = 252
+    minimum_observations: int = 40
+    volume_ma_days: int = 20
+    volume_zscore_days: int = 60
+    divergence_threshold_z: float = 1.5
+    extreme_zscore_threshold: float = 2.0
+    neutral_flow_pct_aum: float = 0.0005
+    max_single_etf_weight: float = 0.60
 
 
 @dataclass(frozen=True)
@@ -73,6 +101,9 @@ class ETFAnalyticsConfig:
     outliers: ETFOutlierConfig = field(default_factory=ETFOutlierConfig)
     scores: ETFScoreConfig = field(default_factory=ETFScoreConfig)
     regime: ETFRegimeConfig = field(default_factory=ETFRegimeConfig)
+    grouping: ETFGroupingConfig = field(default_factory=ETFGroupingConfig)
+    availability: ETFAvailabilityConfig = field(default_factory=ETFAvailabilityConfig)
+    representative: ETFRepresentativeConfig = field(default_factory=ETFRepresentativeConfig)
     exclusions: ETFExclusionConfig = field(default_factory=ETFExclusionConfig)
 
 

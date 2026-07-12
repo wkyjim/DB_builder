@@ -887,6 +887,10 @@ def recompute_etf_flow_features(engine) -> int:
                 ELSE NULL
             END,
             flow_method = CASE
+                WHEN e.prev_shares_1d IS NOT NULL AND e.shares_outstanding IS NOT NULL
+                     AND e.shares_outstanding = e.prev_shares_1d
+                     AND COALESCE(e.nav, 0) > 0
+                    THEN 'shares_delta_zero_no_creation_redemption'
                 WHEN e.prev_shares_1d IS NOT NULL AND e.shares_outstanding IS NOT NULL AND COALESCE(e.nav, 0) > 0
                     THEN 'shares_delta_x_today_nav'
                 WHEN e.prev_aum_1d IS NOT NULL AND e.aum IS NOT NULL
@@ -930,7 +934,12 @@ def flow_interpretation(row: dict) -> str:
     if flow is None:
         return f"{ticker} ({category}): daily net flow history is still building."
     direction = "inflow estimate" if flow > 0 else "outflow estimate" if flow < 0 else "flat flow estimate"
-    caveat = "daily net flow = shares outstanding change x today's NAV" if method == "shares_delta_x_today_nav" else "AUM-change estimate, price-contaminated"
+    if method == "shares_delta_zero_no_creation_redemption":
+        caveat = "issuer shares outstanding were unchanged, so estimated primary-market flow is zero"
+    elif method == "shares_delta_x_today_nav":
+        caveat = "daily net flow = shares outstanding change x today's NAV"
+    else:
+        caveat = "AUM-change estimate, price-contaminated"
     return f"{ticker} ({category}): {direction}; {caveat}."
 
 
@@ -975,7 +984,7 @@ def fetch_latest_etf_flow_rows(engine) -> list[dict]:
                 ) AS rn
             FROM public.etf_daily_data
             WHERE date >= (SELECT date FROM max_date) - INTERVAL '14 days'
-              AND source <> 'yfinance metadata'
+              AND source NOT ILIKE '%yfinance%'
         )
         SELECT *
         FROM ranked
@@ -1016,6 +1025,7 @@ def build_etf_flow_signals(rows: list[dict]) -> list[dict]:
                 "percentile": None,
                 "interpretation": flow_interpretation(row),
                 "source": "ETF daily data",
+                "flow_method": row.get("flow_method"),
             }
         )
     return signals

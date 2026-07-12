@@ -12,8 +12,14 @@ from db_builder.etf_flow.repository import (
     setup_etf_flow_analytics_schema,
     upsert_daily,
     upsert_features,
+    upsert_exposures,
+    upsert_divergence_flags,
+    upsert_issuer_availability,
+    upsert_market_flow,
     upsert_raw_from_source,
+    upsert_representative_map,
     upsert_regime,
+    upsert_signal_daily,
     upsert_segments,
     upsert_simple_table,
 )
@@ -37,17 +43,29 @@ def run_etf_flow_analytics(
         "daily": 0,
         "features": 0,
         "segments": 0,
+        "exposures": 0,
+        "issuer_availability": 0,
         "consensus": 0,
         "rotation": 0,
         "forward": 0,
         "audits": 0,
         "regime": 0,
+        "representative_map": 0,
+        "representative_signals": 0,
+        "representative_market_flow": 0,
+        "representative_divergences": 0,
     }
     if not dry_run:
+        writes["representative_map"] = upsert_representative_map(engine)
         writes["raw"] = upsert_raw_from_source(engine, raw)
         writes["daily"] = upsert_daily(engine, tables["daily"])
         writes["features"] = upsert_features(engine, tables["features"])
+        writes["representative_signals"] = upsert_signal_daily(engine, tables["representative_signals"])
+        writes["representative_market_flow"] = upsert_market_flow(engine, output.market_flow)
+        writes["representative_divergences"] = upsert_divergence_flags(engine, tables["representative_divergences"])
         writes["segments"] = upsert_segments(engine, tables["segments"])
+        writes["exposures"] = upsert_exposures(engine, tables["exposures"])
+        writes["issuer_availability"] = upsert_issuer_availability(engine, tables["issuer_availability"])
         writes["consensus"] = upsert_simple_table(
             engine,
             tables["consensus"],
@@ -80,6 +98,9 @@ def run_etf_flow_analytics(
         "daily_rows": len(tables["daily"]),
         "feature_rows": len(tables["features"]),
         "segment_rows": len(tables["segments"]),
+        "exposure_rows": len(tables["exposures"]),
+        "representative_signal_rows": len(tables["representative_signals"]),
+        "representative_divergence_rows": len(tables["representative_divergences"]),
         "as_of_date": output.as_of_date.isoformat() if output.as_of_date else None,
         "writes": writes,
         "output": output.to_dict(),

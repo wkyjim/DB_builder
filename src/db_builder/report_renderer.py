@@ -49,13 +49,19 @@ def score_all(data: dict) -> dict:
     macro = data.get("macro", [])
     news_rows = data.get("news", [])
     news_signals = data.get("news_signals", [])
+    etf_flow = data.get("etf_flow_analytics", {})
+    flow_by_exposure = {
+        row.get("exposure_id"): row
+        for row in (etf_flow.get("exposures") or etf_flow.get("market_segments") or [])
+        if row.get("exposure_id")
+    }
     from db_builder.market_strength import compute_market_strength
 
     market_strength = compute_market_strength(technicals)
-    regime = compute_regime(technicals, macro, news_rows, market_strength)
+    regime = compute_regime(technicals, macro, news_rows, market_strength, etf_flow)
     confidence = compute_confidence(regime, market_strength, technicals, macro, news_rows)
-    sectors = rank_sectors(technicals, news_signals)
-    themes = rank_themes(technicals, news_signals)
+    sectors = rank_sectors(technicals, news_signals, flow_by_exposure)
+    themes = rank_themes(technicals, news_signals, flow_by_exposure)
     sector_theme_alignment = align_sector_themes(sectors, themes)
     news = score_news(news_rows)
     broad_dispersion = compute_broad_market_dispersion(technicals)
@@ -517,7 +523,7 @@ def _positioning_flow_lines(rows: list[dict]) -> list[str]:
         "Official ETF / fund flows: current report uses shares-outstanding-derived net fund flow estimates from free ETF metadata.",
         "Institutional Ownership: not available until SEC 13F ingestion is implemented.",
         "Crowding / Squeeze Risks: initial coverage uses CFTC crowded positioning and FINRA elevated short-sale volume only.",
-        "Flow-Confirmed vs Price-Only Themes: partial coverage through ETF flow proxies; stronger coverage requires issuer/ICI adapters.",
+        "Grouped exposure flow reliability: use issuer coverage and availability status before treating ETF flow as confirmation.",
     ]
     lines.extend(["### Deferred Flow Sections", ""])
     lines.extend(f"- {item}" for item in missing_sections)
@@ -554,6 +560,7 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     flags = scores["audit_flags"]
     broad_dispersion = scores.get("broad_dispersion", {})
     sector_dispersion = scores.get("sector_dispersion", [])
+    etf_regime = (data.get("etf_flow_analytics") or {}).get("flow_regime") or {}
 
     lines = [
         "# Rule-Based Institutional Market Update",
@@ -566,6 +573,7 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
         f"- Regime score: **{fmt(regime['score'])} / 100** ({regime['label']})",
         f"- Market strength: **{fmt(strength['score'])} / 100** ({strength['label']})",
         f"- Evidence quality: **{fmt(confidence['score'])} / 100**",
+        f"- ETF flow contribution: **{fmt(etf_regime.get('flow_regime_score') or etf_regime.get('score'))} / 100**, reliability **{fmt(etf_regime.get('flow_regime_confidence') or etf_regime.get('confidence'))} / 100**",
         f"- Breadth: **{strength['breadth']['label']}**; above 50DMA `{fmt(strength['breadth']['above_50d_pct'])}%`, above 200DMA `{fmt(strength['breadth']['above_200d_pct'])}%`",
         f"- Top sector score: **{sectors[0]['sector']}** `{fmt(sectors[0]['score'])}`" if sectors else "- Top sector score: unavailable",
         f"- Top theme score: **{themes[0]['theme']}** `{fmt(themes[0]['score'])}`" if themes else "- Top theme score: unavailable",
@@ -613,7 +621,7 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     lines.append("")
     lines.extend(
         table(
-            ["Rank", "Sector", "Score", "Trend", "Momentum", "Breadth", "3M RS", "Supporting / Leaders", "Detracting / Laggards"],
+            ["Rank", "Sector", "Score", "Trend", "Momentum", "Stock Breadth", "ETF Flow", "Flow Reliability", "3M RS", "Supporting / Leaders", "Detracting / Laggards"],
             [
                 [
                     idx,
@@ -622,6 +630,8 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
                     row["trend_label"],
                     row["momentum_label"],
                     row["breadth_label"],
+                    fmt(row["components"].get("grouped_etf_flow")),
+                    fmt(row.get("flow_reliability")),
                     fmt(row["three_month_relative_strength"]),
                     ", ".join(_constituent_leaders_for_sector(row["sector"], sector_dispersion, "leaders") or row["top_supporting_tickers"]),
                     ", ".join(_constituent_leaders_for_sector(row["sector"], sector_dispersion, "laggards") or row["top_detracting_tickers"]),
@@ -632,7 +642,7 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     )
 
     lines.extend(["", "### Thematic Strength", ""])
-    lines.extend(table(["Rank", "Theme", "Score", "Setup", "Dispersion", "Price", "News"], [[idx, row["theme"], fmt(row["score"]), row["setup_label"], fmt(row["dispersion"]), row["price_confirmation"], row["news_confirmation"]] for idx, row in enumerate(themes[:15], start=1)]))
+    lines.extend(table(["Rank", "Theme", "Score", "Setup", "ETF Flow", "Flow Reliability", "Dispersion", "Price", "News"], [[idx, row["theme"], fmt(row["score"]), row["setup_label"], fmt(row["components"].get("grouped_etf_flow")), fmt(row.get("flow_reliability")), fmt(row["dispersion"]), row["price_confirmation"], row["news_confirmation"]] for idx, row in enumerate(themes[:15], start=1)]))
     improving = sorted(themes, key=lambda row: flt(row["components"].get("relative_return")), reverse=True)[:5]
     deteriorating = sorted(themes, key=lambda row: flt(row["components"].get("relative_return")))[:5]
     lines.extend(["", f"- Top 5 improving themes: {', '.join(row['theme'] for row in improving)}"])

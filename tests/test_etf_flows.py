@@ -56,6 +56,20 @@ def test_flow_interpretation_labels_proxy_not_official_flow():
     assert "shares outstanding change x today's NAV" in text
 
 
+def test_flow_interpretation_explains_zero_creation_redemption():
+    text = flow_interpretation(
+        {
+            "etf_ticker": "IJH",
+            "category": "Mid Caps",
+            "net_fund_flow_1d": 0,
+            "flow_method": "shares_delta_zero_no_creation_redemption",
+        }
+    )
+
+    assert "flat flow estimate" in text
+    assert "shares outstanding were unchanged" in text
+
+
 def test_issuer_registry_maps_core_etfs():
     assert ETF_ISSUER_REGISTRY["XLK"]["issuer"] == "State Street / SPDR"
     assert ETF_ISSUER_REGISTRY["QQQ"]["issuer"] == "Invesco"
@@ -304,6 +318,7 @@ def test_build_etf_flow_signals_outputs_positioning_signal_rows():
 
     assert signals[0]["asset_id"] == "SMH"
     assert signals[0]["source"] == "ETF daily data"
+    assert signals[0]["flow_method"] == "shares_delta_x_today_nav"
     assert signals[0]["signal_name"] == "ETF daily net fund flow"
     assert signals[0]["z_score"] == -100_000_000
     assert "outflow estimate" in signals[0]["interpretation"]

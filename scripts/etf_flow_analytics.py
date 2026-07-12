@@ -45,17 +45,22 @@ def main() -> None:
         return
     mode = "DRY RUN" if dry_run else "UPSERT LOCAL"
     print(f"[{mode}] ETF flow analytics as_of={result['as_of_date']}")
-    print(f"raw={result['raw_rows']:,} daily={result['daily_rows']:,} features={result['feature_rows']:,} segments={result['segment_rows']:,}")
+    print(
+        f"raw={result['raw_rows']:,} daily={result['daily_rows']:,} "
+        f"features={result['feature_rows']:,} segments={result['segment_rows']:,} "
+        f"exposures={result.get('exposure_rows', 0):,}"
+    )
     print(f"writes={result['writes']}")
     regime = result["output"].get("flow_regime") or {}
     print(
         "flow_regime="
         f"{regime.get('label')} score={regime.get('score')} confidence={regime.get('confidence')}"
     )
-    for row in result["output"].get("market_segments", [])[:8]:
+    for row in result["output"].get("exposures", [])[:8]:
         print(
-            f"- {row.get('segment')}: score={row.get('score'):.1f} "
-            f"signal={row.get('signal')} confidence={row.get('confidence'):.1f}"
+            f"- {row.get('exposure_name')}: score={row.get('adjusted_flow_score'):.1f} "
+            f"signal={row.get('flow_signal')} reliability={row.get('signal_reliability'):.1f} "
+            f"status={row.get('data_availability_status')}"
         )
 
 

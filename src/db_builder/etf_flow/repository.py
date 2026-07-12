@@ -11,6 +11,8 @@ import pandas as pd
 from sqlalchemy import text
 
 from db_builder.etf_flows import ETF_FLOW_UNIVERSE, ETF_ISSUER_REGISTRY
+from db_builder.etf_flow.exposure_mapping import attach_exposure_columns
+from db_builder.etf_flow.representative import representative_rows
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -39,7 +41,7 @@ def build_master_rows() -> list[dict[str, Any]]:
         registry = ETF_ISSUER_REGISTRY.get(ticker, {})
         name = ticker
         rows.append(
-            {
+            attach_exposure_columns({
                 "ticker": ticker,
                 "fund_name": name,
                 "issuer": registry.get("issuer"),
@@ -61,7 +63,7 @@ def build_master_rows() -> list[dict[str, Any]]:
                 "is_active": True,
                 "flow_eligible": True,
                 "classification_version": "2026-07-11",
-            }
+            })
         )
     return rows
 
@@ -69,6 +71,7 @@ def build_master_rows() -> list[dict[str, Any]]:
 def upsert_etf_master(engine, rows: list[dict[str, Any]] | None = None) -> int:
     setup_etf_flow_analytics_schema(engine)
     payload = rows or build_master_rows()
+    payload = [row if row.get("exposure_id") else attach_exposure_columns(row) for row in payload]
     if not payload:
         return 0
     sql = text(
@@ -77,13 +80,15 @@ def upsert_etf_master(engine, rows: list[dict[str, Any]] | None = None) -> int:
             ticker, fund_name, issuer, asset_class, primary_segment, secondary_segment,
             sector, theme, style, region, duration_bucket, credit_quality, commodity_type,
             currency, benchmark, inception_date, is_leveraged, is_inverse, is_active,
-            flow_eligible, classification_version, updated_at
+            flow_eligible, classification_version, exposure_id, exposure_name, exposure_type,
+            benchmark_family, is_primary_proxy, allocation_weight_cap, updated_at
         )
         VALUES (
             :ticker, :fund_name, :issuer, :asset_class, :primary_segment, :secondary_segment,
             :sector, :theme, :style, :region, :duration_bucket, :credit_quality, :commodity_type,
             :currency, :benchmark, :inception_date, :is_leveraged, :is_inverse, :is_active,
-            :flow_eligible, :classification_version, now()
+            :flow_eligible, :classification_version, :exposure_id, :exposure_name, :exposure_type,
+            :benchmark_family, :is_primary_proxy, :allocation_weight_cap, now()
         )
         ON CONFLICT (ticker)
         DO UPDATE SET
@@ -101,6 +106,54 @@ def upsert_etf_master(engine, rows: list[dict[str, Any]] | None = None) -> int:
             is_active = EXCLUDED.is_active,
             flow_eligible = EXCLUDED.flow_eligible,
             classification_version = EXCLUDED.classification_version,
+            exposure_id = EXCLUDED.exposure_id,
+            exposure_name = EXCLUDED.exposure_name,
+            exposure_type = EXCLUDED.exposure_type,
+            benchmark_family = EXCLUDED.benchmark_family,
+            is_primary_proxy = EXCLUDED.is_primary_proxy,
+            allocation_weight_cap = EXCLUDED.allocation_weight_cap,
+            updated_at = now();
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, payload)
+    return len(payload)
+
+
+def upsert_representative_map(engine, rows: list[dict[str, Any]] | None = None) -> int:
+    setup_etf_flow_analytics_schema(engine)
+    payload = rows or representative_rows()
+    if not payload:
+        return 0
+    sql = text(
+        """
+        INSERT INTO public.etf_representative_map (
+            exposure_id, exposure_name, exposure_type, primary_ticker, secondary_ticker,
+            tertiary_ticker, primary_issuer, benchmark_family, selection_priority,
+            aggregation_allowed, divergence_threshold_z, minimum_history_days,
+            is_active, notes, updated_at
+        )
+        VALUES (
+            :exposure_id, :exposure_name, :exposure_type, :primary_ticker, :secondary_ticker,
+            :tertiary_ticker, :primary_issuer, :benchmark_family, :selection_priority,
+            :aggregation_allowed, :divergence_threshold_z, :minimum_history_days,
+            :is_active, :notes, now()
+        )
+        ON CONFLICT (exposure_id)
+        DO UPDATE SET
+            exposure_name = EXCLUDED.exposure_name,
+            exposure_type = EXCLUDED.exposure_type,
+            primary_ticker = EXCLUDED.primary_ticker,
+            secondary_ticker = EXCLUDED.secondary_ticker,
+            tertiary_ticker = EXCLUDED.tertiary_ticker,
+            primary_issuer = EXCLUDED.primary_issuer,
+            benchmark_family = EXCLUDED.benchmark_family,
+            selection_priority = EXCLUDED.selection_priority,
+            aggregation_allowed = EXCLUDED.aggregation_allowed,
+            divergence_threshold_z = EXCLUDED.divergence_threshold_z,
+            minimum_history_days = EXCLUDED.minimum_history_days,
+            is_active = EXCLUDED.is_active,
+            notes = EXCLUDED.notes,
             updated_at = now();
         """
     )
@@ -113,6 +166,28 @@ def fetch_raw_etf_flow_source(engine, *, start_date=None, as_of_date=None) -> pd
     setup_etf_flow_analytics_schema(engine)
     upsert_etf_master(engine)
     sql = """
+        WITH ranked_source AS (
+            SELECT
+                d.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY d.date, d.etf_ticker
+                    ORDER BY
+                        CASE
+                            WHEN d.source ILIKE '%navhist%' THEN 0
+                            WHEN d.source ILIKE '%First Trust%' THEN 0
+                            WHEN d.source ILIKE '%BlackRock historical%' THEN 0
+                            WHEN d.source ILIKE '%BlackRock fund download%' THEN 1
+                            WHEN d.source ILIKE '%VanEck%' THEN 1
+                            ELSE 3
+                        END,
+                        CASE WHEN d.net_fund_flow_1d IS NULL THEN 1 ELSE 0 END,
+                        ABS(COALESCE(d.net_fund_flow_1d, 0)) DESC,
+                        d.updated_at DESC NULLS LAST
+                ) AS source_rank
+            FROM public.etf_daily_data d
+            WHERE d.source NOT ILIKE '%yfinance%'
+              AND d.source NOT ILIKE '%BlackRock fund download%'
+        )
         SELECT
             d.date,
             d.etf_ticker AS ticker,
@@ -120,6 +195,12 @@ def fetch_raw_etf_flow_source(engine, *, start_date=None, as_of_date=None) -> pd
             COALESCE(m.fund_name, d.etf_ticker) AS fund_name,
             m.asset_class,
             m.primary_segment,
+            m.exposure_id,
+            m.exposure_name,
+            m.exposure_type,
+            m.benchmark_family,
+            m.is_primary_proxy,
+            m.allocation_weight_cap,
             m.secondary_segment,
             m.sector,
             m.theme,
@@ -129,18 +210,20 @@ def fetch_raw_etf_flow_source(engine, *, start_date=None, as_of_date=None) -> pd
             m.credit_quality,
             d.shares_outstanding,
             d.nav,
-            COALESCE(d.market_price, d.nav) AS close,
-            COALESCE(d.market_price, d.nav) AS adjusted_close,
+            COALESCE(d.market_price, p.close, d.nav) AS close,
+            COALESCE(d.market_price, p.close, d.nav) AS adjusted_close,
             d.aum,
-            NULL::numeric AS volume,
+            p.volume::numeric AS volume,
             COALESCE(m.currency, 'USD') AS currency,
             COALESCE(m.is_active, true) AS is_active,
             d.source,
             d.updated_at AS loaded_at
-        FROM public.etf_daily_data d
+        FROM ranked_source d
         LEFT JOIN public.etf_master m ON m.ticker = d.etf_ticker
+        LEFT JOIN public.us_equities p ON p.ticker = d.etf_ticker AND p.date = d.date
         WHERE (:start_date IS NULL OR d.date >= :start_date)
           AND (:as_of_date IS NULL OR d.date <= :as_of_date)
+          AND d.source_rank = 1
           AND COALESCE(m.flow_eligible, true) = true
           AND COALESCE(m.is_leveraged, false) = false
           AND COALESCE(m.is_inverse, false) = false
@@ -306,6 +389,93 @@ def upsert_features(engine, features: pd.DataFrame) -> int:
     return len(payload)
 
 
+def upsert_signal_daily(engine, signals: pd.DataFrame) -> int:
+    columns = [
+        "date", "ticker", "exposure_id", "exposure_type",
+        "flow_1d", "flow_5d", "flow_20d", "flow_60d",
+        "flow_pct_aum_1d", "flow_pct_aum_5d", "flow_pct_aum_20d", "flow_pct_aum_60d",
+        "flow_zscore_1d", "flow_zscore_5d", "flow_zscore_20d", "flow_zscore_60d",
+        "flow_percentile_20d", "flow_percentile_60d",
+        "positive_flow_days_20d", "positive_flow_days_60d",
+        "flow_persistence_20d", "flow_persistence_60d",
+        "consecutive_inflow_days", "consecutive_outflow_days",
+        "flow_momentum", "flow_acceleration", "flow_rotation_state",
+        "volume_ratio_20d", "volume_ratio_60d", "volume_zscore_20d", "volume_zscore_60d",
+        "dollar_volume", "dollar_volume_ratio_20d", "dollar_volume_zscore_60d",
+        "price_state", "flow_state", "volume_state", "price_flow_volume_state",
+        "state_strength", "state_confidence", "interpretation", "data_quality_score",
+    ]
+    if signals.empty:
+        return 0
+    payload = _records(signals[[col for col in columns if col in signals.columns]])
+    placeholders = ", ".join(f":{col}" for col in columns)
+    update_cols = ", ".join(f"{col} = EXCLUDED.{col}" for col in columns if col not in {"date", "ticker"})
+    sql = text(
+        f"""
+        INSERT INTO public.etf_flow_signal_daily ({", ".join(columns)}, created_at)
+        VALUES ({placeholders}, now())
+        ON CONFLICT (date, ticker)
+        DO UPDATE SET {update_cols}, created_at = now();
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, payload)
+    return len(payload)
+
+
+def upsert_market_flow(engine, market_flow: dict[str, Any]) -> int:
+    if not market_flow:
+        return 0
+    columns = [
+        "date", "equity_risk_flow_score", "credit_risk_flow_score",
+        "sector_cyclicality_flow_score", "cash_preference_score",
+        "duration_demand_score", "duration_liquidity_score", "gold_signal",
+        "bitcoin_signal", "alternative_asset_score", "alternative_asset_interpretation",
+        "market_flow_score", "market_flow_regime", "market_flow_reliability",
+    ]
+    row = {col: market_flow.get(col) for col in columns}
+    placeholders = ", ".join(f":{col}" for col in columns)
+    update_cols = ", ".join(f"{col} = EXCLUDED.{col}" for col in columns if col != "date")
+    sql = text(
+        f"""
+        INSERT INTO public.etf_market_flow_daily ({", ".join(columns)}, created_at)
+        VALUES ({placeholders}, now())
+        ON CONFLICT (date)
+        DO UPDATE SET {update_cols}, created_at = now();
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, row)
+    return 1
+
+
+def upsert_divergence_flags(engine, flags: pd.DataFrame) -> int:
+    columns = [
+        "date", "flag_type", "severity", "exposure_id", "primary_ticker",
+        "comparison_ticker", "description", "interpretation",
+    ]
+    if flags.empty:
+        return 0
+    payload = _records(flags[[col for col in columns if col in flags.columns]])
+    placeholders = ", ".join(f":{col}" for col in columns)
+    update_cols = ", ".join(
+        f"{col} = EXCLUDED.{col}"
+        for col in columns
+        if col not in {"date", "flag_type", "exposure_id", "primary_ticker", "comparison_ticker"}
+    )
+    sql = text(
+        f"""
+        INSERT INTO public.etf_flow_divergence_flags ({", ".join(columns)}, created_at)
+        VALUES ({placeholders}, now())
+        ON CONFLICT (date, flag_type, exposure_id, primary_ticker, comparison_ticker)
+        DO UPDATE SET {update_cols}, created_at = now();
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, payload)
+    return len(payload)
+
+
 def upsert_segments(engine, segments: pd.DataFrame) -> int:
     columns = [
         "date", "segment_type", "segment", "flow_1d", "flow_5d", "flow_20d", "flow_60d",
@@ -324,6 +494,66 @@ def upsert_segments(engine, segments: pd.DataFrame) -> int:
         INSERT INTO public.etf_flow_segment_daily ({", ".join(columns)}, created_at)
         VALUES ({placeholders}, now())
         ON CONFLICT (date, segment_type, segment)
+        DO UPDATE SET {update_cols}, created_at = now();
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, payload)
+    return len(payload)
+
+
+def upsert_exposures(engine, exposures: pd.DataFrame) -> int:
+    columns = [
+        "date", "analysis_timestamp", "exposure_id", "exposure_name", "exposure_type",
+        "known_flow_1d", "known_flow_5d", "known_flow_20d",
+        "normalized_flow_1d", "normalized_flow_5d", "normalized_flow_20d",
+        "flow_momentum", "flow_acceleration", "flow_persistence",
+        "reported_etf_count", "eligible_etf_count", "reported_issuer_count", "eligible_issuer_count",
+        "issuer_aum_coverage", "data_availability_status", "issuer_agreement_score",
+        "signal_reliability", "raw_flow_score", "adjusted_flow_score", "flow_signal", "is_provisional",
+    ]
+    if exposures.empty:
+        return 0
+    payload = _records(exposures[[col for col in columns if col in exposures.columns]])
+    placeholders = ", ".join(f":{col}" for col in columns)
+    update_cols = ", ".join(
+        f"{col} = EXCLUDED.{col}"
+        for col in columns
+        if col not in {"date", "analysis_timestamp", "exposure_id"}
+    )
+    sql = text(
+        f"""
+        INSERT INTO public.etf_flow_exposure_daily ({", ".join(columns)}, created_at)
+        VALUES ({placeholders}, now())
+        ON CONFLICT (date, analysis_timestamp, exposure_id)
+        DO UPDATE SET {update_cols}, created_at = now();
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql, payload)
+    return len(payload)
+
+
+def upsert_issuer_availability(engine, availability: pd.DataFrame) -> int:
+    columns = [
+        "analysis_timestamp", "effective_date", "issuer", "expected_release_at",
+        "source_published_at", "ingested_at", "availability_status", "eligible_aum",
+        "reported_aum", "freshness_hours", "data_quality_score",
+    ]
+    if availability.empty:
+        return 0
+    payload = _records(availability[[col for col in columns if col in availability.columns]])
+    placeholders = ", ".join(f":{col}" for col in columns)
+    update_cols = ", ".join(
+        f"{col} = EXCLUDED.{col}"
+        for col in columns
+        if col not in {"analysis_timestamp", "effective_date", "issuer"}
+    )
+    sql = text(
+        f"""
+        INSERT INTO public.etf_issuer_data_availability ({", ".join(columns)}, created_at)
+        VALUES ({placeholders}, now())
+        ON CONFLICT (analysis_timestamp, effective_date, issuer)
         DO UPDATE SET {update_cols}, created_at = now();
         """
     )
@@ -407,17 +637,22 @@ def upsert_regime(engine, regime: dict[str, Any], as_of_date) -> int:
 def fetch_latest_analytics_output(engine) -> dict[str, Any]:
     setup_etf_flow_analytics_schema(engine)
     regime = pd.read_sql(
-        text("SELECT * FROM public.etf_flow_regime_daily ORDER BY date DESC LIMIT 1"),
+        text("SELECT * FROM public.etf_flow_regime_daily ORDER BY created_at DESC, date DESC LIMIT 1"),
         engine,
     ).to_dict(orient="records")
     segments = pd.read_sql(
         text(
             """
             SELECT *
-            FROM public.etf_flow_segment_daily
-            WHERE date = (SELECT MAX(date) FROM public.etf_flow_segment_daily)
-            ORDER BY score DESC NULLS LAST
-            LIMIT 15
+            FROM public.etf_flow_exposure_daily
+            WHERE (date, analysis_timestamp) = (
+                SELECT date, analysis_timestamp
+                FROM public.etf_flow_exposure_daily
+                ORDER BY created_at DESC, analysis_timestamp DESC, date DESC
+                LIMIT 1
+            )
+            ORDER BY adjusted_flow_score DESC NULLS LAST
+            LIMIT 40
             """
         ),
         engine,
@@ -446,9 +681,58 @@ def fetch_latest_analytics_output(engine) -> dict[str, Any]:
         ),
         engine,
     ).to_dict(orient="records")
+    market_flow = pd.read_sql(
+        text("SELECT * FROM public.etf_market_flow_daily ORDER BY created_at DESC, date DESC LIMIT 1"),
+        engine,
+    ).to_dict(orient="records")
+    representative = pd.read_sql(
+        text(
+            """
+            WITH max_date AS (
+                SELECT MAX(date) AS date FROM public.etf_flow_signal_daily
+            ),
+            ranked AS (
+                SELECT
+                    s.*,
+                    ROW_NUMBER() OVER (PARTITION BY s.ticker ORDER BY s.date DESC) AS rn
+                FROM public.etf_flow_signal_daily s
+                WHERE s.date >= (SELECT date FROM max_date) - INTERVAL '5 days'
+            )
+            SELECT ranked.*, m.exposure_name
+            FROM ranked
+            LEFT JOIN public.etf_representative_map m
+              ON m.exposure_id = ranked.exposure_id
+             AND (
+                 m.primary_ticker = ranked.ticker
+                 OR m.secondary_ticker = ranked.ticker
+                 OR m.tertiary_ticker = ranked.ticker
+             )
+            WHERE ranked.rn = 1
+            ORDER BY ranked.state_strength DESC NULLS LAST, ranked.ticker
+            LIMIT 80
+            """
+        ),
+        engine,
+    ).to_dict(orient="records")
+    representative_divergences = pd.read_sql(
+        text(
+            """
+            SELECT *
+            FROM public.etf_flow_divergence_flags
+            WHERE date = (SELECT MAX(date) FROM public.etf_flow_divergence_flags)
+            ORDER BY severity DESC, exposure_id
+            LIMIT 20
+            """
+        ),
+        engine,
+    ).to_dict(orient="records")
     return {
         "flow_regime": regime[0] if regime else {},
         "market_segments": segments,
+        "exposures": segments,
         "forward_signals": forward,
         "contradictions": audits,
+        "market_flow": market_flow[0] if market_flow else {},
+        "representative_signals": representative,
+        "representative_divergences": representative_divergences,
     }

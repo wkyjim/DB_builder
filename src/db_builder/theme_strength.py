@@ -39,7 +39,32 @@ def setup_label(score: float) -> str:
     return "Underperformance risk"
 
 
-def score_theme(name: str, rows: list[dict], news_signals: list[dict]) -> dict:
+THEME_FLOW_EXPOSURE = {
+    "AI Infrastructure": "US_SEMICONDUCTORS",
+    "Semiconductors": "US_SEMICONDUCTORS",
+    "Cybersecurity": "CYBERSECURITY",
+    "Defense": "DEFENSE",
+    "Healthcare Innovation": "US_HEALTHCARE",
+    "Grid Infrastructure": "GRID_INFRASTRUCTURE",
+    "Nuclear": "NUCLEAR",
+    "Energy": "US_ENERGY",
+    "Financials": "US_FINANCIALS",
+    "Crypto Infrastructure": "BITCOIN",
+    "Small Caps": "US_SMALL_CAP",
+    "Dividend Defensives": "DIVIDEND_DEFENSIVES",
+    "Quality Growth": "QUALITY_FACTOR",
+}
+
+
+def _flow_for(name: str, flow_by_exposure: dict[str, dict] | None) -> tuple[float, float]:
+    exposure_id = THEME_FLOW_EXPOSURE.get(name)
+    if not exposure_id or not flow_by_exposure:
+        return 50.0, 0.0
+    row = flow_by_exposure.get(exposure_id) or {}
+    return flt(row.get("adjusted_flow_score"), 50.0), flt(row.get("signal_reliability"), 0.0)
+
+
+def score_theme(name: str, rows: list[dict], news_signals: list[dict], flow_by_exposure: dict[str, dict] | None = None) -> dict:
     basket = THEME_BASKETS[name]
     theme_rows = _rows_for(rows, basket)
     spy = _row(rows, "SPY")
@@ -52,6 +77,7 @@ def score_theme(name: str, rows: list[dict], news_signals: list[dict]) -> dict:
     breadth_50 = avg([100.0 if flt(row.get("close")) >= flt(row.get("ma_50"), 10**9) else 0.0 for row in theme_rows])
     breadth_200 = avg([100.0 if flt(row.get("close")) >= flt(row.get("ma_200"), 10**9) else 0.0 for row in theme_rows])
     news_intensity, headline_ratio = _theme_news(name, news_signals)
+    flow_score, flow_reliability = _flow_for(name, flow_by_exposure)
     dispersion = max(returns_20) - min(returns_20) if returns_20 else 0
     components = {
         "equal_weight_return": clamp(50 + avg(returns_20, 0)),
@@ -62,6 +88,7 @@ def score_theme(name: str, rows: list[dict], news_signals: list[dict]) -> dict:
         "macd": avg([score_macd(row) for row in theme_rows]),
         "volume": avg([clamp(flt(row.get("volume_ratio_20"), 1) * 50) for row in theme_rows]),
         "volatility_adjusted_return": avg([clamp(50 + flt(row.get("return_20d")) / max(flt(row.get("volatility_20d"), 1), 1) * 10) for row in theme_rows]),
+        "grouped_etf_flow": flow_score,
         "news_intensity": news_intensity,
         "headline_ratio": headline_ratio,
     }
@@ -88,6 +115,7 @@ def score_theme(name: str, rows: list[dict], news_signals: list[dict]) -> dict:
         "setup_score": setup_score,
         "setup_label": setup_label(setup_score),
         "components": {key: round(value, 4) for key, value in components.items()},
+        "flow_reliability": round(flow_reliability, 4),
         "setup_drivers": [key for key, value in setup_components.items() if value >= 60][:5],
         "invalidation_triggers": ["relative strength below SPY", "breadth below 45%", "news turns negative"],
         "data_caveats": [] if theme_rows else ["theme basket rows unavailable"],
@@ -97,6 +125,6 @@ def score_theme(name: str, rows: list[dict], news_signals: list[dict]) -> dict:
     }
 
 
-def rank_themes(rows: list[dict], news_signals: list[dict]) -> list[dict]:
-    ranked = [score_theme(name, rows, news_signals) for name in THEME_BASKETS]
+def rank_themes(rows: list[dict], news_signals: list[dict], flow_by_exposure: dict[str, dict] | None = None) -> list[dict]:
+    ranked = [score_theme(name, rows, news_signals, flow_by_exposure) for name in THEME_BASKETS]
     return sorted(ranked, key=lambda row: row["score"], reverse=True)

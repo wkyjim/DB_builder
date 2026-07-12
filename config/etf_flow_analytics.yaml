@@ -20,22 +20,52 @@ etf_flow:
     zflow: 10.0
     momentum: 8.0
     persistence: 12.0
-    breadth: 10.0
     consensus: 8.0
-    concentration_penalty: 12.0
+    reliability: 10.0
 
   forward_setup_weights:
     price_trend: 0.20
     relative_strength: 0.15
     market_breadth: 0.15
-    etf_flow_persistence: 0.15
+    etf_flow_persistence: 0.20
     flow_acceleration: 0.10
     cross_issuer_consensus: 0.10
-    flow_breadth: 0.10
-    regime_alignment: 0.05
+    regime_alignment: 0.10
 
   regime:
     weight_in_total_regime: 0.15
+
+  grouping:
+    weighting_method: sqrt_aum
+    max_single_etf_weight: 0.50
+
+  availability:
+    high_coverage_threshold: 0.70
+    minimum_usable_coverage: 0.40
+    complete_coverage_threshold: 0.90
+    single_issuer_reliability_cap: 65
+    stale_after_hours: 36
+    neutral_flow_pct_aum: 0.0005
+
+  representative:
+    horizons: [1, 5, 20, 60]
+    short_zscore_lookback: 60
+    long_zscore_lookback: 252
+    minimum_observations: 40
+    volume_moving_average_days: 20
+    volume_zscore_days: 60
+    divergence_threshold_z: 1.5
+    extreme_zscore_threshold: 2.0
+    neutral_flow_pct_aum: 0.0005
+    max_single_etf_weight: 0.60
+
+  market_flow:
+    regime_weight: 0.12
+    equity_risk_flow_weight: 0.35
+    credit_risk_flow_weight: 0.20
+    sector_cyclicality_flow_weight: 0.25
+    duration_liquidity_weight: 0.15
+    alternative_asset_weight: 0.05
 
   exclusions:
     leveraged: true

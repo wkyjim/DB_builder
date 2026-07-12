@@ -6,6 +6,7 @@ from db_builder.contradiction_audit import audit_report_scores
 from db_builder.market_strength import compute_market_strength, score_above_ma
 from db_builder.news_scoring import classify_news_relevance, score_headline
 from db_builder.report_renderer import render_rule_based_market_update, score_all
+from db_builder.rule_based_config import MACRO_SYMBOLS
 from db_builder.rule_based_regime import compute_regime, regime_label
 from db_builder.sector_strength import rank_sectors
 from db_builder.theme_strength import rank_themes, setup_label
@@ -208,6 +209,27 @@ def test_rule_based_report_renders_required_sections():
     assert "## Tactical Buy List" not in markdown
     assert "## Tactical Sell / Reduce List" not in markdown
     assert "overweight" not in markdown.lower()
+
+
+def test_macro_symbols_include_dashboard_tape_assets():
+    expected = {
+        "^GSPC",
+        "^NDX",
+        "^DJI",
+        "^VIX",
+        "^HSI",
+        "NIY=F",
+        "^KS200",
+        "DX-Y.NYB",
+        "JPY=X",
+        "EURUSD=X",
+        "GC=F",
+        "BZ=F",
+        "CL=F",
+        "BTC-USD",
+    }
+
+    assert expected <= set(MACRO_SYMBOLS)
 
 
 def test_rule_based_report_includes_precious_and_cyclical_metals_analysis():

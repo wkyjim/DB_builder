@@ -8,24 +8,26 @@ from db_builder.etf_flow.config import ETFAnalyticsConfig, clamp, flow_regime_la
 
 
 RISK_ON_SEGMENTS = {
-    "Broad Equity",
-    "Total U.S. Equity",
-    "Small Caps",
-    "Mid Caps",
-    "Growth",
-    "High Yield Credit",
-    "Semiconductors",
-    "Technology",
+    "US_BROAD_EQUITY",
+    "US_SMALL_CAP",
+    "US_MID_CAP",
+    "US_LARGE_GROWTH",
+    "US_SEMICONDUCTORS",
+    "US_TECHNOLOGY",
+    "US_HIGH_YIELD",
+    "EMERGING_MARKETS",
 }
 
 DEFENSIVE_SEGMENTS = {
-    "Treasury Bills",
-    "U.S. Treasuries",
-    "Long Duration Treasury",
-    "Short Treasury",
-    "Gold",
-    "Core Bonds",
-    "Investment Grade Credit",
+    "US_TREASURY_BILLS",
+    "US_TREASURY_LONG",
+    "US_TREASURY_INTERMEDIATE",
+    "US_TREASURY_SHORT",
+    "GOLD",
+    "US_CORE_BONDS",
+    "US_INVESTMENT_GRADE",
+    "US_UTILITIES",
+    "US_CONSUMER_STAPLES",
 }
 
 
@@ -46,13 +48,17 @@ def build_flow_regime(
             "conflict_flag": False,
         }
     seg = segments.copy()
-    risk_on = seg[seg["segment"].isin(RISK_ON_SEGMENTS)]
-    defensive = seg[seg["segment"].isin(DEFENSIVE_SEGMENTS)]
-    risk_on_score = float(risk_on["score"].mean()) if not risk_on.empty else 50.0
-    defensive_score = float(defensive["score"].mean()) if not defensive.empty else 50.0
-    breadth = float(seg["flow_breadth_20d"].mean() * 100.0) if "flow_breadth_20d" in seg else 50.0
-    flow_score = clamp((risk_on_score * 0.55) + ((100.0 - defensive_score) * 0.25) + (breadth * 0.20))
-    confidence = clamp(float(seg["confidence"].mean()) if "confidence" in seg else 50.0)
+    id_col = "exposure_id" if "exposure_id" in seg else "segment"
+    score_col = "adjusted_flow_score" if "adjusted_flow_score" in seg else "score"
+    confidence_col = "signal_reliability" if "signal_reliability" in seg else "confidence"
+    risk_on = seg[seg[id_col].isin(RISK_ON_SEGMENTS)]
+    defensive = seg[seg[id_col].isin(DEFENSIVE_SEGMENTS)]
+    risk_on_score = float(risk_on[score_col].mean()) if not risk_on.empty else 50.0
+    defensive_score = float(defensive[score_col].mean()) if not defensive.empty else 50.0
+    reliability = float(seg[confidence_col].mean()) if confidence_col in seg else 50.0
+    raw_flow_score = clamp((risk_on_score * 0.65) + ((100.0 - defensive_score) * 0.35))
+    flow_score = clamp(50.0 + (raw_flow_score - 50.0) * reliability / 100.0)
+    confidence = clamp(reliability)
     combined = None
     if existing_regime_score is not None:
         combined = clamp(
@@ -72,6 +78,7 @@ def build_flow_regime(
         "components": {
             "risk_on_score": risk_on_score,
             "defensive_score": defensive_score,
-            "flow_breadth_score": breadth,
+            "reliability_adjusted_flow_score": flow_score,
+            "average_signal_reliability": reliability,
         },
     }
