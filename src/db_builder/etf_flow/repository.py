@@ -399,10 +399,11 @@ def upsert_signal_daily(engine, signals: pd.DataFrame) -> int:
         "positive_flow_days_20d", "positive_flow_days_60d",
         "flow_persistence_20d", "flow_persistence_60d",
         "consecutive_inflow_days", "consecutive_outflow_days",
-        "flow_momentum", "flow_acceleration", "flow_rotation_state",
+        "flow_momentum", "flow_acceleration",
         "volume_ratio_20d", "volume_ratio_60d", "volume_zscore_20d", "volume_zscore_60d",
         "dollar_volume", "dollar_volume_ratio_20d", "dollar_volume_zscore_60d",
         "price_state", "flow_state", "volume_state", "price_flow_volume_state",
+        "regime_bias", "flow_structure", "confidence_modifier",
         "state_strength", "state_confidence", "interpretation", "data_quality_score",
     ]
     if signals.empty:
@@ -736,3 +737,5 @@ def fetch_latest_analytics_output(engine) -> dict[str, Any]:
         "representative_signals": representative,
         "representative_divergences": representative_divergences,
     }
+
+

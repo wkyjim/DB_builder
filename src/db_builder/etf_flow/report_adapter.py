@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 import math
 
-
 def _fmt(value, digits: int = 1) -> str:
     try:
         numeric = float(value)
@@ -14,7 +13,6 @@ def _fmt(value, digits: int = 1) -> str:
     if math.isnan(numeric) or math.isinf(numeric):
         return "n/a"
     return f"{numeric:.{digits}f}"
-
 
 def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
     if not rows:
@@ -25,7 +23,6 @@ def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
         *["| " + " | ".join(str(cell) for cell in row) + " |" for row in rows],
     ]
 
-
 CORE_TICKERS = ["IVV", "ACWI", "EFA", "IEMG", "IJH", "IWM", "LQD", "HYG", "SGOV", "SHY", "IEF", "TLT", "GLD", "IBIT"]
 SECTOR_TICKERS = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLK", "XLB", "XLRE", "XLU"]
 SUBSECTOR_TICKERS = [
@@ -34,10 +31,24 @@ SUBSECTOR_TICKERS = [
     "OIH", "XME", "XRT", "FDN", "SKYY", "ROBT",
 ]
 
-
 def _by_ticker(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(row.get("ticker") or "").upper(): row for row in rows}
 
+def _display_state(value: Any) -> str:
+    if not value:
+        return "n/a"
+    text = str(value)
+    if text == "normal activity":
+        return "Normal"
+    if text == "high activity":
+        return "High"
+    if text == "very high activity":
+        return "High"
+    if text == "low activity":
+        return "Low"
+    if text == "very low activity":
+        return "Low"
+    return text.replace("_", " ").title()
 
 def _flow_row(row: dict[str, Any]) -> list[str]:
     return [
@@ -47,9 +58,14 @@ def _flow_row(row: dict[str, Any]) -> list[str]:
         _fmt(row.get("flow_zscore_60d")),
         _fmt(row.get("flow_persistence_20d")),
         _fmt(row.get("volume_zscore_60d")),
+        _display_state(row.get("price_state")),
+        _display_state(row.get("flow_state")),
+        _display_state(row.get("volume_state")),
         str(row.get("price_flow_volume_state") or "n/a"),
+        str(row.get("regime_bias") or "n/a"),
+        str(row.get("flow_structure") or "n/a"),
+        _fmt(row.get("state_confidence")),
     ]
-
 
 def _ticker_table(rows_by_ticker: dict[str, dict[str, Any]], tickers: list[str], *, subsector: bool = False) -> list[list[str]]:
     rows = []
@@ -57,25 +73,8 @@ def _ticker_table(rows_by_ticker: dict[str, dict[str, Any]], tickers: list[str],
         row = rows_by_ticker.get(ticker)
         if not row:
             continue
-        if subsector:
-            rows.append(
-                [
-                    ticker,
-                    str(row.get("exposure_name") or row.get("exposure_id") or "n/a"),
-                    _fmt(row.get("flow_zscore_20d")),
-                    _fmt(row.get("flow_zscore_60d")),
-                    _fmt(row.get("flow_persistence_20d")),
-                    _fmt(row.get("volume_zscore_60d")),
-                    str(row.get("price_state") or "n/a"),
-                    str(row.get("flow_state") or "n/a"),
-                    str(row.get("price_flow_volume_state") or "n/a"),
-                    str(row.get("flow_rotation_state") or "n/a"),
-                ]
-            )
-        else:
-            rows.append(_flow_row(row))
+        rows.append(_flow_row(row))
     return rows
-
 
 def etf_flow_report_lines(data: dict[str, Any]) -> list[str]:
     if not data:
@@ -109,7 +108,7 @@ def etf_flow_report_lines(data: dict[str, Any]) -> list[str]:
     lines.extend(["### Core Flow Signals", ""])
     lines.extend(
         _table(
-            ["Ticker", "Exposure", "20D Flow Z", "60D Flow Z", "Persistence", "Volume Z", "Price/Flow/Volume State"],
+            ["Ticker", "Exposure", "20D Flow Z", "60D Flow Z", "Persistence", "Volume Z", "Price State", "Flow State", "Volume State", "PFV State", "Regime Bias", "Flow Structure", "Confidence"],
             _ticker_table(rows_by_ticker, CORE_TICKERS),
         )
     )
@@ -117,15 +116,15 @@ def etf_flow_report_lines(data: dict[str, Any]) -> list[str]:
     lines.extend(["### Sector Flow Signals", ""])
     lines.extend(
         _table(
-            ["Ticker", "Exposure", "20D Flow Z", "60D Flow Z", "Persistence", "Volume Z", "Price/Flow/Volume State"],
+            ["Ticker", "Exposure", "20D Flow Z", "60D Flow Z", "Persistence", "Volume Z", "Price State", "Flow State", "Volume State", "PFV State", "Regime Bias", "Flow Structure", "Confidence"],
             _ticker_table(rows_by_ticker, SECTOR_TICKERS),
         )
     )
     lines.append("")
-    lines.extend(["### Subsector Rotation Signals", ""])
+    lines.extend(["### Subsector PFV Signals", ""])
     lines.extend(
         _table(
-            ["Ticker", "Exposure", "20D Flow Z", "60D Flow Z", "Persistence", "Volume Z", "Price State", "Flow State", "Price/Flow/Volume State", "Rotation State"],
+            ["Ticker", "Exposure", "20D Flow Z", "60D Flow Z", "Persistence", "Volume Z", "Price State", "Flow State", "Volume State", "PFV State", "Regime Bias", "Flow Structure", "Confidence"],
             _ticker_table(rows_by_ticker, SUBSECTOR_TICKERS, subsector=True),
         )
     )
@@ -153,3 +152,4 @@ def etf_flow_report_lines(data: dict[str, Any]) -> list[str]:
         )
         lines.append("")
     return lines
+

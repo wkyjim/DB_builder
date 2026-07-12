@@ -347,11 +347,16 @@ def test_representative_price_flow_volume_state_matrix():
 
     assert latest["price_flow_volume_state"] in {
         "Confirmed Accumulation",
-        "Price-Led Strength",
+        "Steady Sponsorship",
+        "Price Leadership",
         "Quiet Accumulation",
         "Neutral",
+        "High Turnover Consolidation",
     }
     assert latest["interpretation"]
+    assert latest["regime_bias"]
+    assert latest["flow_structure"]
+    assert "flow_rotation_state" not in signals.columns
 
 
 def test_market_flow_score_uses_representative_tickers():
@@ -402,5 +407,10 @@ def test_representative_report_renders_required_sections():
     assert "ETF Flows Analysis" in rendered
     assert "Core Flow Signals" in rendered
     assert "Sector Flow Signals" in rendered
-    assert "Subsector Rotation Signals" in rendered
+    assert "Subsector PFV Signals" in rendered
     assert "Representative Exposure Dashboard" not in rendered
+    assert "Rotation State" not in rendered
+    assert "Flow Structure" in rendered
+
+
+

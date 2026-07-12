@@ -174,19 +174,22 @@ def _state_from_score(value: float | None, *, band: float = 0.0005) -> str:
 
 
 def _flow_state(row: pd.Series, cfg: ETFAnalyticsConfig) -> str:
-    z = row.get("flow_zscore_5d")
-    pct = row.get("flow_pct_aum_5d")
-    if pd.notna(z):
-        if z >= 1.0:
-            return "inflow"
-        if z <= -1.0:
-            return "outflow"
-    if pd.notna(pct):
-        if pct > cfg.representative.neutral_flow_pct_aum:
-            return "inflow"
-        if pct < -cfg.representative.neutral_flow_pct_aum:
-            return "outflow"
-    return "flat"
+    """Current allocation-flow state using 1D/5D flow and z-score thresholds."""
+    neutral_band = cfg.representative.neutral_flow_pct_aum
+    for z_name, pct_name in (("flow_zscore_1d", "flow_pct_aum_1d"), ("flow_zscore_5d", "flow_pct_aum_5d")):
+        z = row.get(z_name)
+        if pd.notna(z):
+            if z >= 1.0:
+                return "inflow"
+            if z <= -1.0:
+                return "outflow"
+        pct = row.get(pct_name)
+        if pd.notna(pct):
+            if pct > neutral_band:
+                return "inflow"
+            if pct < -neutral_band:
+                return "outflow"
+    return "neutral"
 
 
 def _volume_state(row: pd.Series) -> str:
@@ -208,35 +211,104 @@ def _volume_state(row: pd.Series) -> str:
 
 
 PRICE_FLOW_VOLUME_INTERPRETATIONS = {
-    ("up", "inflow", "high"): ("Confirmed Accumulation", "confirmed accumulation with strong market participation"),
-    ("up", "inflow", "normal"): ("Confirmed Accumulation", "steady sponsorship"),
-    ("up", "inflow", "low"): ("Confirmed Accumulation", "positive allocation flow with limited trading confirmation"),
-    ("up", "flat", "high"): ("Price-Led Strength", "price-led momentum without creation support"),
-    ("up", "flat", "normal"): ("Price-Led Strength", "price strength lacks primary-market confirmation"),
-    ("up", "flat", "low"): ("Price-Led Strength", "weakly supported price advance"),
-    ("up", "outflow", "high"): ("Price Strength with Redemptions", "active redemption despite rising price"),
-    ("up", "outflow", "normal"): ("Price Strength with Redemptions", "mild price-flow contradiction"),
-    ("up", "outflow", "low"): ("Price Strength with Redemptions", "low-confidence redemption signal"),
-    ("flat", "inflow", "high"): ("Quiet Accumulation", "active accumulation before breakout"),
-    ("flat", "inflow", "normal"): ("Quiet Accumulation", "quiet accumulation"),
-    ("flat", "inflow", "low"): ("Quiet Accumulation", "early but weak accumulation"),
-    ("flat", "flat", "high"): ("Neutral", "high turnover without directional allocation"),
-    ("flat", "flat", "normal"): ("Neutral", "neutral"),
-    ("flat", "flat", "low"): ("Neutral", "inactive or low-information state"),
-    ("flat", "outflow", "high"): ("Quiet Distribution", "active distribution before breakdown"),
-    ("flat", "outflow", "normal"): ("Quiet Distribution", "quiet distribution"),
-    ("flat", "outflow", "low"): ("Quiet Distribution", "weak distribution signal"),
-    ("down", "inflow", "high"): ("Buying Weakness", "institutional buying into weakness"),
-    ("down", "inflow", "normal"): ("Buying Weakness", "early accumulation against weak price"),
-    ("down", "inflow", "low"): ("Buying Weakness", "limited buying support"),
-    ("down", "flat", "high"): ("Price Weakness without Flow Confirmation", "secondary-market selling without confirmed redemptions"),
-    ("down", "flat", "normal"): ("Price Weakness without Flow Confirmation", "price weakness without primary-market confirmation"),
-    ("down", "flat", "low"): ("Price Weakness without Flow Confirmation", "weak price signal with limited activity"),
-    ("down", "outflow", "high"): ("Confirmed Distribution", "confirmed distribution"),
-    ("down", "outflow", "normal"): ("Confirmed Distribution", "persistent selling pressure"),
-    ("down", "outflow", "low"): ("Confirmed Distribution", "distribution signal with limited activity"),
+    ("up", "inflow", "high"): ("Confirmed Accumulation", "Institutions buying into an established uptrend with strong participation.", "Strong Risk-On"),
+    ("up", "inflow", "normal"): ("Steady Sponsorship", "Healthy institutional support for the trend.", "Risk-On"),
+    ("up", "inflow", "low"): ("Quiet Accumulation", "Institutional buying exists but participation is limited.", "Mild Risk-On"),
+    ("up", "neutral", "high"): ("Momentum Rally", "Secondary-market buying dominates without ETF creations.", "Watch"),
+    ("up", "neutral", "normal"): ("Price Leadership", "Trend continues without allocation confirmation.", "Neutral Bullish"),
+    ("up", "neutral", "low"): ("Fragile Rally", "Weak participation and no institutional sponsorship.", "Low Confidence"),
+    ("up", "outflow", "high"): ("Distribution Into Strength", "Institutions actively reduce exposure during a rally.", "Bearish Divergence"),
+    ("up", "outflow", "normal"): ("Profit Taking", "Tactical selling inside an uptrend.", "Slightly Bearish"),
+    ("up", "outflow", "low"): ("Weak Redemption", "Small outflow with limited participation.", "Neutral"),
+    ("flat", "inflow", "high"): ("Institutional Accumulation", "Strong buying before price responds.", "Early Bullish"),
+    ("flat", "inflow", "normal"): ("Quiet Accumulation", "Investors steadily accumulate during consolidation.", "Improving"),
+    ("flat", "inflow", "low"): ("Early Accumulation", "Positive but low-conviction accumulation.", "Watch"),
+    ("flat", "neutral", "high"): ("High Turnover Consolidation", "Repositioning without net allocation.", "Transition"),
+    ("flat", "neutral", "normal"): ("Neutral", "Balanced market.", "Neutral"),
+    ("flat", "neutral", "low"): ("Dormant Market", "Very little information content.", "Neutral"),
+    ("flat", "outflow", "high"): ("Distribution Before Breakdown", "Institutions leave while price remains stable.", "Early Bearish"),
+    ("flat", "outflow", "normal"): ("Quiet Distribution", "Steady selling beneath the surface.", "Weakening"),
+    ("flat", "outflow", "low"): ("Weak Distribution", "Small outflow with limited conviction.", "Neutral"),
+    ("down", "inflow", "high"): ("Aggressive Dip Buying", "Institutions buy aggressively during weakness.", "Recovery Candidate"),
+    ("down", "inflow", "normal"): ("Contrarian Accumulation", "Early buying against the downtrend.", "Watch"),
+    ("down", "inflow", "low"): ("Tentative Buying", "Weak support.", "Low Confidence"),
+    ("down", "neutral", "high"): ("Secondary-Market Liquidation", "Selling pressure without ETF redemptions.", "Cautious"),
+    ("down", "neutral", "normal"): ("Unconfirmed Weakness", "Price weak but allocation unchanged.", "Neutral Bearish"),
+    ("down", "neutral", "low"): ("Weak Decline", "Low-conviction downtrend.", "Neutral"),
+    ("down", "outflow", "high"): ("Confirmed Distribution", "Institutions actively exit while price falls.", "Strong Risk-Off"),
+    ("down", "outflow", "normal"): ("Persistent Distribution", "Sustained institutional selling.", "Risk-Off"),
+    ("down", "outflow", "low"): ("Thin Distribution", "Selling exists but participation is limited.", "Mild Risk-Off"),
 }
 
+
+def _flow_direction(row: pd.Series, horizon: int, cfg: ETFAnalyticsConfig) -> str:
+    z = row.get(f"flow_zscore_{horizon}d")
+    pct = row.get(f"flow_pct_aum_{horizon}d")
+    band = cfg.representative.neutral_flow_pct_aum
+    if pd.notna(z):
+        if z >= 1.0:
+            return "positive"
+        if z <= -1.0:
+            return "negative"
+    if pd.notna(pct):
+        if pct > band:
+            return "positive"
+        if pct < -band:
+            return "negative"
+    return "neutral"
+
+
+def _flow_structure(row: pd.Series, cfg: ETFAnalyticsConfig) -> tuple[str, float, str]:
+    """Explain whether current flow is tactical or structural; replaces rotation state."""
+    d1 = _flow_direction(row, 1, cfg)
+    d20 = _flow_direction(row, 20, cfg)
+    d60 = _flow_direction(row, 60, cfg)
+    p20 = row.get("flow_persistence_20d")
+    z_values = [row.get(name) for name in ("flow_zscore_1d", "flow_zscore_5d", "flow_zscore_20d", "flow_zscore_60d")]
+    z_values = [float(value) for value in z_values if pd.notna(value)]
+
+    confidence_modifier = 0.0
+    tags: list[str] = []
+
+    if z_values and max(z_values) > 2:
+        tags.append("Exceptional institutional buying")
+        confidence_modifier += 8
+    if z_values and min(z_values) < -2:
+        tags.append("Exceptional institutional selling")
+        confidence_modifier -= 8
+    if pd.notna(p20) and float(p20) > 0.70:
+        tags.append("Strong sponsorship")
+        confidence_modifier += 8
+    elif pd.notna(p20) and float(p20) < 0.30:
+        tags.append("Persistent selling")
+        confidence_modifier -= 8
+
+    if d1 != "neutral" and d1 == d20 == d60:
+        base = "Strong confirmation"
+        confidence_modifier += 10
+    elif d1 == "negative" and d20 == "positive" and d60 == "positive":
+        base = "Tactical profit-taking inside structural accumulation"
+        confidence_modifier -= 2
+    elif d1 == "positive" and d20 == "negative" and d60 == "negative":
+        base = "Tactical rebound inside structural distribution"
+        confidence_modifier -= 2
+    elif d20 == "positive" and d60 == "positive":
+        base = "Structural accumulation"
+        confidence_modifier += 6
+    elif d20 == "negative" and d60 == "negative":
+        base = "Structural distribution"
+        confidence_modifier -= 6
+    elif d20 == "positive" and d60 == "negative":
+        base = "Medium-term recovery"
+        confidence_modifier += 2
+    elif d20 == "negative" and d60 == "positive":
+        base = "Medium-term deterioration"
+        confidence_modifier -= 2
+    else:
+        base = "Mixed or neutral flow structure"
+
+    narrative = base if not tags else f"{base}; {', '.join(tags)}"
+    return narrative, confidence_modifier, base
 
 def _volume_bucket(volume_state: str) -> str:
     if "high" in volume_state:
@@ -246,16 +318,16 @@ def _volume_bucket(volume_state: str) -> str:
     return "normal"
 
 
-def _price_flow_volume(row: pd.Series) -> tuple[str, str, float, float]:
-    state, interpretation = PRICE_FLOW_VOLUME_INTERPRETATIONS.get(
+def _price_flow_volume(row: pd.Series) -> tuple[str, str, str, float, float]:
+    state, interpretation, regime_bias = PRICE_FLOW_VOLUME_INTERPRETATIONS.get(
         (row["price_state"], row["flow_state"], _volume_bucket(row["volume_state"])),
-        ("Neutral", "neutral"),
+        ("Neutral", "Balanced market.", "Neutral"),
     )
     z = row.get("flow_zscore_20d")
     volume_z = row.get("volume_zscore_60d")
     strength = clamp(50 + (0 if pd.isna(z) else abs(float(z)) * 12) + (0 if pd.isna(volume_z) else min(abs(float(volume_z)) * 4, 12)))
     confidence = clamp(float(row.get("data_quality_score") or 50) * 0.5 + (20 if pd.notna(z) else 0) + (15 if pd.notna(volume_z) else 0))
-    return state, interpretation, strength, confidence
+    return state, interpretation, regime_bias, strength, confidence
 
 
 def build_coverage_audit(raw: pd.DataFrame) -> pd.DataFrame:
@@ -350,17 +422,16 @@ def build_etf_flow_signal_daily(daily: pd.DataFrame, raw: pd.DataFrame, config: 
     pfv = [_price_flow_volume(row) for _, row in df.iterrows()]
     df["price_flow_volume_state"] = [item[0] for item in pfv]
     df["interpretation"] = [item[1] for item in pfv]
-    df["state_strength"] = [item[2] for item in pfv]
-    df["state_confidence"] = [item[3] for item in pfv]
-    df["flow_rotation_state"] = [
-        "Strengthening Inflow" if (row.flow_zscore_20d or 0) > 1 and (row.flow_acceleration or 0) > 0
-        else "Inflow Decelerating" if (row.flow_zscore_20d or 0) > 1
-        else "Early Improvement" if (row.flow_zscore_20d or 0) < -1 and (row.flow_acceleration or 0) > 0
-        else "Worsening Outflow" if (row.flow_zscore_20d or 0) < -1
-        else "Emerging Interest" if (row.flow_acceleration or 0) > 0
-        else "Fading Interest" if (row.flow_acceleration or 0) < 0
-        else "Neutral"
-        for row in df.itertuples()
+    df["regime_bias"] = [item[2] for item in pfv]
+    df["state_strength"] = [item[3] for item in pfv]
+    df["state_confidence"] = [item[4] for item in pfv]
+    flow_structure = [_flow_structure(row, cfg) for _, row in df.iterrows()]
+    df["flow_structure"] = [item[0] for item in flow_structure]
+    df["confidence_modifier"] = [item[1] for item in flow_structure]
+    df["flow_structure_base"] = [item[2] for item in flow_structure]
+    df["state_confidence"] = [
+        clamp(conf + modifier)
+        for conf, modifier in zip(df["state_confidence"], df["confidence_modifier"])
     ]
     df["exposure_id"] = df["ticker"].map(lambda ticker: rep_by_ticker[ticker].exposure_id)
     df["exposure_type"] = df["ticker"].map(lambda ticker: rep_by_ticker[ticker].exposure_type)
@@ -501,3 +572,4 @@ def build_divergence_flags(signal_daily: pd.DataFrame, config: ETFAnalyticsConfi
     for exposure_id, primary, comparison, reason in RELATED_COMPARISONS:
         add_pair(exposure_id, primary, comparison, reason, related=True)
     return pd.DataFrame(flags)
+

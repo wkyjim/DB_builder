@@ -342,7 +342,10 @@ CREATE TABLE IF NOT EXISTS public.etf_flow_signal_daily (
     consecutive_outflow_days integer,
     flow_momentum numeric,
     flow_acceleration numeric,
-    flow_rotation_state text,
+    flow_rotation_state text, -- Deprecated: replaced by flow_structure/regime_bias.
+    regime_bias text,
+    flow_structure text,
+    confidence_modifier numeric,
     volume_ratio_20d numeric,
     volume_ratio_60d numeric,
     volume_zscore_20d numeric,
@@ -362,6 +365,11 @@ CREATE TABLE IF NOT EXISTS public.etf_flow_signal_daily (
     PRIMARY KEY (date, ticker)
 );
 
+
+ALTER TABLE public.etf_flow_signal_daily ADD COLUMN IF NOT EXISTS regime_bias text;
+ALTER TABLE public.etf_flow_signal_daily ADD COLUMN IF NOT EXISTS flow_structure text;
+ALTER TABLE public.etf_flow_signal_daily ADD COLUMN IF NOT EXISTS confidence_modifier numeric;
+COMMENT ON COLUMN public.etf_flow_signal_daily.flow_rotation_state IS 'Deprecated: replaced by PFV flow_structure and regime_bias.';
 CREATE TABLE IF NOT EXISTS public.etf_market_flow_daily (
     date date PRIMARY KEY,
     equity_risk_flow_score numeric,
@@ -410,3 +418,4 @@ CREATE INDEX IF NOT EXISTS idx_etf_representative_map_primary ON public.etf_repr
 CREATE INDEX IF NOT EXISTS idx_etf_flow_signal_daily_ticker_date ON public.etf_flow_signal_daily (ticker, date);
 CREATE INDEX IF NOT EXISTS idx_etf_flow_signal_daily_exposure_date ON public.etf_flow_signal_daily (exposure_id, date);
 CREATE INDEX IF NOT EXISTS idx_etf_flow_divergence_flags_date ON public.etf_flow_divergence_flags (date);
+
