@@ -8,11 +8,13 @@ from db_builder.etf_flow.aggregation import build_etf_flow_analytics, build_expo
 from db_builder.etf_flow.breadth import breadth_metrics
 from db_builder.etf_flow.confidence import flow_confidence_adjustment
 from db_builder.etf_flow.consensus import issuer_consensus
+from db_builder.etf_flow.config import ETFAnalyticsConfig
 from db_builder.etf_flow.feature_engineering import build_daily_flow_table, build_rolling_features
 from db_builder.etf_flow.price_flow import price_flow_state
 from db_builder.etf_flow.report_adapter import etf_flow_report_lines
 from db_builder.etf_flow.regime import build_flow_regime
 from db_builder.etf_flow.representative import (
+    PRICE_FLOW_VOLUME_INTERPRETATIONS,
     build_divergence_flags,
     build_etf_flow_signal_daily,
     build_market_flow,
@@ -324,6 +326,19 @@ def test_report_adapter_omits_etf_breadth_language():
     assert "concentration" not in rendered
 
 
+def test_pfv_matrix_matches_institutional_mapping():
+    assert PRICE_FLOW_VOLUME_INTERPRETATIONS[("up", "inflow", "high")] == (
+        "Confirmed Accumulation",
+        "Strong buying supports the uptrend with high participation.",
+        "Strong Risk-On",
+    )
+    assert PRICE_FLOW_VOLUME_INTERPRETATIONS[("up", "inflow", "normal")][0] == "Steady Accumulation"
+    assert PRICE_FLOW_VOLUME_INTERPRETATIONS[("up", "outflow", "low")][0] == "Weak Distribution"
+    assert PRICE_FLOW_VOLUME_INTERPRETATIONS[("flat", "neutral", "high")][0] == "High-Turnover Consolidation"
+    assert PRICE_FLOW_VOLUME_INTERPRETATIONS[("down", "neutral", "high")][0] == "Heavy Selling Pressure"
+    assert PRICE_FLOW_VOLUME_INTERPRETATIONS[("down", "inflow", "normal")][0] == "Contrarian Buying"
+
+
 def test_representative_signal_calculates_required_horizons_and_volume():
     raw = synthetic_representative_raw()
     daily = build_daily_flow_table(raw)
@@ -347,16 +362,33 @@ def test_representative_price_flow_volume_state_matrix():
 
     assert latest["price_flow_volume_state"] in {
         "Confirmed Accumulation",
-        "Steady Sponsorship",
+        "Steady Accumulation",
         "Price Leadership",
         "Quiet Accumulation",
         "Neutral",
-        "High Turnover Consolidation",
+        "High-Turnover Consolidation",
     }
     assert latest["interpretation"]
     assert latest["regime_bias"]
     assert latest["flow_structure"]
     assert "flow_rotation_state" not in signals.columns
+
+
+def test_flow_state_uses_5d_and_structural_flow_before_single_day_shock():
+    raw = synthetic_representative_raw()
+    daily = build_daily_flow_table(raw)
+    signals = build_etf_flow_signal_daily(daily, raw)
+    soxx_like = signals[signals["ticker"].eq("HYG")].iloc[-1].copy()
+    soxx_like["flow_zscore_1d"] = -1.3
+    soxx_like["flow_pct_aum_1d"] = -0.02
+    soxx_like["flow_zscore_5d"] = 3.3
+    soxx_like["flow_pct_aum_5d"] = 0.13
+    soxx_like["flow_zscore_20d"] = 2.5
+    soxx_like["flow_zscore_60d"] = 2.7
+
+    from db_builder.etf_flow.representative import _flow_state
+
+    assert _flow_state(soxx_like, ETFAnalyticsConfig()) == "inflow"
 
 
 def test_market_flow_score_uses_representative_tickers():
@@ -411,6 +443,7 @@ def test_representative_report_renders_required_sections():
     assert "Representative Exposure Dashboard" not in rendered
     assert "Rotation State" not in rendered
     assert "Flow Structure" in rendered
+    assert "Buy" in rendered or "Sell" in rendered or "Neutral" in rendered
 
 
 

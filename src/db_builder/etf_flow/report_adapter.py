@@ -48,6 +48,12 @@ def _display_state(value: Any) -> str:
         return "Low"
     if text == "very low activity":
         return "Low"
+    if text == "inflow":
+        return "Buy"
+    if text == "outflow":
+        return "Sell"
+    if text == "neutral":
+        return "Neutral"
     return text.replace("_", " ").title()
 
 def _flow_row(row: dict[str, Any]) -> list[str]:

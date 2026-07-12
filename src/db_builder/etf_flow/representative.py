@@ -174,21 +174,42 @@ def _state_from_score(value: float | None, *, band: float = 0.0005) -> str:
 
 
 def _flow_state(row: pd.Series, cfg: ETFAnalyticsConfig) -> str:
-    """Current allocation-flow state using 1D/5D flow and z-score thresholds."""
+    """Current allocation-flow state using 5D flow first, with 1D as a shock input."""
     neutral_band = cfg.representative.neutral_flow_pct_aum
-    for z_name, pct_name in (("flow_zscore_1d", "flow_pct_aum_1d"), ("flow_zscore_5d", "flow_pct_aum_5d")):
-        z = row.get(z_name)
-        if pd.notna(z):
-            if z >= 1.0:
-                return "inflow"
-            if z <= -1.0:
-                return "outflow"
-        pct = row.get(pct_name)
-        if pd.notna(pct):
-            if pct > neutral_band:
-                return "inflow"
-            if pct < -neutral_band:
-                return "outflow"
+    z1 = row.get("flow_zscore_1d")
+    z5 = row.get("flow_zscore_5d")
+    z20 = row.get("flow_zscore_20d")
+    z60 = row.get("flow_zscore_60d")
+    pct1 = row.get("flow_pct_aum_1d")
+    pct5 = row.get("flow_pct_aum_5d")
+
+    if pd.notna(z5):
+        if z5 >= 1.0:
+            return "inflow"
+        if z5 <= -1.0:
+            return "outflow"
+    if pd.notna(pct5):
+        if pct5 > neutral_band:
+            return "inflow"
+        if pct5 < -neutral_band:
+            return "outflow"
+
+    if pd.notna(z20) and pd.notna(z60):
+        if z20 >= 1.0 and z60 >= 1.0:
+            return "inflow"
+        if z20 <= -1.0 and z60 <= -1.0:
+            return "outflow"
+
+    if pd.notna(z1):
+        if z1 >= 1.0:
+            return "inflow"
+        if z1 <= -1.0:
+            return "outflow"
+    if pd.notna(pct1):
+        if pct1 > neutral_band:
+            return "inflow"
+        if pct1 < -neutral_band:
+            return "outflow"
     return "neutral"
 
 
@@ -211,33 +232,33 @@ def _volume_state(row: pd.Series) -> str:
 
 
 PRICE_FLOW_VOLUME_INTERPRETATIONS = {
-    ("up", "inflow", "high"): ("Confirmed Accumulation", "Institutions buying into an established uptrend with strong participation.", "Strong Risk-On"),
-    ("up", "inflow", "normal"): ("Steady Sponsorship", "Healthy institutional support for the trend.", "Risk-On"),
-    ("up", "inflow", "low"): ("Quiet Accumulation", "Institutional buying exists but participation is limited.", "Mild Risk-On"),
-    ("up", "neutral", "high"): ("Momentum Rally", "Secondary-market buying dominates without ETF creations.", "Watch"),
-    ("up", "neutral", "normal"): ("Price Leadership", "Trend continues without allocation confirmation.", "Neutral Bullish"),
-    ("up", "neutral", "low"): ("Fragile Rally", "Weak participation and no institutional sponsorship.", "Low Confidence"),
-    ("up", "outflow", "high"): ("Distribution Into Strength", "Institutions actively reduce exposure during a rally.", "Bearish Divergence"),
-    ("up", "outflow", "normal"): ("Profit Taking", "Tactical selling inside an uptrend.", "Slightly Bearish"),
-    ("up", "outflow", "low"): ("Weak Redemption", "Small outflow with limited participation.", "Neutral"),
-    ("flat", "inflow", "high"): ("Institutional Accumulation", "Strong buying before price responds.", "Early Bullish"),
-    ("flat", "inflow", "normal"): ("Quiet Accumulation", "Investors steadily accumulate during consolidation.", "Improving"),
-    ("flat", "inflow", "low"): ("Early Accumulation", "Positive but low-conviction accumulation.", "Watch"),
-    ("flat", "neutral", "high"): ("High Turnover Consolidation", "Repositioning without net allocation.", "Transition"),
-    ("flat", "neutral", "normal"): ("Neutral", "Balanced market.", "Neutral"),
-    ("flat", "neutral", "low"): ("Dormant Market", "Very little information content.", "Neutral"),
-    ("flat", "outflow", "high"): ("Distribution Before Breakdown", "Institutions leave while price remains stable.", "Early Bearish"),
-    ("flat", "outflow", "normal"): ("Quiet Distribution", "Steady selling beneath the surface.", "Weakening"),
-    ("flat", "outflow", "low"): ("Weak Distribution", "Small outflow with limited conviction.", "Neutral"),
-    ("down", "inflow", "high"): ("Aggressive Dip Buying", "Institutions buy aggressively during weakness.", "Recovery Candidate"),
-    ("down", "inflow", "normal"): ("Contrarian Accumulation", "Early buying against the downtrend.", "Watch"),
-    ("down", "inflow", "low"): ("Tentative Buying", "Weak support.", "Low Confidence"),
-    ("down", "neutral", "high"): ("Secondary-Market Liquidation", "Selling pressure without ETF redemptions.", "Cautious"),
-    ("down", "neutral", "normal"): ("Unconfirmed Weakness", "Price weak but allocation unchanged.", "Neutral Bearish"),
-    ("down", "neutral", "low"): ("Weak Decline", "Low-conviction downtrend.", "Neutral"),
-    ("down", "outflow", "high"): ("Confirmed Distribution", "Institutions actively exit while price falls.", "Strong Risk-Off"),
-    ("down", "outflow", "normal"): ("Persistent Distribution", "Sustained institutional selling.", "Risk-Off"),
-    ("down", "outflow", "low"): ("Thin Distribution", "Selling exists but participation is limited.", "Mild Risk-Off"),
+    ("up", "inflow", "high"): ("Confirmed Accumulation", "Strong buying supports the uptrend with high participation.", "Strong Risk-On"),
+    ("up", "inflow", "normal"): ("Steady Accumulation", "Buying continues to support the uptrend.", "Risk-On"),
+    ("up", "inflow", "low"): ("Quiet Accumulation", "Buying supports the trend but participation is limited.", "Mild Risk-On"),
+    ("up", "neutral", "high"): ("Momentum Rally", "Strong trading activity but no clear net buying or selling.", "Watch"),
+    ("up", "neutral", "normal"): ("Price Leadership", "Price continues higher without clear buying support.", "Neutral Bullish"),
+    ("up", "neutral", "low"): ("Fragile Rally", "Rising prices on limited participation.", "Low Confidence"),
+    ("up", "outflow", "high"): ("Distribution into Strength", "Heavy selling occurs despite rising prices.", "Bearish Divergence"),
+    ("up", "outflow", "normal"): ("Profit Taking", "Moderate selling during an uptrend.", "Slightly Bearish"),
+    ("up", "outflow", "low"): ("Weak Distribution", "Limited selling pressure despite rising prices.", "Neutral"),
+    ("flat", "inflow", "high"): ("Strong Accumulation", "Heavy buying while prices consolidate.", "Early Bullish"),
+    ("flat", "inflow", "normal"): ("Quiet Accumulation", "Buying during consolidation.", "Improving"),
+    ("flat", "inflow", "low"): ("Early Accumulation", "Initial buying with limited conviction.", "Watch"),
+    ("flat", "neutral", "high"): ("High-Turnover Consolidation", "Heavy trading but balanced buying and selling.", "Transition"),
+    ("flat", "neutral", "normal"): ("Neutral", "Balanced market conditions.", "Neutral"),
+    ("flat", "neutral", "low"): ("Dormant Market", "Little activity or useful information.", "Neutral"),
+    ("flat", "outflow", "high"): ("Distribution Before Breakdown", "Heavy selling while prices remain stable.", "Early Bearish"),
+    ("flat", "outflow", "normal"): ("Quiet Distribution", "Steady selling during consolidation.", "Weakening"),
+    ("flat", "outflow", "low"): ("Weak Distribution", "Limited selling pressure.", "Neutral"),
+    ("down", "inflow", "high"): ("Aggressive Dip Buying", "Strong buying during a decline.", "Recovery Candidate"),
+    ("down", "inflow", "normal"): ("Contrarian Buying", "Buying emerges despite weakness.", "Watch"),
+    ("down", "inflow", "low"): ("Tentative Buying", "Limited buying interest.", "Low Confidence"),
+    ("down", "neutral", "high"): ("Heavy Selling Pressure", "Heavy trading accompanies price weakness but without clear net buying or selling.", "Cautious"),
+    ("down", "neutral", "normal"): ("Unconfirmed Weakness", "Prices fall without clear buying or selling imbalance.", "Neutral Bearish"),
+    ("down", "neutral", "low"): ("Weak Downtrend", "Low-conviction decline.", "Neutral"),
+    ("down", "outflow", "high"): ("Confirmed Distribution", "Strong selling confirms the downtrend.", "Strong Risk-Off"),
+    ("down", "outflow", "normal"): ("Persistent Distribution", "Continued selling pressure.", "Risk-Off"),
+    ("down", "outflow", "low"): ("Thin Distribution", "Selling persists but with limited participation.", "Mild Risk-Off"),
 }
 
 
@@ -260,7 +281,7 @@ def _flow_direction(row: pd.Series, horizon: int, cfg: ETFAnalyticsConfig) -> st
 
 def _flow_structure(row: pd.Series, cfg: ETFAnalyticsConfig) -> tuple[str, float, str]:
     """Explain whether current flow is tactical or structural; replaces rotation state."""
-    d1 = _flow_direction(row, 1, cfg)
+    current = str(row.get("flow_state") or "neutral")
     d20 = _flow_direction(row, 20, cfg)
     d60 = _flow_direction(row, 60, cfg)
     p20 = row.get("flow_persistence_20d")
@@ -270,10 +291,10 @@ def _flow_structure(row: pd.Series, cfg: ETFAnalyticsConfig) -> tuple[str, float
     confidence_modifier = 0.0
     tags: list[str] = []
 
-    if z_values and max(z_values) > 2:
+    if z_values and max(z_values) > 2 and current != "outflow":
         tags.append("Exceptional institutional buying")
         confidence_modifier += 8
-    if z_values and min(z_values) < -2:
+    if z_values and min(z_values) < -2 and current != "inflow":
         tags.append("Exceptional institutional selling")
         confidence_modifier -= 8
     if pd.notna(p20) and float(p20) > 0.70:
@@ -283,13 +304,16 @@ def _flow_structure(row: pd.Series, cfg: ETFAnalyticsConfig) -> tuple[str, float
         tags.append("Persistent selling")
         confidence_modifier -= 8
 
-    if d1 != "neutral" and d1 == d20 == d60:
+    if current == "inflow" and d20 == "positive" and d60 == "positive":
         base = "Strong confirmation"
         confidence_modifier += 10
-    elif d1 == "negative" and d20 == "positive" and d60 == "positive":
+    elif current == "outflow" and d20 == "negative" and d60 == "negative":
+        base = "Strong confirmation"
+        confidence_modifier += 10
+    elif current == "outflow" and d20 == "positive" and d60 == "positive":
         base = "Tactical profit-taking inside structural accumulation"
         confidence_modifier -= 2
-    elif d1 == "positive" and d20 == "negative" and d60 == "negative":
+    elif current == "inflow" and d20 == "negative" and d60 == "negative":
         base = "Tactical rebound inside structural distribution"
         confidence_modifier -= 2
     elif d20 == "positive" and d60 == "positive":
