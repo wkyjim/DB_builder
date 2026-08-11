@@ -39,14 +39,17 @@ neon_engine = make_neon_engine()
 
 ASSETS = [
     ("^GSPC", "S&P 500", "stock_index"),
+    ("^NDX", "NASDAQ 100", "stock_index"),
     ("^IXIC", "NASDAQ Composite", "stock_index"),
     ("^DJI", "Dow Jones Industrial Average", "stock_index"),
     ("^RUT", "Russell 2000 Index", "stock_index"),
     ("^VIX", "CBOE Volatility Index", "stock_index"),
+    ("^SKEW", "CBOE SKEW Index", "volatility"),
     ("^MOVE", "ICE BofA MOVE Index", "volatility"),
     ("^HSI", "HANG SENG INDEX", "stock_index"),
     ("^N225", "Nikkei 225", "stock_index"),
     ("^KS11", "KOSPI Composite Index", "stock_index"),
+    ("^KS200", "KOSPI 200 Index", "stock_index"),
     ("000001.SS", "SSE Composite Index", "stock_index"),
     ("^FTSE", "FTSE 100", "stock_index"),
     ("^GDAXI", "DAX", "stock_index"),
@@ -56,6 +59,10 @@ ASSETS = [
     ("ES=F", "E-mini S&P 500 Future", "futures"),
     ("YM=F", "Mini Dow Future", "futures"),
     ("RTY=F", "E-mini Russell 2000 Future", "futures"),
+    ("NIY=F", "Nikkei 225 Future", "futures"),
+    ("KOR200c1", "KOSPI 200 Futures", "futures"),
+    ("HK50", "Hang Seng Futures", "futures"),
+    ("CIHc1", "SSE 50 Futures", "futures"),
     ("GC=F", "Gold Future", "futures"),
     ("CL=F", "WTI Crude Oil Future", "futures"),
     ("BZ=F", "Brent Crude Oil Future", "futures"),
@@ -66,6 +73,13 @@ ASSETS = [
     ("^FVX", "Treasury Yield 5 Years", "ust_yield"),
     ("^TNX", "Treasury Yield 10 Years", "ust_yield"),
     ("^TYX", "Treasury Yield 30 Years", "ust_yield"),
+    ("US2YT=X", "United States 2-Year Treasury Yield", "ust_yield"),
+    ("US3YT=X", "United States 3-Year Treasury Yield", "ust_yield"),
+    ("US5YT=X", "United States 5-Year Treasury Yield", "ust_yield"),
+    ("US7YT=X", "United States 7-Year Treasury Yield", "ust_yield"),
+    ("US10YT=X", "United States 10-Year Treasury Yield", "ust_yield"),
+    ("US20YT=X", "United States 20-Year Treasury Yield", "ust_yield"),
+    ("US30YT=X", "United States 30-Year Treasury Yield", "ust_yield"),
 
     ("EURUSD=X", "EUR/USD", "fx"),
     ("DX-Y.NYB", "US Dollar Index", "fx"),
@@ -76,6 +90,7 @@ ASSETS = [
     ("CNY=X", "USD/CNY", "fx"),
     ("HKD=X", "USD/HKD", "fx"),
     ("SGD=X", "USD/SGD", "fx"),
+    ("CHFUSD=X", "CHF/USD", "fx"),
 
     ("BTC-USD", "Bitcoin USD", "crypto"),
     ("ETH-USD", "Ethereum USD", "crypto"),
@@ -91,6 +106,29 @@ ASSETS = [
     ("SHY", "iShares 1-3 Year Treasury Bond ETF", "duration_rates"),
 ]
 
+INVESTINY_ASSETS = {
+    "US2YT=X": 23701,
+    "US3YT=X": 23702,
+    "US5YT=X": 23703,
+    "US7YT=X": 23704,
+    "US10YT=X": 23705,
+    "US20YT=X": 1161827,
+    "US30YT=X": 23706,
+    "KOR200c1": 8987,
+    "HK50": 8984,
+    "CIHc1": 1115062,
+    # Investing.com continuous front-contract instruments. The public source
+    # labels currently display as LCOV6 (Brent) and OIL (WTI), while the
+    # canonical database symbols remain BZ=F and CL=F for API compatibility.
+    "BZ=F": 8833,
+    "CL=F": 8849,
+}
+
+INVESTING_SOURCE_SYMBOLS = {
+    "BZ=F": "LCOV6",
+    "CL=F": "OIL",
+}
+
 
 # ============================================================
 # CLOSE TIME MAP
@@ -102,12 +140,15 @@ SYMBOL_CLOSE_MAP = {
     "^FTSE": {"tz": "Europe/London", "close_time": "16:30"},
     "^GDAXI": {"tz": "Europe/Berlin", "close_time": "17:30"},
     "^GSPC": {"tz": "America/New_York", "close_time": "16:00"},
+    "^NDX": {"tz": "America/New_York", "close_time": "16:00"},
     "^HSI": {"tz": "Asia/Hong_Kong", "close_time": "16:10"},
     "^IXIC": {"tz": "America/New_York", "close_time": "16:00"},
     "^KS11": {"tz": "Asia/Seoul", "close_time": "15:30"},
+    "^KS200": {"tz": "Asia/Seoul", "close_time": "15:30"},
     "^N225": {"tz": "Asia/Tokyo", "close_time": "15:30"},
     "^RUT": {"tz": "America/New_York", "close_time": "16:00"},
     "^VIX": {"tz": "America/Chicago", "close_time": "15:15"},
+    "^SKEW": {"tz": "America/Chicago", "close_time": "15:15"},
     "^MOVE": {"tz": "America/New_York", "close_time": "16:00"},
     "000001.SS": {"tz": "Asia/Shanghai", "close_time": "15:00"},
 
@@ -115,6 +156,10 @@ SYMBOL_CLOSE_MAP = {
     "ES=F": {"tz": "America/New_York", "close_time": "17:00"},
     "YM=F": {"tz": "America/New_York", "close_time": "17:00"},
     "RTY=F": {"tz": "America/New_York", "close_time": "17:00"},
+    "NIY=F": {"tz": "America/Chicago", "close_time": "16:00"},
+    "KOR200c1": {"tz": "Asia/Seoul", "close_time": "15:45"},
+    "HK50": {"tz": "Asia/Hong_Kong", "close_time": "16:30"},
+    "CIHc1": {"tz": "Asia/Shanghai", "close_time": "15:15"},
     "GC=F": {"tz": "America/New_York", "close_time": "17:00"},
     "CL=F": {"tz": "America/New_York", "close_time": "17:00"},
     "BZ=F": {"tz": "America/New_York", "close_time": "17:00"},
@@ -125,6 +170,13 @@ SYMBOL_CLOSE_MAP = {
     "^FVX": {"tz": "America/New_York", "close_time": "16:00"},
     "^TNX": {"tz": "America/New_York", "close_time": "16:00"},
     "^TYX": {"tz": "America/New_York", "close_time": "16:00"},
+    "US2YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    "US3YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    "US5YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    "US7YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    "US10YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    "US20YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    "US30YT=X": {"tz": "America/New_York", "close_time": "16:00"},
 
     "EURUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
     "DX-Y.NYB": {"tz": "America/New_York", "close_time": "17:00"},
@@ -135,6 +187,7 @@ SYMBOL_CLOSE_MAP = {
     "CNY=X": {"tz": "America/New_York", "close_time": "17:00"},
     "HKD=X": {"tz": "America/New_York", "close_time": "17:00"},
     "SGD=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "CHFUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
 
     "BTC-USD": {"tz": "UTC", "close_time": "23:59"},
     "ETH-USD": {"tz": "UTC", "close_time": "23:59"},
@@ -476,6 +529,172 @@ def filter_duplicate_symbol_dates(rows, existing_df):
     return df_missing.to_dict(orient="records")
 
 
+def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False, provider_label="macro"):
+    if not rows:
+        return 0
+
+    rows_df = pd.DataFrame(rows)
+    min_date = rows_df["date"].min()
+    max_date = rows_df["date"].max()
+
+    local_existing_df = fetch_existing_symbol_dates(
+        local_engine,
+        symbols=symbols,
+        min_date=min_date,
+        max_date=max_date,
+    )
+
+    print(
+        f"[EXISTING LOCAL {provider_label}] rows={len(local_existing_df):,} "
+        f"range={min_date} -> {max_date}"
+    )
+
+    local_missing_rows = filter_duplicate_symbol_dates(
+        rows=rows,
+        existing_df=local_existing_df,
+    )
+
+    if local_missing_rows:
+        print(f"[{provider_label} LOCAL NEW ROWS] {len(local_missing_rows):,}")
+        if dry_run:
+            print(f"[DRY RUN SKIP LOCAL UPSERT {provider_label}] rows={len(local_missing_rows):,}")
+        else:
+            print(f"[UPSERT LOCAL {provider_label}] rows={len(local_missing_rows):,}")
+            upsert_macro(local_engine, local_missing_rows)
+    else:
+        print(f"[{provider_label} LOCAL NO NEW ROWS AFTER DEDUPE]")
+
+    neon_missing_rows = []
+    if upsert_neon:
+        neon_existing_df = fetch_existing_symbol_dates(
+            neon_engine,
+            symbols=symbols,
+            min_date=min_date,
+            max_date=max_date,
+        )
+        print(
+            f"[EXISTING NEON {provider_label}] rows={len(neon_existing_df):,} "
+            f"range={min_date} -> {max_date}"
+        )
+        neon_missing_rows = filter_duplicate_symbol_dates(
+            rows=rows,
+            existing_df=neon_existing_df,
+        )
+        if neon_missing_rows:
+            print(f"[{provider_label} NEON NEW ROWS] {len(neon_missing_rows):,}")
+            if dry_run:
+                print(f"[DRY RUN SKIP NEON UPSERT {provider_label}] rows={len(neon_missing_rows):,}")
+            else:
+                print(f"[UPSERT NEON {provider_label}] rows={len(neon_missing_rows):,}")
+                upsert_macro(neon_engine, neon_missing_rows)
+        else:
+            print(f"[{provider_label} NEON NO NEW ROWS AFTER DEDUPE]")
+
+    return max(len(local_missing_rows), len(neon_missing_rows))
+
+
+# ============================================================
+# INVESTINY
+# ============================================================
+
+def _investiny_date(value):
+    return pd.to_datetime(value, format="%m/%d/%Y", errors="coerce")
+
+
+def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=3):
+    investing_id = INVESTINY_ASSETS[symbol]
+    source_symbol = INVESTING_SOURCE_SYMBOLS.get(symbol, symbol)
+    target_start_date = start_date or (datetime.now().date() - timedelta(days=LOOKBACK_DAYS))
+    fetch_start_date = target_start_date - timedelta(days=CALC_BUFFER_DAYS)
+    fetch_end_date = end_date or (datetime.now().date() + timedelta(days=1))
+
+    from_date = fetch_start_date.strftime("%m/%d/%Y")
+    to_date = fetch_end_date.strftime("%m/%d/%Y")
+    print(
+        f"[INVESTING.COM FETCH WINDOW] {symbol} source_symbol={source_symbol} "
+        f"id={investing_id} "
+        f"fetch_start={fetch_start_date} | target_start={target_start_date} | end={fetch_end_date}"
+    )
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            from investiny import historical_data
+
+            time.sleep(random.uniform(0.8, 2.0))
+            payload = historical_data(
+                investing_id=investing_id,
+                from_date=from_date,
+                to_date=to_date,
+                interval="D",
+            )
+            df = pd.DataFrame(payload)
+            if df.empty:
+                return pd.DataFrame(), target_start_date
+
+            df = df.rename(
+                columns={
+                    "date": "Date",
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                }
+            )
+            df["Date"] = df["Date"].map(_investiny_date)
+            df["Adj Close"] = df["Close"]
+            if "Volume" not in df.columns:
+                df["Volume"] = None
+            df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
+            df = df[df["Date"].dt.weekday < 5].copy()
+            return df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]], target_start_date
+        except Exception as e:
+            print(f"[INVESTINY RETRY {attempt}/{max_retries}] {symbol}: {e}")
+            if attempt == max_retries:
+                raise
+            time.sleep(random.uniform(3.0, 8.0))
+
+
+def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None):
+    symbol_df, target_start_date = fetch_investiny_symbol_df(symbol, start_date=start_date)
+    if symbol_df.empty:
+        print(f"[INVESTINY NO DATA] {symbol}")
+        return [], None
+
+    print(
+        f"[INVESTINY DATES RAW] {symbol} | "
+        f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
+    )
+
+    live_row = extract_latest_unfinished_row(
+        df=symbol_df,
+        symbol=symbol,
+        name=meta["name"],
+        asset_type=meta["asset_type"],
+        observed_at=observed_at,
+    )
+    if live_row:
+        live_row["source"] = "investing.com"
+
+    symbol_df = remove_unfinished_bars(symbol_df, symbol)
+    if symbol_df.empty:
+        print(f"[INVESTINY NO FINISHED BARS] {symbol}")
+        return [], live_row
+
+    rows = calculate_rows_for_symbol(
+        df=symbol_df,
+        symbol=symbol,
+        name=meta["name"],
+        asset_type=meta["asset_type"],
+    )
+    rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start_date)
+    if rows:
+        print(f"[INVESTINY ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
+    else:
+        print(f"[INVESTINY NO VALID ROWS IN TARGET WINDOW] {symbol}")
+    return rows, live_row
+
+
 # ============================================================
 # YFINANCE
 # ============================================================
@@ -569,7 +788,8 @@ def run_etf_flow_update_after_macro(*, start_date=None, tickers=None, dry_run=Fa
     currently covers macro/live market data separately. The derived positioning
     signals are refreshed from the latest local ETF rows.
     """
-    from db_builder.etf_flows import ETF_FLOW_UNIVERSE, run_etf_flow_fetch
+    from db_builder.etf_flow.run import run_etf_flow_analytics
+    from db_builder.etf_flows import ETF_FLOW_UNIVERSE, plan_etf_flow_missing_fetch, run_etf_flow_fetch
     from db_builder.positioning_flow_signals import run_positioning_flow_signal_update, setup_flow_tables
 
     print("\n[ETF FLOW UPDATE]")
@@ -585,17 +805,61 @@ def run_etf_flow_update_after_macro(*, start_date=None, tickers=None, dry_run=Fa
     if not dry_run:
         setup_flow_tables(local_engine)
 
-    result = run_etf_flow_fetch(
+    plan = plan_etf_flow_missing_fetch(
         local_engine,
         tickers=selected_tickers,
-        dry_run=dry_run,
         start_date=start_date,
     )
+    print(
+        f"[ETF FLOW TARGET] session={plan['target_date']} "
+        f"missing_tickers={len(plan['tickers'])} skipped_current={len(plan['skipped_tickers'])}"
+    )
+    if plan.get("unsupported_tickers"):
+        print(f"[ETF FLOW UNSUPPORTED ISSUER HISTORY] {','.join(plan['unsupported_tickers'])}")
+    if plan["latest_dates"]:
+        latest_preview = sorted(plan["latest_dates"].items())[:8]
+        print(f"[ETF FLOW LATEST PREVIEW] {latest_preview}")
+    if not plan["tickers"]:
+        print("[ETF FLOW SKIP] Issuer-backed ETF flow data already covers the target session.")
+        return {
+            "rows": 0,
+            "upserted": 0,
+            "recomputed": 0,
+            "sample": [],
+            "plan": plan,
+            "skipped": True,
+        }
+
+    result = run_etf_flow_fetch(
+        local_engine,
+        tickers=plan["tickers"],
+        dry_run=dry_run,
+        start_date=plan["start_date"],
+        end_date=plan["target_date"],
+        allow_yfinance_fallback=False,
+    )
+    result["plan"] = plan
     print(
         f"[ETF FLOW RESULT] snapshots={result['rows']:,} "
         f"upserted={result['upserted']:,} recomputed={result['recomputed']:,}"
     )
     if not dry_run:
+        analytics_result = run_etf_flow_analytics(
+            local_engine,
+            as_of_date=plan["target_date"],
+            # Analytics needs prior rows for lag/rolling fields. The issuer
+            # fetch above remains incremental, but the analytics refresh must
+            # include full available history so Monday values can use Friday
+            # as the previous session and rolling windows are not truncated.
+            start_date=None,
+            dry_run=False,
+            write_report_output=True,
+        )
+        print(
+            f"[ETF FLOW ANALYTICS] as_of={analytics_result['as_of_date']} "
+            f"raw={analytics_result['raw_rows']:,} features={analytics_result['feature_rows']:,} "
+            f"signals={analytics_result['representative_signal_rows']:,}"
+        )
         signal_result = run_positioning_flow_signal_update(local_engine, dry_run=False)
         print(f"[ETF FLOW SIGNALS] positioning_flow_signals upserted={signal_result['upserted']:,}")
     return result
@@ -609,6 +873,7 @@ def run_daily_update(
     update_etf_flows=True,
     etf_flow_start_date=None,
     etf_flow_tickers=None,
+    update_live=True,
 ):
     if not dry_run:
         create_macro_table(local_engine)
@@ -633,9 +898,13 @@ def run_daily_update(
             raise ValueError(f"Unknown macro symbols requested: {unknown}")
         symbols = [symbol for symbol in symbols if symbol in requested]
 
+    yfinance_symbols = [symbol for symbol in symbols if symbol not in INVESTINY_ASSETS]
+    investiny_symbols = [symbol for symbol in symbols if symbol in INVESTINY_ASSETS]
+
     print(
         f"Running macro update for {len(symbols)} symbols "
-        f"in batches of {BATCH_SIZE}..."
+        f"({len(yfinance_symbols)} yfinance, {len(investiny_symbols)} Investing.com) "
+        f"in yfinance batches of {BATCH_SIZE}..."
     )
     if start_date:
         print(f"[START DATE OVERRIDE] target_start={start_date}")
@@ -647,7 +916,7 @@ def run_daily_update(
     all_live_rows = []
     observed_at = datetime.now(ZoneInfo("UTC"))
 
-    for batch in chunk_list(symbols, BATCH_SIZE):
+    for batch in chunk_list(yfinance_symbols, BATCH_SIZE):
         print(f"\n[BATCH] {batch[0]} -> {batch[-1]} | {len(batch)} symbols")
 
         try:
@@ -727,59 +996,51 @@ def run_daily_update(
             print("[BATCH NO YF ROWS]")
             continue
 
-        yf_df = pd.DataFrame(all_yf_rows)
-        min_date = yf_df["date"].min()
-        max_date = yf_df["date"].max()
-
-        existing_df = fetch_existing_symbol_dates(
-            local_engine,
-            symbols=batch,
-            min_date=min_date,
-            max_date=max_date,
+        upsert_new_macro_rows(
+            all_yf_rows,
+            batch,
+            upsert_neon=upsert_neon,
+            dry_run=dry_run,
+            provider_label="YF",
         )
-
-        print(
-            f"[EXISTING LOCAL] rows={len(existing_df):,} "
-            f"range={min_date} -> {max_date}"
-        )
-
-        missing_rows = filter_duplicate_symbol_dates(
-            rows=all_yf_rows,
-            existing_df=existing_df,
-        )
-
-        if not missing_rows:
-            print("[BATCH NO NEW ROWS AFTER DEDUPE]")
-            time.sleep(random.uniform(1.0, 3.0))
-            continue
-
-        print(f"[NEW ROWS] {len(missing_rows):,}")
-
-        debug_missing = pd.DataFrame(missing_rows)
-        print("[MISSING ROWS BY SYMBOL]")
-        print(
-            debug_missing.groupby("symbol")["date"]
-            .apply(lambda x: sorted(list(x)))
-            .to_string()
-        )
-
-        if dry_run:
-            print(f"[DRY RUN SKIP UPSERT] rows={len(missing_rows):,}")
-            continue
-
-        print(f"[UPSERT LOCAL] rows={len(missing_rows):,}")
-        upsert_macro(local_engine, missing_rows)
-
-        if upsert_neon:
-            print(f"[UPSERT NEON] rows={len(missing_rows):,}")
-            upsert_macro(neon_engine, missing_rows)
 
         print("[BATCH DONE]")
 
         time.sleep(random.uniform(1.0, 3.0))
 
+    if investiny_symbols:
+        print(f"\n[INVESTING.COM SYMBOLS] {investiny_symbols}")
+    for symbol in investiny_symbols:
+        try:
+            meta = asset_map[symbol]
+            print(f"[PROCESS INVESTING.COM] {symbol}")
+            rows, live_row = process_investiny_symbol(
+                symbol,
+                meta,
+                start_date=start_date,
+                observed_at=observed_at,
+            )
+            if live_row:
+                all_live_rows.append(live_row)
+                print(
+                    f"[INVESTING.COM LIVE SNAPSHOT] {symbol} | "
+                    f"market_date={live_row['market_date']} close={live_row['close']}"
+                )
+            upsert_new_macro_rows(
+                rows,
+                [symbol],
+                upsert_neon=upsert_neon,
+                dry_run=dry_run,
+                provider_label="INVESTING.COM",
+            )
+        except Exception as e:
+            print(f"[INVESTINY PROCESS ERROR] {symbol}: {e}")
+            time.sleep(random.uniform(2.0, 5.0))
+
     print(f"\n[LIVE SNAPSHOT TOTAL] rows={len(all_live_rows):,}")
-    if dry_run:
+    if not update_live:
+        print("[LIVE REPLACE SKIP] Historical backfill mode.")
+    elif dry_run:
         print("[DRY RUN SKIP LIVE REPLACE]")
     else:
         print(f"[REPLACE LOCAL LIVE] rows={len(all_live_rows):,}")
@@ -811,6 +1072,7 @@ def parse_args():
     parser.add_argument("--local-only", action="store_true", help="Upsert local PostgreSQL only.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and calculate rows without upserting.")
     parser.add_argument("--skip-etf-flows", action="store_true", help="Skip local ETF daily flow refresh after macro update.")
+    parser.add_argument("--skip-live-replace", action="store_true", help="Do not replace public.macro_live; useful for historical symbol-subset backfills.")
     parser.add_argument("--etf-flow-start-date", default=None, help="Optional ETF flow backfill start date in YYYY-MM-DD format.")
     parser.add_argument("--etf-flow-tickers", default=None, help="Optional comma-separated ETF subset for ETF flow refresh.")
     return parser.parse_args()
@@ -830,4 +1092,5 @@ if __name__ == "__main__":
         update_etf_flows=not args.skip_etf_flows,
         etf_flow_start_date=etf_flow_start,
         etf_flow_tickers=etf_flow_tickers,
+        update_live=not args.skip_live_replace,
     )

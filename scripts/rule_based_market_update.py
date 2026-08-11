@@ -12,6 +12,9 @@ from db_builder.report_renderer import render_rule_based_market_update, save_rul
 from db_builder.rule_based_market_data import collect_rule_based_inputs
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate deterministic rule-based market update report.")
     parser.add_argument("--window-hours", type=int, default=24)
@@ -25,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dashboard-repo",
         type=Path,
-        default=Path(r"C:\Users\User\OneDrive\Coding\market-dashboard"),
+        default=PROJECT_ROOT / "market-dashboard",
         help="Local market-dashboard repository path.",
     )
     parser.add_argument(
@@ -33,17 +36,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Commit and push the updated market-dashboard latest report.",
     )
+    parser.add_argument(
+        "--notify-telegram",
+        action="store_true",
+        help="Send a Telegram report-update summary after the report is saved or published.",
+    )
     parser.add_argument("--json-output", type=Path, default=None)
     return parser.parse_args()
 
 
-def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool = False) -> Path:
+def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool = False, dry_run: bool = False) -> Path:
     if not dashboard_repo.exists():
         raise FileNotFoundError(f"Dashboard repository not found: {dashboard_repo}")
     if not (dashboard_repo / ".git").exists():
         raise FileNotFoundError(f"Dashboard path is not a git repository: {dashboard_repo}")
 
     target = dashboard_repo / "data" / "latest-report.md"
+    if dry_run:
+        print(f"[DRY RUN] Would publish latest report to dashboard: {target}")
+        if push:
+            print("[DRY RUN] Would commit and push data/latest-report.md to market-dashboard.")
+        return target
+
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(report_path, target)
     print(f"Published latest report to dashboard: {target}")
@@ -79,8 +93,15 @@ def main() -> None:
     if args.save:
         path = save_rule_based_report(markdown, generated_at=data.get("generated_at"))
         print(f"Saved rule-based market update report: {path}")
+        notification_path = path
         if args.publish_dashboard:
-            publish_to_dashboard(path, args.dashboard_repo, push=args.push_dashboard and not args.dry_run)
+            notification_path = publish_to_dashboard(path, args.dashboard_repo, push=args.push_dashboard, dry_run=args.dry_run)
+        if args.notify_telegram:
+            from db_builder.telegram_bot import build_report_update_summary, send_telegram_message
+
+            message = build_report_update_summary(markdown, report_path=notification_path)
+            send_telegram_message(message, dry_run=args.dry_run)
+            print("Telegram report update notification prepared." if args.dry_run else "Telegram report update notification sent.")
         return
     if args.publish_dashboard:
         raise ValueError("--publish-dashboard requires --save")

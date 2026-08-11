@@ -44,10 +44,13 @@ def volatility_score(macro_rows: list[dict]) -> tuple[float, list[str]]:
 
 
 def rates_score(macro_rows: list[dict]) -> tuple[float, list[str]]:
-    five = flt(macro_by_symbol(macro_rows, "^FVX").get("close"), None)
-    ten = flt(macro_by_symbol(macro_rows, "^TNX").get("close"), None)
-    thirty = flt(macro_by_symbol(macro_rows, "^TYX").get("close"), None)
-    ten_chg = flt(macro_by_symbol(macro_rows, "^TNX").get("pct_chg"))
+    five_row = macro_by_symbol(macro_rows, "US5YT=X") or macro_by_symbol(macro_rows, "^FVX")
+    ten_row = macro_by_symbol(macro_rows, "US10YT=X") or macro_by_symbol(macro_rows, "^TNX")
+    thirty_row = macro_by_symbol(macro_rows, "US30YT=X") or macro_by_symbol(macro_rows, "^TYX")
+    five = flt(five_row.get("close"), None)
+    ten = flt(ten_row.get("close"), None)
+    thirty = flt(thirty_row.get("close"), None)
+    ten_chg = flt(ten_row.get("pct_chg"))
     if ten is None:
         return 50.0, ["10Y Treasury missing; rates neutral"]
     score = 55.0
@@ -148,7 +151,11 @@ def compute_regime(technical_rows: list[dict], macro_rows: list[dict], news_rows
 
 
 def compute_confidence(regime: dict, market_strength: dict, technical_rows: list[dict], macro_rows: list[dict], news_rows: list[dict]) -> dict:
-    expected_macro = {"^GSPC", "^IXIC", "^RUT", "^VIX", "^MOVE", "^TNX", "^TYX", "GC=F", "CL=F", "HG=F", "HYG", "LQD", "RSP"}
+    expected_macro = {
+        "^GSPC", "^IXIC", "^RUT", "^VIX", "^SKEW", "^MOVE",
+        "US2YT=X", "US5YT=X", "US10YT=X", "US30YT=X",
+        "GC=F", "CL=F", "HG=F", "HYG", "LQD", "RSP",
+    }
     present_macro = {row.get("symbol") for row in macro_rows}
     if "DX-Y.NYB" in present_macro:
         present_macro.add("DXY")

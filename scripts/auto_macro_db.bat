@@ -19,7 +19,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py')) { Write-Log 'ERROR' 'macro_data_fetch.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\economic_data_fetch.py' 'economic_data_fetch.py' '--upsert-local')) { Write-Log 'ERROR' 'economic_data_fetch.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 900)) { Write-Log 'ERROR' 'global_economic_data_fetch.py failed after 3 retries'; exit 1 }" ^
-  "if (-not (Invoke-RetryPython 'scripts\deepseek_multistage_report.py' 'qwen_multistage_report.py' '--save --window-hours 24 --timeout 0 --stage-timeout 0 --allow-warnings' 3600)) { Write-Log 'ERROR' 'qwen_multistage_report.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\rule_based_market_update.py' 'rule_based_market_update.py' '--save --window-hours 24 --publish-dashboard --push-dashboard --notify-telegram' 900)) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; exit 1 }" ^
   "Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; exit 0"
-
-exit /b %ERRORLEVEL%
+set "WORKFLOW_EXIT_CODE=%ERRORLEVEL%"
+if not "%WORKFLOW_EXIT_CODE%"=="0" call "%~dp0telegram_system_alert.bat" "auto_macro_db workflow failed. Check scheduled logs."
+exit /b %WORKFLOW_EXIT_CODE%

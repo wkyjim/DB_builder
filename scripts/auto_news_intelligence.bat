@@ -25,7 +25,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if (-not (Invoke-RetryPython 'scripts\sector_regime.py' 'sector_regime.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_regime.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\sector_rotation.py' 'sector_rotation.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'sector_rotation.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\secular_themes.py' 'secular_themes.py' @('--upsert-local', '--window-hours', '24'))) { Write-Log 'ERROR' 'secular_themes.py failed after 3 retries'; exit 1 }" ^
-  "if (-not (Invoke-RetryPython 'scripts\rule_based_market_update.py' 'rule_based_market_update.py' @('--save', '--window-hours', '24', '--publish-dashboard', '--push-dashboard'))) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\rule_based_market_update.py' 'rule_based_market_update.py' @('--save', '--window-hours', '24', '--publish-dashboard', '--push-dashboard', '--notify-telegram'))) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; exit 1 }" ^
   "Write-Log 'SUCCESS' 'auto_news_intelligence workflow complete'; exit 0"
-
-exit /b %ERRORLEVEL%
+set "WORKFLOW_EXIT_CODE=%ERRORLEVEL%"
+if not "%WORKFLOW_EXIT_CODE%"=="0" call "%~dp0telegram_system_alert.bat" "auto_news_intelligence workflow failed. Check scheduled logs."
+exit /b %WORKFLOW_EXIT_CODE%

@@ -17,15 +17,21 @@ import io
 import math
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pandas_market_calendars as mcal
 import requests
 from bs4 import BeautifulSoup
 from sqlalchemy import text
 
 from db_builder.flow_sources import record_flow_source_health
 
+
+NYSE = mcal.get_calendar("NYSE")
+ETF_FLOW_DEFAULT_START_DATE = date(2026, 1, 1)
+ETF_FLOW_RELEASE_TIME_NY = dt_time(17, 0)
 
 ISSUER_REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
@@ -213,6 +219,100 @@ ETF_ISSUER_REGISTRY = {
     "SHY": {"issuer": "BlackRock / iShares", "adapter": "yfinance_metadata", "source_url": "https://www.ishares.com/us/products/239452/ishares-1-3-year-treasury-bond-etf"},
     **{ticker: _blackrock_ishares_entry(portfolio_id) for ticker, portfolio_id in ISHARES_FLOW_ETF_PORTFOLIO_IDS.items()},
 }
+
+
+def _is_valid_nyse_session(value: date) -> bool:
+    schedule = NYSE.schedule(start_date=value, end_date=value)
+    return not schedule.empty
+
+
+def _filter_valid_nyse_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if row.get("date") and _is_valid_nyse_session(row["date"])]
+
+
+def latest_potential_etf_flow_session(
+    now: datetime | None = None,
+    *,
+    release_time_ny: dt_time = ETF_FLOW_RELEASE_TIME_NY,
+) -> date:
+    """Return the latest NYSE session whose issuer flow files may be available.
+
+    ETF issuer files are usually end-of-day artifacts. The macro job runs
+    hourly, so before the configured New York release time we target the prior
+    completed NYSE session instead of creating same-day placeholder rows.
+    """
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current_ny = current.astimezone(ZoneInfo("America/New_York"))
+    cutoff = datetime.combine(current_ny.date(), release_time_ny, tzinfo=current_ny.tzinfo)
+    end_date = current_ny.date() if current_ny >= cutoff else current_ny.date() - timedelta(days=1)
+    schedule = NYSE.schedule(start_date=end_date - timedelta(days=14), end_date=end_date)
+    if schedule.empty:
+        raise RuntimeError("Could not determine latest potential ETF flow session.")
+    return schedule.index[-1].date()
+
+
+def fetch_latest_etf_flow_dates(engine, *, tickers: list[str] | None = None) -> dict[str, date]:
+    """Return latest issuer-backed ETF flow date by ticker.
+
+    yfinance metadata is intentionally excluded because it is not an issuer
+    daily NAV/shares file and can create false weekend/current-date flow rows.
+    """
+    selected = [ticker.upper() for ticker in tickers] if tickers else list(ETF_FLOW_UNIVERSE)
+    sql = text(
+        """
+        SELECT etf_ticker, MAX(date) AS latest_date
+        FROM public.etf_daily_data
+        WHERE etf_ticker = ANY(:tickers)
+          AND source NOT ILIKE '%yfinance%'
+          AND source NOT ILIKE '%BlackRock fund download%'
+        GROUP BY etf_ticker
+        """
+    )
+    try:
+        df = pd.read_sql(sql, engine, params={"tickers": selected})
+    except Exception:
+        return {}
+    return {str(row.etf_ticker).upper(): row.latest_date for row in df.itertuples(index=False) if row.latest_date}
+
+
+def plan_etf_flow_missing_fetch(
+    engine,
+    *,
+    tickers: list[str] | None = None,
+    start_date: date | None = None,
+    target_date: date | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Plan an issuer-history fetch for only ETFs missing the target session."""
+    selected = [ticker.strip().upper() for ticker in tickers if ticker.strip()] if tickers else list(ETF_FLOW_UNIVERSE)
+    eligible = [
+        ticker
+        for ticker in selected
+        if ETF_ISSUER_REGISTRY.get(ticker, {}).get("adapter")
+        and ETF_ISSUER_REGISTRY.get(ticker, {}).get("adapter") != "yfinance_metadata"
+    ]
+    unsupported = [ticker for ticker in selected if ticker not in set(eligible)]
+    target = target_date or latest_potential_etf_flow_session(now=now)
+    latest_dates = fetch_latest_etf_flow_dates(engine, tickers=eligible)
+
+    if start_date is not None:
+        missing = eligible
+        fetch_start = start_date
+    else:
+        missing = [ticker for ticker in eligible if latest_dates.get(ticker) is None or latest_dates[ticker] < target]
+        dated = [latest_dates[ticker] + timedelta(days=1) for ticker in missing if latest_dates.get(ticker)]
+        fetch_start = min(dated) if dated else ETF_FLOW_DEFAULT_START_DATE
+
+    return {
+        "target_date": target,
+        "start_date": fetch_start,
+        "tickers": missing,
+        "latest_dates": latest_dates,
+        "skipped_tickers": [ticker for ticker in eligible if ticker not in set(missing)],
+        "unsupported_tickers": unsupported,
+    }
 
 
 def _row_template(
@@ -704,13 +804,20 @@ def fetch_issuer_etf_daily_row(ticker: str, *, timeout: int = 20) -> dict:
     if registry.get("adapter") == "blackrock_fund_download" and source_url:
         response = requests.get(source_url, headers=ISSUER_REQUEST_HEADERS, timeout=timeout)
         response.raise_for_status()
-        row = parse_blackrock_fund_download(response.text, ticker, source_url=source_url)
-        if row:
-            return row
+        rows = parse_blackrock_historical_rows(response.text, ticker, source_url=source_url)
+        rows = _filter_valid_nyse_rows(rows)
+        if rows:
+            return max(rows, key=lambda item: item["date"])
     raise RuntimeError(f"No issuer parser available for {ticker}")
 
 
-def fetch_issuer_etf_history_rows(ticker: str, *, start_date: date | None = None, timeout: int = 30) -> list[dict]:
+def fetch_issuer_etf_history_rows(
+    ticker: str,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    timeout: int = 30,
+) -> list[dict]:
     ticker = ticker.upper()
     registry = ETF_ISSUER_REGISTRY.get(ticker, {})
     source_url = registry.get("source_url")
@@ -722,10 +829,10 @@ def fetch_issuer_etf_history_rows(ticker: str, *, start_date: date | None = None
     response = requests.get(request_url, headers=ISSUER_REQUEST_HEADERS, timeout=timeout)
     response.raise_for_status()
     if adapter == "ssga_navhist":
-        return parse_spdr_navhist_workbook(response.content, ticker, source_url=source_url, start_date=start_date)
-    if adapter == "vaneck_history":
-        return parse_vaneck_history_workbook(response.content, ticker, source_url=request_url, start_date=start_date)
-    if adapter == "vaneck_page":
+        rows = parse_spdr_navhist_workbook(response.content, ticker, source_url=source_url, start_date=start_date)
+    elif adapter == "vaneck_history":
+        rows = parse_vaneck_history_workbook(response.content, ticker, source_url=request_url, start_date=start_date)
+    elif adapter == "vaneck_page":
         rows = parse_vaneck_history_workbook(response.content, ticker, source_url=request_url, start_date=start_date)
         try:
             current_row = fetch_issuer_etf_daily_row(ticker, timeout=timeout)
@@ -734,17 +841,16 @@ def fetch_issuer_etf_history_rows(ticker: str, *, start_date: date | None = None
         if current_row and (start_date is None or current_row["date"] >= start_date):
             rows = [row for row in rows if row["date"] != current_row["date"]]
             rows.append(current_row)
-        return rows
-    if adapter == "firsttrust_price_history":
-        return parse_firsttrust_price_history(response.text, ticker, source_url=source_url, start_date=start_date)
-    if adapter == "blackrock_fund_download":
+    elif adapter == "firsttrust_price_history":
+        rows = parse_firsttrust_price_history(response.text, ticker, source_url=source_url, start_date=start_date)
+    elif adapter == "blackrock_fund_download":
         rows = parse_blackrock_historical_rows(response.text, ticker, source_url=source_url, start_date=start_date)
-        row = parse_blackrock_fund_download(response.text, ticker, source_url=source_url)
-        if row and (start_date is None or row["date"] >= start_date):
-            rows = [history_row for history_row in rows if history_row["date"] != row["date"]]
-            rows.append(row)
-        return rows
-    return []
+    else:
+        rows = []
+    rows = _filter_valid_nyse_rows(rows)
+    if end_date is not None:
+        rows = [row for row in rows if row["date"] <= end_date]
+    return rows
 
 
 def fetch_etf_flow_snapshots(
@@ -752,6 +858,8 @@ def fetch_etf_flow_snapshots(
     *,
     snapshot_date: date | None = None,
     start_date: date | None = None,
+    end_date: date | None = None,
+    allow_yfinance_fallback: bool = False,
 ) -> list[dict]:
     import yfinance as yf
 
@@ -759,7 +867,7 @@ def fetch_etf_flow_snapshots(
     for ticker in tickers or list(ETF_FLOW_UNIVERSE):
         if start_date is not None:
             try:
-                history_rows = fetch_issuer_etf_history_rows(ticker, start_date=start_date)
+                history_rows = fetch_issuer_etf_history_rows(ticker, start_date=start_date, end_date=end_date)
             except Exception:
                 history_rows = []
             if history_rows:
@@ -771,9 +879,15 @@ def fetch_etf_flow_snapshots(
                 row["date"] = snapshot_date
                 row["snapshot_date"] = snapshot_date
         except Exception:
+            if not allow_yfinance_fallback:
+                continue
             info = yf.Ticker(ticker).get_info()
             row = _snapshot_from_info(ticker, info, snapshot_date=snapshot_date)
         if row["aum"] is None and row["shares_outstanding"] is None:
+            continue
+        if not _is_valid_nyse_session(row["date"]):
+            continue
+        if end_date is not None and row["date"] > end_date:
             continue
         rows.append(row)
     return rows
@@ -1038,12 +1152,20 @@ def run_etf_flow_fetch(
     dry_run: bool = False,
     snapshot_date: date | None = None,
     start_date: date | None = None,
+    end_date: date | None = None,
+    allow_yfinance_fallback: bool = False,
 ) -> dict:
     started = time.perf_counter()
     rows: list[dict] = []
     error = None
     try:
-        rows = fetch_etf_flow_snapshots(tickers=tickers, snapshot_date=snapshot_date, start_date=start_date)
+        rows = fetch_etf_flow_snapshots(
+            tickers=tickers,
+            snapshot_date=snapshot_date,
+            start_date=start_date,
+            end_date=end_date,
+            allow_yfinance_fallback=allow_yfinance_fallback,
+        )
         upserted = 0 if dry_run else upsert_etf_flow_snapshots(engine, rows)
         recomputed = 0 if dry_run else recompute_etf_flow_features(engine)
         succeeded = True

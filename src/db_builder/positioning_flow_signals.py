@@ -299,8 +299,14 @@ def enrich_etf_flow_dashboard_rows(rows: list[dict], *, limit: int = 30) -> list
         enriched["asset_group"] = category
         enriched["display_name"] = f"{ticker} - {category}"
         enriched["flow_bucket"] = _etf_flow_bucket(category)
+        flow_method = str(row.get("flow_method") or "")
         if ticker in ALWAYS_SHOW_ETF_FLOW_TICKERS and five_day is None and (one_day is None or one_day == 0):
             enriched["flow_comment"] = "Issuer-backed snapshot saved; flow history is still building."
+        elif flow_method == "shares_delta_zero_no_creation_redemption":
+            enriched["flow_comment"] = (
+                "No 1D shares-outstanding change reported; "
+                f"5D {_flow_direction(five_day)}."
+            )
         else:
             enriched["flow_comment"] = f"1D {_flow_direction(one_day)}; 5D {_flow_direction(five_day)}."
         enriched_rows.append(enriched)

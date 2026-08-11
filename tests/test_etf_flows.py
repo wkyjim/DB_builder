@@ -1,10 +1,12 @@
-from datetime import date
+from datetime import date, datetime, timezone
 
 from db_builder.etf_flows import (
     ETF_FLOW_UNIVERSE,
     ETF_ISSUER_REGISTRY,
     ISHARES_ADDITIONAL_FLOW_ETFS,
     ISHARES_TOP_30_FLOW_ETFS,
+    latest_potential_etf_flow_session,
+    plan_etf_flow_missing_fetch,
     _snapshot_from_info,
     build_etf_flow_signals,
     flow_interpretation,
@@ -15,6 +17,53 @@ from db_builder.etf_flows import (
     parse_ssga_fund_page,
     parse_vaneck_history_workbook,
 )
+
+
+def test_latest_potential_etf_flow_session_waits_until_5pm_new_york():
+    assert latest_potential_etf_flow_session(
+        datetime(2026, 7, 20, 20, 59, tzinfo=timezone.utc)
+    ) == date(2026, 7, 17)
+
+    assert latest_potential_etf_flow_session(
+        datetime(2026, 7, 20, 21, 0, tzinfo=timezone.utc)
+    ) == date(2026, 7, 20)
+
+
+def test_plan_etf_flow_missing_fetch_only_selects_stale_tickers(monkeypatch):
+    import db_builder.etf_flows as etf_flows
+
+    def fake_latest_dates(engine, *, tickers):
+        return {
+            "SPY": date(2026, 7, 17),
+            "IVV": date(2026, 7, 16),
+        }
+
+    monkeypatch.setattr(etf_flows, "fetch_latest_etf_flow_dates", fake_latest_dates)
+
+    plan = plan_etf_flow_missing_fetch(
+        object(),
+        tickers=["SPY", "IVV", "SMH"],
+        target_date=date(2026, 7, 17),
+    )
+
+    assert plan["tickers"] == ["IVV", "SMH"]
+    assert plan["skipped_tickers"] == ["SPY"]
+    assert plan["start_date"] == date(2026, 7, 17)
+
+
+def test_plan_etf_flow_missing_fetch_skips_metadata_only_sources(monkeypatch):
+    import db_builder.etf_flows as etf_flows
+
+    monkeypatch.setattr(etf_flows, "fetch_latest_etf_flow_dates", lambda engine, *, tickers: {})
+
+    plan = plan_etf_flow_missing_fetch(
+        object(),
+        tickers=["QQQ", "RSP", "IVV"],
+        target_date=date(2026, 7, 17),
+    )
+
+    assert plan["tickers"] == ["IVV"]
+    assert plan["unsupported_tickers"] == ["QQQ", "RSP"]
 
 
 def test_snapshot_from_info_maps_free_yfinance_metadata():

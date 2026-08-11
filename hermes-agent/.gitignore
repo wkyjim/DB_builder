@@ -1,0 +1,13 @@
+.env
+*.local
+*.secret
+reports/*.tmp
+reports/*.json
+logs/
+
+# Root DB_builder ignores Markdown globally; keep this package's design docs
+# and source skill eligible for an explicit future commit.
+!/*.md
+!/skills/
+!/skills/**/
+!/skills/**/*.md

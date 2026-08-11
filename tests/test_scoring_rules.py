@@ -189,7 +189,7 @@ def test_rule_based_report_renders_required_sections():
     for section in [
         "## Executive Dashboard",
         "## Market Regime Score",
-        "## Market Strength Score",
+        "## US Equity Strength Score",
         "## Evidence Quality / Confidence",
         "## Cross-Asset Confirmation",
         "## Market Dispersion Analysis",
@@ -239,6 +239,43 @@ def test_rule_based_report_includes_precious_and_cyclical_metals_analysis():
     assert "| Silver |" in markdown
     assert "| Copper |" in markdown
     assert "SI=F" in markdown
+
+
+def test_rule_based_report_labels_live_macro_rows():
+    data = sample_data()
+    data["macro"] = [
+        {
+            "symbol": "^GSPC",
+            "name": "S&P 500",
+            "close": 6200,
+            "pct_chg": 0.8,
+            "date": "2026-07-21",
+            "market_date": "2026-07-21",
+            "observed_at": "2026-07-21T14:05:00+00:00",
+            "is_live": True,
+            "data_status": "live",
+        },
+        *macro_rows()[1:],
+    ]
+
+    markdown = render_rule_based_market_update(data, score_all(data))
+
+    assert "Live macro rows are intraday snapshots" in markdown
+    assert "| Symbol | Name | Close | Pct Chg | Market Date | Status |" in markdown
+    assert "live as of 21 July 2026, 22:05:00 (HKT)" in markdown
+    assert "- Live macro rows used: `1`" in markdown
+
+
+def test_rule_based_report_uses_readable_hkt_generated_timestamp_and_regime_table():
+    markdown = render_rule_based_market_update(sample_data(), score_all(sample_data()))
+
+    assert "Generated at: 30 June 2026, 08:00:00 (HKT)" in markdown
+    assert "| Metric | Value | Driver / Interpretation |" in markdown
+    assert "| Overall regime |" in markdown
+    assert "Positive contributors" in markdown
+    assert "Negative contributors" in markdown
+    assert "Core equity ETFs versus moving averages." in markdown
+    assert "higher score means calmer volatility conditions" in markdown
 
 
 def test_news_analytics_table_uses_investment_implication_format():

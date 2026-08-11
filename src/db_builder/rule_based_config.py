@@ -124,10 +124,11 @@ CORE_MARKET_TICKERS = sorted(
 )
 
 MACRO_SYMBOLS = [
-    "^GSPC", "^NDX", "^IXIC", "^DJI", "^RUT", "^VIX", "^MOVE", "^HSI", "^N225", "^KS11", "^KS200", "^FVX", "^TNX", "^TYX",
+    "^GSPC", "^NDX", "^IXIC", "^DJI", "^RUT", "^VIX", "^SKEW", "^MOVE", "^HSI", "^N225", "^KS11", "^KS200",
+    "^FVX", "^TNX", "^TYX", "US2YT=X", "US3YT=X", "US5YT=X", "US7YT=X", "US10YT=X", "US20YT=X", "US30YT=X",
     "DXY", "DX-Y.NYB", "JPY=X", "EURUSD=X",
     "GC=F", "SI=F", "CL=F", "BZ=F", "HG=F", "BTC-USD", "ETH-USD",
-    "ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F",
+    "ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F", "KOR200c1", "HK50", "CIHc1",
     "HYG", "LQD", "JNK", "RSP", "IWF", "IWD", "TLT", "IEF", "SHY",
 ]
 

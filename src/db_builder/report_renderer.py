@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from db_builder.contradiction_audit import audit_report_scores
 from db_builder.etf_flow.report_adapter import etf_flow_report_lines
@@ -36,6 +38,22 @@ def fmt_money(value) -> str:
         return f"{sign}${abs(numeric):,.0f}"
     except (TypeError, ValueError):
         return "n/a"
+
+
+def fmt_hkt_timestamp(value) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    if not isinstance(value, datetime):
+        return str(value)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    hkt = value.astimezone(ZoneInfo("Asia/Hong_Kong"))
+    return f"{hkt.day} {hkt.strftime('%B %Y, %H:%M:%S')} (HKT)"
 
 
 def table(headers: list[str], rows: list[list]) -> list[str]:
@@ -81,12 +99,69 @@ def score_all(data: dict) -> dict:
     return scores
 
 
+def _macro_status(row: dict) -> str:
+    if row.get("is_live") or row.get("data_status") == "live":
+        observed = row.get("observed_at")
+        return f"live as of {fmt_hkt_timestamp(observed)}" if observed else "live"
+    return "closed"
+
+
+def _macro_date(row: dict):
+    return row.get("market_date") or row.get("date") or "n/a"
+
+
 def _top_macro_rows(macro: list[dict]) -> list[list]:
-    wanted = ["^GSPC", "^IXIC", "^RUT", "^VIX", "^MOVE", "^FVX", "^TNX", "^TYX", "DX-Y.NYB", "HYG", "LQD", "JNK", "RSP", "IWF", "IWD", "TLT", "IEF", "SHY", "GC=F", "SI=F", "CL=F", "HG=F"]
+    wanted = [
+        "^GSPC", "^IXIC", "^RUT", "^VIX", "^SKEW", "^MOVE",
+        "US2YT=X", "US3YT=X", "US5YT=X", "US7YT=X", "US10YT=X", "US20YT=X", "US30YT=X",
+        "HK50", "KOR200c1", "CIHc1",
+        "HYG", "LQD", "JNK", "RSP", "IWF", "IWD", "TLT", "IEF", "SHY",
+        "GC=F", "SI=F", "CL=F", "HG=F",
+    ]
     rows = []
     for symbol in wanted:
         row = next((item for item in macro if item.get("symbol") == symbol), {})
-        rows.append([symbol, row.get("name", "unavailable"), fmt(row.get("close")), fmt(row.get("pct_chg")), row.get("date", "n/a")])
+        rows.append([symbol, row.get("name", "unavailable"), fmt(row.get("close")), fmt(row.get("pct_chg")), _macro_date(row), _macro_status(row) if row else "unavailable"])
+    return rows
+
+
+def _regime_score_rows(regime: dict) -> list[list]:
+    def bias(value) -> str:
+        numeric = flt(value, None)
+        if numeric is None:
+            return "unavailable"
+        if numeric >= 65:
+            return "risk-on support"
+        if numeric >= 55:
+            return "mild risk-on support"
+        if numeric > 45:
+            return "neutral / mixed"
+        if numeric > 35:
+            return "mild risk-off pressure"
+        return "risk-off pressure"
+
+    interpretations = {
+        "equity_trend": "Core equity ETFs versus moving averages.",
+        "equity_momentum": "5D/20D/60D return momentum across SPY, QQQ, IWM, and SMH.",
+        "market_breadth": "Participation breadth from tracked equity/ETF rows.",
+        "volatility": "VIX level and change; higher score means calmer volatility conditions.",
+        "rates_yield_curve": "Treasury yield pressure and curve shape; higher score means less rates pressure.",
+        "credit_proxy": "Credit-market proxy; currently neutral when no direct spread signal is available.",
+        "dollar_fx": "Dollar move; higher score means less USD tightening pressure.",
+        "commodity_confirmation": "Copper, silver, oil, and gold mix; higher score means better cyclical confirmation.",
+        "etf_flow": "Grouped ETF flow contribution adjusted for reliability.",
+        "news_confirmation": "Weighted headline/news confirmation score.",
+    }
+
+    rows = [["Overall regime", fmt(regime.get("score")), regime.get("label", "n/a")]]
+    rows.extend(
+        [key, fmt(value), f"{bias(value)}; {interpretations.get(key, 'Regime input.')}"]
+        for key, value in regime.get("subscores", {}).items()
+    )
+    rows.append(["Positive contributors", "", ", ".join(regime.get("positive_contributors") or ["none"])])
+    rows.append(["Negative contributors", "", ", ".join(regime.get("negative_contributors") or ["none"])])
+    if regime.get("missing_data_warnings"):
+        rows.append(["Missing data", "", ", ".join(regime["missing_data_warnings"])])
     return rows
 
 
@@ -539,13 +614,13 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     lines = [
         "# Rule-Based Institutional Market Update",
         "",
-        f"Generated at: {generated_at.isoformat() if generated_at else 'n/a'}",
+        f"Generated at: {fmt_hkt_timestamp(generated_at)}",
         f"Window: {window_hours}h",
         "",
         "## Executive Dashboard",
         "",
         f"- Regime score: **{fmt(regime['score'])} / 100** ({regime['label']})",
-        f"- Market strength: **{fmt(strength['score'])} / 100** ({strength['label']})",
+        f"- US equity strength: **{fmt(strength['score'])} / 100** ({strength['label']})",
         f"- Evidence quality: **{fmt(confidence['score'])} / 100**",
         f"- ETF flow contribution: **{fmt(etf_regime.get('flow_regime_score') or etf_regime.get('score'))} / 100**, reliability **{fmt(etf_regime.get('flow_regime_confidence') or etf_regime.get('confidence'))} / 100**",
         f"- Breadth: **{strength['breadth']['label']}**; above 50DMA `{fmt(strength['breadth']['above_50d_pct'])}%`, above 200DMA `{fmt(strength['breadth']['above_200d_pct'])}%`",
@@ -555,13 +630,9 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
         "## Market Regime Score",
         "",
     ]
-    lines.extend(table(["Sub-score", "Value"], [[key, fmt(value)] for key, value in regime["subscores"].items()]))
-    lines.extend(["", "Positive contributors: " + ", ".join(regime["positive_contributors"] or ["none"])])
-    lines.extend(["Negative contributors: " + ", ".join(regime["negative_contributors"] or ["none"])])
-    if regime["missing_data_warnings"]:
-        lines.append("Missing-data warnings: " + ", ".join(regime["missing_data_warnings"]))
+    lines.extend(table(["Metric", "Value", "Driver / Interpretation"], _regime_score_rows(regime)))
 
-    lines.extend(["", "## Market Strength Score", ""])
+    lines.extend(["", "## US Equity Strength Score", ""])
     lines.extend(table(["Component", "Score"], [[key, fmt(value)] for key, value in strength["decomposition"].items()]))
 
     lines.extend(["", "## Evidence Quality / Confidence", ""])
@@ -578,7 +649,11 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     lines.extend(["", "## Cross-Asset Confirmation", ""])
     lines.extend(table(["Area", "Signal", "Interpretation"], _cross_asset_summary(data.get("macro", []))))
     lines.extend(["", "### Macro Snapshot", ""])
-    lines.extend(table(["Symbol", "Name", "Close", "Pct Chg", "Date"], _top_macro_rows(data.get("macro", []))))
+    live_count = sum(1 for row in data.get("macro", []) if row.get("is_live") or row.get("data_status") == "live")
+    if live_count:
+        lines.append(f"Live macro rows are intraday snapshots from `public.macro_live`; closed rows are official stored rows from `public.macro`.")
+        lines.append("")
+    lines.extend(table(["Symbol", "Name", "Close", "Pct Chg", "Market Date", "Status"], _top_macro_rows(data.get("macro", []))))
 
     lines.extend(["", "## Market Dispersion Analysis", ""])
     lines.extend(_broad_dispersion_lines(broad_dispersion))
@@ -659,7 +734,7 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
         lines.append("No contradiction flags were triggered by current deterministic rules.")
 
     lines.extend(["", "## Data Quality Notes", ""])
-    lines.extend([f"- Technical rows loaded: `{len(data.get('technicals', []))}`", f"- S&P 500 constituent technical rows loaded: `{len(data.get('sp500_technicals', []))}`", f"- Macro rows loaded: `{len(data.get('macro', []))}`", f"- Economic rows loaded: `{len(data.get('economic', []))}`", f"- News rows loaded: `{len(data.get('news', []))}`", f"- Positioning/flow rows loaded: `{len(data.get('positioning_flow', []))}`"])
+    lines.extend([f"- Technical rows loaded: `{len(data.get('technicals', []))}`", f"- S&P 500 constituent technical rows loaded: `{len(data.get('sp500_technicals', []))}`", f"- Macro rows loaded: `{len(data.get('macro', []))}`", f"- Live macro rows used: `{live_count}`", f"- Economic rows loaded: `{len(data.get('economic', []))}`", f"- News rows loaded: `{len(data.get('news', []))}`", f"- Positioning/flow rows loaded: `{len(data.get('positioning_flow', []))}`"])
     for warning in confidence["warning_flags"][:8]:
         lines.append(f"- {warning}")
     return "\n".join(lines).rstrip() + "\n"

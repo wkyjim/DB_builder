@@ -17,6 +17,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--setup-tables", action="store_true")
     parser.add_argument("--tickers", help="Comma-separated ETF tickers. Defaults to the curated ETF flow universe.")
     parser.add_argument("--start-date", help="Backfill issuer history from YYYY-MM-DD where issuer history is available.")
+    parser.add_argument("--end-date", help="Optional issuer-history cutoff date in YYYY-MM-DD.")
+    parser.add_argument(
+        "--allow-yfinance-fallback",
+        action="store_true",
+        help="Allow yfinance metadata fallback rows. Disabled by default because this is not issuer fund-flow data.",
+    )
     parser.add_argument("--refresh-signals", action="store_true", help="Refresh public.positioning_flow_signals after upsert.")
     parser.add_argument("--summary", action="store_true", help="Print latest ETF daily data rows from positioning_flow_signals.")
     return parser.parse_args()
@@ -56,11 +62,14 @@ def main() -> None:
 
     tickers = _parse_tickers(args.tickers)
     start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
+    end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date() if args.end_date else None
     result = run_etf_flow_fetch(
         engine,
         tickers=tickers,
         dry_run=args.dry_run or not args.upsert_local,
         start_date=start_date,
+        end_date=end_date,
+        allow_yfinance_fallback=args.allow_yfinance_fallback,
     )
     mode = "DRY RUN" if args.dry_run or not args.upsert_local else "UPSERT LOCAL"
     print(f"[{mode}] ETF snapshots={result['rows']:,} upserted={result['upserted']:,} recomputed={result['recomputed']:,}")

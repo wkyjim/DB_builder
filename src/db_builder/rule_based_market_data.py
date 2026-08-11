@@ -80,16 +80,62 @@ def fetch_market_technicals(engine, *, tickers: list[str] | None = None) -> pd.D
     return _safe_read_sql(engine, sql, {"tickers": selected})
 
 
-def fetch_macro_snapshot(engine, *, symbols: list[str] | None = None) -> pd.DataFrame:
+def fetch_macro_snapshot(engine, *, symbols: list[str] | None = None, live_max_age_minutes: int = 240) -> pd.DataFrame:
     selected = symbols or MACRO_SYMBOLS
     sql = """
+        WITH closed_latest AS (
+            SELECT DISTINCT ON (symbol)
+                symbol,
+                name,
+                asset_type,
+                date,
+                close,
+                pct_chg,
+                volume,
+                NULL::timestamptz AS observed_at,
+                date AS market_date,
+                false AS is_live,
+                'closed'::text AS data_status,
+                1 AS source_rank
+            FROM public.macro
+            WHERE symbol = ANY(:symbols)
+            ORDER BY symbol, date DESC
+        ),
+        live_candidates AS (
+            SELECT
+                l.symbol,
+                l.name,
+                l.asset_type,
+                l.market_date AS date,
+                l.close,
+                l.pct_chg,
+                l.volume,
+                l.observed_at,
+                l.market_date,
+                true AS is_live,
+                'live'::text AS data_status,
+                0 AS source_rank
+            FROM public.macro_live l
+            LEFT JOIN closed_latest c ON c.symbol = l.symbol
+            WHERE l.symbol = ANY(:symbols)
+              AND l.is_market_closed = false
+              AND l.observed_at >= now() - (:live_max_age_minutes * INTERVAL '1 minute')
+              AND l.market_date >= COALESCE(c.date, DATE '1900-01-01')
+        ),
+        ranked AS (
+            SELECT *
+            FROM closed_latest
+            UNION ALL
+            SELECT *
+            FROM live_candidates
+        )
         SELECT DISTINCT ON (symbol)
-            symbol, name, asset_type, date, close, pct_chg, volume
-        FROM public.macro
-        WHERE symbol = ANY(:symbols)
-        ORDER BY symbol, date DESC
+            symbol, name, asset_type, date, close, pct_chg, volume,
+            observed_at, market_date, is_live, data_status
+        FROM ranked
+        ORDER BY symbol, source_rank, date DESC
     """
-    return _safe_read_sql(engine, sql, {"symbols": selected})
+    return _safe_read_sql(engine, sql, {"symbols": selected, "live_max_age_minutes": live_max_age_minutes})
 
 
 def fetch_recent_news(engine, *, window_hours: int, limit: int = 80) -> pd.DataFrame:

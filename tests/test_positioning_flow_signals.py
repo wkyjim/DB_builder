@@ -127,6 +127,13 @@ def test_etf_flow_dashboard_rows_add_display_names_and_simple_comments():
             {"asset_id": "QQQ", "signal_value": 0, "z_score": None, "source": "ETF daily data"},
             {"asset_id": "TLT", "signal_value": 3000, "z_score": 4000, "source": "ETF daily data"},
             {"asset_id": "IBIT", "signal_value": -3000, "z_score": -4000, "source": "ETF daily data"},
+            {
+                "asset_id": "IJH",
+                "signal_value": 0,
+                "z_score": 4000,
+                "flow_method": "shares_delta_zero_no_creation_redemption",
+                "source": "ETF daily data",
+            },
             {"asset_id": "SMH", "signal_value": 0, "z_score": None, "source": "ETF daily data"},
             {"asset_id": "SOXX", "signal_value": 0, "z_score": None, "source": "ETF daily data"},
         ]
@@ -140,6 +147,7 @@ def test_etf_flow_dashboard_rows_add_display_names_and_simple_comments():
     assert by_ticker["SPY"]["display_name"] == "SPY - Broad Equity"
     assert by_ticker["SPY"]["flow_bucket"] == "Broad Market ETF Flows"
     assert by_ticker["SPY"]["flow_comment"] == "1D outflow; 5D inflow."
+    assert by_ticker["IJH"]["flow_comment"] == "No 1D shares-outstanding change reported; 5D inflow."
     assert by_ticker["TLT"]["display_name"] == "TLT - Long Duration Treasury"
     assert by_ticker["TLT"]["flow_bucket"] == "Fixed Income / Macro ETF Flows"
     assert by_ticker["IBIT"]["display_name"] == "IBIT - Bitcoin"

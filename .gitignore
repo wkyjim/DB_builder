@@ -7,7 +7,10 @@ logs/
 
 # Generated reports
 reports/
-*.md
+hermes-agent/reports/
+
+# Generated repair/backfill artifacts
+artifacts/
 
 # Pytest cache
 .pytest_cache/
@@ -42,3 +45,5 @@ Desktop.ini
 
 # Separate deployment repo
 neon-api/
+market-dashboard/
+market-intelligence-telegram-bot/
