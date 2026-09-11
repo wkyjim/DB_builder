@@ -7,11 +7,33 @@ import pytest
 
 from db_builder.trading_calendar import (
     coverage_is_sufficient,
+    filter_valid_trading_dates,
     is_valid_nyse_session,
     latest_completed_nyse_session_date,
     reject_non_trading_dates,
     should_skip_for_latest_session,
 )
+
+
+def test_filter_valid_trading_dates_checks_each_date_once(monkeypatch):
+    calls = []
+
+    def fake_is_valid(value):
+        calls.append(value)
+        return value == date(2026, 9, 10)
+
+    monkeypatch.setattr("db_builder.trading_calendar.is_valid_nyse_session", fake_is_valid)
+    frame = pd.DataFrame(
+        {
+            "date": ["2026-09-10", "2026-09-10", "2026-09-12"],
+            "ticker": ["A", "B", "C"],
+        }
+    )
+
+    result = filter_valid_trading_dates(frame)
+
+    assert result["ticker"].tolist() == ["A", "B"]
+    assert sorted(calls) == [date(2026, 9, 10), date(2026, 9, 12)]
 
 
 def test_saturday_2026_05_30_rejected():

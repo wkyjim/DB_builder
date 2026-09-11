@@ -102,7 +102,13 @@ def filter_valid_trading_dates(
 
     result = df.copy()
     result[date_column] = pd.to_datetime(result[date_column]).dt.date
-    keep_mask = result[date_column].map(is_valid_nyse_session)
+    unique_dates = result[date_column].dropna().unique()
+    valid_dates = {
+        session_date
+        for session_date in unique_dates
+        if is_valid_nyse_session(session_date)
+    }
+    keep_mask = result[date_column].isin(valid_dates)
     dropped = len(result) - int(keep_mask.sum())
 
     if dropped:

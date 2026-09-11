@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
@@ -13,6 +14,21 @@ from db_builder.trading_calendar import latest_completed_nyse_session_date
 
 
 DEFAULT_API_HEALTH_URL = "https://postgresql-us-equities-api.onrender.com/"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Check equity-pipeline dependencies.")
+    parser.add_argument(
+        "--require-neon",
+        action="store_true",
+        help="Fail when Neon is unavailable. Local-first jobs leave this advisory.",
+    )
+    parser.add_argument(
+        "--require-api",
+        action="store_true",
+        help="Fail when the public Render API is unavailable.",
+    )
+    return parser.parse_args()
 
 
 def check_database_connection(name: str, engine) -> bool:
@@ -59,20 +75,36 @@ def check_api_health() -> bool:
         return False
 
 
-def main() -> int:
-    local = local_engine()
-    neon = neon_engine()
+def check_neon() -> bool:
+    try:
+        engine = neon_engine()
+    except Exception as exc:
+        print(f"[FAIL] Neon configuration: {type(exc).__name__}")
+        return False
+    return check_database_connection("Neon", engine) and check_latest_date("Neon", engine)
 
-    checks = [
+
+def main() -> int:
+    args = parse_args()
+    local = local_engine()
+    required_checks = [
         check_database_connection("PostgreSQL", local),
-        check_database_connection("Neon", neon),
         check_latest_date("local", local),
-        check_latest_date("Neon", neon),
         check_latest_nyse_session(),
-        check_api_health(),
     ]
 
-    if all(checks):
+    neon_ok = check_neon()
+    api_ok = check_api_health()
+    if not neon_ok and not args.require_neon:
+        print("[WARN] Neon preflight failed; local ingestion may continue and sync can retry later.")
+    if not api_ok and not args.require_api:
+        print("[WARN] Public API health failed; it does not block local ingestion.")
+    if args.require_neon:
+        required_checks.append(neon_ok)
+    if args.require_api:
+        required_checks.append(api_ok)
+
+    if all(required_checks):
         print("[OK] health check passed")
         return 0
 
@@ -82,4 +114,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

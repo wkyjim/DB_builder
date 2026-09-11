@@ -22,6 +22,8 @@ from db_builder.yfinance_equity_fallback import fetch_missing_range_rows
 from equity_session_coverage_audit import (
     build_session_rows,
     expected_sessions,
+    fetch_coverage_eligible_tickers,
+    fetch_raw_coverage_keys,
     fetch_keys,
     keys_by_date,
 )
@@ -36,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="2026-05-01")
     parser.add_argument("--end-date", default=None)
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=None,
+        help="Use a rolling calendar-day window ending at --end-date/latest session.",
+    )
     parser.add_argument("--minimum-coverage", type=float, default=MIN_SESSION_COVERAGE_RATIO)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--artifact-dir", type=Path, default=ARTIFACT_ROOT)
@@ -50,13 +58,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Apply raw and indicator repairs to local PostgreSQL and Neon.",
     )
+    parser.add_argument(
+        "--apply-local",
+        action="store_true",
+        help="Apply repairs only to local PostgreSQL; Neon is reconciled separately.",
+    )
     return parser.parse_args()
 
 
 def discover_repair_targets(engine, start_date, end_date, minimum_coverage: float) -> dict:
     history_start = start_date - timedelta(days=14)
     sessions = expected_sessions(history_start, end_date)
-    raw = fetch_keys(engine, RAW_TABLE, history_start, end_date)
+    eligible_tickers = fetch_coverage_eligible_tickers(engine)
+    raw = fetch_raw_coverage_keys(
+        engine,
+        history_start,
+        end_date,
+        core_only=True,
+        eligible_tickers=eligible_tickers,
+    )
     rows = build_session_rows(
         sessions,
         keys_by_date(raw),
@@ -67,7 +87,10 @@ def discover_repair_targets(engine, start_date, end_date, minimum_coverage: floa
         row["date"]: set(row["missing_baseline_tickers"])
         for row in rows
         if row["date"] >= start_date
-        and "LOW_RAW_COVERAGE" in row["flags"]
+        and (
+            "LOW_RAW_COVERAGE" in row["flags"]
+            or "MISSING_SESSION" in row["flags"]
+        )
         and row["missing_baseline_tickers"]
     }
 
@@ -133,7 +156,10 @@ def fetch_repair_rows(
             f"found={len(found):,} unresolved={len(unresolved):,}",
             flush=True,
         )
-    return result.frame.sort_values(["ticker", "date"]), diagnostics
+    frame = result.frame
+    if not frame.empty:
+        frame = frame.sort_values(["ticker", "date"])
+    return frame, diagnostics
 
 
 def earliest_repair_dates(raw_repairs: pd.DataFrame) -> dict[str, object]:
@@ -142,6 +168,29 @@ def earliest_repair_dates(raw_repairs: pd.DataFrame) -> dict[str, object]:
         .min()
         .to_dict()
     )
+
+
+def discover_indicator_repair_dates(engine, start_date, end_date) -> dict[str, object]:
+    frame = pd.read_sql(
+        text(
+            f"""
+            SELECT raw.ticker, MIN(raw.date) AS first_missing_date
+            FROM {RAW_TABLE} raw
+            LEFT JOIN {INDICATOR_TABLE} indicator
+              ON indicator.ticker = raw.ticker
+             AND indicator.date = raw.date
+            WHERE raw.date BETWEEN :start_date AND :end_date
+              AND indicator.ticker IS NULL
+            GROUP BY raw.ticker
+            """
+        ),
+        engine,
+        params={"start_date": start_date, "end_date": end_date},
+    )
+    return {
+        str(row.ticker): pd.Timestamp(row.first_missing_date).date()
+        for row in frame.itertuples(index=False)
+    }
 
 
 def calculate_replacement_indicators(engine, repair_dates: dict[str, object]) -> pd.DataFrame:
@@ -272,11 +321,15 @@ def write_diagnostics(path: Path, payload: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    start_date = pd.Timestamp(args.start_date).date()
     end_date = (
         pd.Timestamp(args.end_date).date()
         if args.end_date
         else latest_completed_nyse_session_date()
+    )
+    start_date = (
+        end_date - timedelta(days=args.lookback_days)
+        if args.lookback_days is not None
+        else pd.Timestamp(args.start_date).date()
     )
     local = local_engine(use_insertmanyvalues=True)
     targets = discover_repair_targets(
@@ -322,28 +375,35 @@ def main() -> None:
     print(f"[RAW REPAIR CSV] path={raw_path} rows={len(raw_repairs):,}", flush=True)
     print(f"[DIAGNOSTICS] path={diagnostics_path}", flush=True)
 
-    if raw_repairs.empty:
-        print("[NO REPAIRS] yfinance returned no missing session rows.", flush=True)
+    apply_local = args.apply or args.apply_local
+    if raw_repairs.empty and not apply_local:
+        print("[NO RAW REPAIRS] yfinance returned no missing session rows.", flush=True)
         return
 
-    repair_dates = earliest_repair_dates(raw_repairs)
+    repair_dates = earliest_repair_dates(raw_repairs) if not raw_repairs.empty else {}
     print(
         f"[IMPACTED TICKERS] count={len(repair_dates):,} "
-        f"earliest={min(repair_dates.values())}",
+        f"earliest={min(repair_dates.values()) if repair_dates else 'n/a'}",
         flush=True,
     )
+    if not apply_local:
+        print("[DRY RUN] No database rows changed. Re-run with --apply.", flush=True)
+        return
+
+    if not raw_repairs.empty:
+        local_raw_table = _load_target_table(local, RAW_TABLE)
+        _upsert_dataframe(local, local_raw_table, raw_repairs)
+        print(f"[LOCAL RAW UPSERT] rows={len(raw_repairs):,}", flush=True)
+
+    indicator_dates = discover_indicator_repair_dates(local, start_date, end_date)
+    for ticker, first_date in indicator_dates.items():
+        repair_dates[ticker] = min(first_date, repair_dates.get(ticker, first_date))
+    print(f"[INDICATOR REPAIR TICKERS] count={len(repair_dates):,}", flush=True)
     local_delete_count = count_indicator_scope(local, repair_dates)
     print(
         f"[LOCAL INDICATOR REPLACEMENT SCOPE] existing_rows={local_delete_count:,}",
         flush=True,
     )
-    if not args.apply:
-        print("[DRY RUN] No database rows changed. Re-run with --apply.", flush=True)
-        return
-
-    local_raw_table = _load_target_table(local, RAW_TABLE)
-    _upsert_dataframe(local, local_raw_table, raw_repairs)
-    print(f"[LOCAL RAW UPSERT] rows={len(raw_repairs):,}", flush=True)
 
     replacements = calculate_replacement_indicators(local, repair_dates)
     indicator_path = artifact_dir / "indicator_replacements.csv"
@@ -357,14 +417,16 @@ def main() -> None:
         flush=True,
     )
 
-    neon = neon_engine(use_insertmanyvalues=True)
-    neon_raw_table = _load_target_table(neon, RAW_TABLE)
-    _upsert_dataframe(neon, neon_raw_table, raw_repairs)
-    print(f"[NEON RAW UPSERT] rows={len(raw_repairs):,}", flush=True)
-    print(
-        f"[NEON INDICATOR REPLACE] rows={atomic_replace_indicators(neon, replacements, repair_dates):,}",
-        flush=True,
-    )
+    if args.apply:
+        neon = neon_engine(use_insertmanyvalues=True)
+        if not raw_repairs.empty:
+            neon_raw_table = _load_target_table(neon, RAW_TABLE)
+            _upsert_dataframe(neon, neon_raw_table, raw_repairs)
+            print(f"[NEON RAW UPSERT] rows={len(raw_repairs):,}", flush=True)
+        print(
+            f"[NEON INDICATOR REPLACE] rows={atomic_replace_indicators(neon, replacements, repair_dates):,}",
+            flush=True,
+        )
     print("[REPAIR COMPLETE]", flush=True)
 
 

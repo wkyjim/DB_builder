@@ -1,11 +1,12 @@
 @echo off
 call "C:\Users\User\anaconda3\Scripts\activate.bat"
 call conda activate PostgreSQL_db
-cd /d "C:\Users\User\OneDrive\Coding\DB_builder"
+for %%I in ("%~dp0..") do set "DB_BUILDER_ROOT=%%~fI"
+cd /d "%DB_BUILDER_ROOT%"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
-  "$Root = 'C:\Users\User\OneDrive\Coding\DB_builder';" ^
+  "$Root = $env:DB_BUILDER_ROOT;" ^
   "$Python = 'C:\Users\User\anaconda3\envs\PostgreSQL_db\python.exe';" ^
   "$LogDir = Join-Path $Root 'logs';" ^
   "New-Item -ItemType Directory -Force -Path $LogDir | Out-Null;" ^
@@ -16,8 +17,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Write-Log 'START' 'auto_postgreSQL_db workflow';" ^
   "if (-not (Invoke-RetryPython 'scripts\health_check.py' 'health_check.py')) { Write-Log 'ERROR' 'health_check.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\pgSQL_equities_auto.py' 'pgSQL_equities_auto.py' @('--fetch-only') 1200)) { Write-Log 'ERROR' 'pgSQL_equities_auto.py failed after 3 retries'; exit 1 }" ^
-  "if (-not (Invoke-RetryPython 'scripts\pgSQL_daily_bulk_sync_to_neon.py' 'pgSQL_daily_bulk_sync_to_neon.py' @('--tables', 'equities'))) { Write-Log 'ERROR' 'pgSQL_daily_bulk_sync_to_neon.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\repair_historical_equity_gaps.py' 'repair_historical_equity_gaps.py' @('--lookback-days', '60', '--minimum-coverage', '0.97', '--apply-local') 3600)) { Write-Log 'ERROR' 'repair_historical_equity_gaps.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\pgSQL_daily_bulk_sync_to_neon.py' 'pgSQL_daily_bulk_sync_to_neon.py' @('--tables', 'equities', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'pgSQL_daily_bulk_sync_to_neon.py failed after 3 retries'; exit 1 }" ^
   "if (-not (Invoke-RetryPython 'scripts\indicator_staged_backfill.py' 'indicator_staged_backfill.py' @('--stage', 'all', '--cleanup-on-success'))) { Write-Log 'ERROR' 'indicator_staged_backfill.py failed after 3 retries'; exit 1 }" ^
+  "if (-not (Invoke-RetryPython 'scripts\pgSQL_daily_bulk_sync_to_neon.py' 'indicator reconciliation to Neon' @('--tables', 'indicators', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'indicator reconciliation to Neon failed after 3 retries'; exit 1 }" ^
   "Write-Log 'SUCCESS' 'auto_postgreSQL_db workflow complete'; exit 0"
 
 exit /b %ERRORLEVEL%

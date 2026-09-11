@@ -14,6 +14,7 @@ from db_builder.trading_calendar import filter_valid_trading_dates
 
 CHUNK_SIZE = 5000
 OVERLAP_DAYS = 5
+RECONCILIATION_DAYS = 60
 
 RAW_NUMERIC_COLUMNS = [
     "open", "high", "low", "close", "change", "pct_chg", "prev_close",
@@ -103,13 +104,16 @@ def fetch_local_rows_for_daily_sync(
     overlap_days: int = OVERLAP_DAYS,
     limit: int | None = None,
     tickers: list[str] | None = None,
+    minimum_date=None,
 ) -> pd.DataFrame:
     limit_clause = "LIMIT %(limit)s" if limit is not None else ""
     ticker_clause = "AND ticker = ANY(%(tickers)s)" if tickers else ""
+    minimum_date_clause = "AND date >= %(minimum_date)s" if minimum_date else ""
     sql = f"""
     SELECT *
     FROM {table_name}
     WHERE date >= (%(latest_date)s::date - (%(overlap_days)s * INTERVAL '1 day'))
+    {minimum_date_clause}
     {ticker_clause}
     ORDER BY date, ticker
     {limit_clause}
@@ -120,6 +124,8 @@ def fetch_local_rows_for_daily_sync(
         params["limit"] = limit
     if tickers:
         params["tickers"] = [ticker.strip().upper() for ticker in tickers if ticker.strip()]
+    if minimum_date:
+        params["minimum_date"] = pd.Timestamp(minimum_date).date()
 
     df = pd.read_sql(
         sql,
@@ -133,6 +139,62 @@ def fetch_local_rows_for_daily_sync(
     )
 
     return df
+
+
+def earliest_count_mismatch(local_counts: pd.DataFrame, neon_counts: pd.DataFrame):
+    """Return the earliest date whose local and Neon ticker counts differ."""
+    local = {
+        pd.Timestamp(row.date).date(): int(row.row_count)
+        for row in local_counts.itertuples(index=False)
+    }
+    remote = {
+        pd.Timestamp(row.date).date(): int(row.row_count)
+        for row in neon_counts.itertuples(index=False)
+    }
+    all_dates = sorted(set(local) | set(remote))
+    return next(
+        (
+            session_date
+            for session_date in all_dates
+            if local.get(session_date, 0) != remote.get(session_date, 0)
+        ),
+        None,
+    )
+
+
+def fetch_date_counts(engine, table_name: str, start_date) -> pd.DataFrame:
+    return pd.read_sql(
+        text(
+            f"""
+            SELECT date, COUNT(*) AS row_count
+            FROM {table_name}
+            WHERE date >= :start_date
+            GROUP BY date
+            ORDER BY date
+            """
+        ),
+        engine,
+        params={"start_date": start_date},
+    )
+
+
+def reconciliation_start_date(
+    local_engine,
+    neon_engine,
+    table_name: str,
+    latest_date,
+    days: int,
+    minimum_date=None,
+):
+    start_date = pd.Timestamp(latest_date).date() - pd.Timedelta(days=days)
+    if minimum_date is not None:
+        start_date = max(start_date, pd.Timestamp(minimum_date).date())
+    local_counts = fetch_date_counts(local_engine, table_name, start_date)
+    neon_counts = fetch_date_counts(neon_engine, table_name, start_date)
+    mismatch = earliest_count_mismatch(local_counts, neon_counts)
+    if mismatch is not None:
+        print(f"[RECONCILE] {table_name}: earliest count mismatch={mismatch}")
+    return mismatch
 
 
 def clean_dataframe_for_target(df: pd.DataFrame, table_name: str) -> pd.DataFrame:
@@ -202,15 +264,23 @@ def bulk_temp_staging_upsert_to_neon(
             ON COMMIT DROP;
         """))
 
-        df.to_sql(
-            name=temp_table,
-            con=conn,
-            if_exists="append",
-            index=False,
-            chunksize=chunk_size,
-            method="multi",
-        )
+        total_chunks = (len(df) + chunk_size - 1) // chunk_size
+        for chunk_number, offset in enumerate(range(0, len(df), chunk_size), start=1):
+            chunk = df.iloc[offset : offset + chunk_size]
+            chunk.to_sql(
+                name=temp_table,
+                con=conn,
+                if_exists="append",
+                index=False,
+                method="multi",
+            )
+            print(
+                f"[UPLOAD PROGRESS] {target_table}: chunk "
+                f"{chunk_number:,}/{total_chunks:,} rows={min(offset + len(chunk), len(df)):,}/{len(df):,}",
+                flush=True,
+            )
 
+        print(f"[MERGE] {target_table}: applying staged rows", flush=True)
         conn.execute(text(merge_sql))
 
     latest_uploaded_date = df["date"].max()
@@ -228,11 +298,13 @@ def daily_bulk_sync_to_neon(
     neon_engine,
     tables: list[str] | None = None,
     overlap_days: int = OVERLAP_DAYS,
+    reconciliation_days: int = RECONCILIATION_DAYS,
     chunk_size: int = CHUNK_SIZE,
     dry_run: bool = False,
     limit: int | None = None,
     tickers: list[str] | None = None,
     allow_non_trading_day: bool = False,
+    minimum_date=None,
 ) -> None:
     start_time = time.time()
     tables = tables or [RAW_TABLE, INDICATOR_TABLE]
@@ -250,6 +322,18 @@ def daily_bulk_sync_to_neon(
         latest_date = get_sync_latest_date(neon_engine, table_name)
         print(f"sync_state latest date for {table_name}: {latest_date}")
 
+        if not ticker_filter and reconciliation_days > 0:
+            mismatch = reconciliation_start_date(
+                local_engine,
+                neon_engine,
+                table_name,
+                latest_date,
+                reconciliation_days,
+                minimum_date=minimum_date,
+            )
+            if mismatch is not None:
+                latest_date = min(pd.Timestamp(latest_date).date(), mismatch)
+
         df = fetch_local_rows_for_daily_sync(
             local_engine=local_engine,
             table_name=table_name,
@@ -257,6 +341,7 @@ def daily_bulk_sync_to_neon(
             overlap_days=overlap_days,
             limit=limit,
             tickers=ticker_filter,
+            minimum_date=minimum_date,
         )
         df = filter_valid_trading_dates(
             df,
@@ -282,12 +367,27 @@ def daily_bulk_sync_to_neon(
             chunk_size=chunk_size,
         )
 
-        if latest_uploaded_date is not None and not ticker_filter:
+        if latest_uploaded_date is not None and not ticker_filter and limit is None:
+            verification_start = pd.to_datetime(df["date"]).dt.date.min()
+            mismatch = earliest_count_mismatch(
+                fetch_date_counts(local_engine, table_name, verification_start),
+                fetch_date_counts(neon_engine, table_name, verification_start),
+            )
+            if mismatch is not None:
+                raise RuntimeError(
+                    f"Post-upload row-count verification failed for {table_name} "
+                    f"at {mismatch}; sync_state was not advanced."
+                )
+            print(
+                f"[VERIFY] {table_name}: local and Neon date counts match "
+                f"from {verification_start} through {latest_uploaded_date}",
+                flush=True,
+            )
             update_sync_state(neon_engine, table_name, latest_uploaded_date)
             print(f"sync_state updated: {table_name} = {latest_uploaded_date}")
         elif latest_uploaded_date is not None:
             print(
-                f"Ticker-scoped sync uploaded through {latest_uploaded_date}; "
+                f"Scoped sync uploaded through {latest_uploaded_date}; "
                 "global sync_state was not advanced."
             )
 

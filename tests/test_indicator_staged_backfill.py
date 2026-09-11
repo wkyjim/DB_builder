@@ -98,7 +98,17 @@ def test_daily_runner_uses_fetch_only_and_staged_pipeline():
 
     assert "pgSQL_equities_auto.py' 'pgSQL_equities_auto.py' @('--fetch-only') 1200" in content
     assert "indicator_staged_backfill.py" in content
-    assert "@('--tables', 'equities')" in content
+    assert "repair_historical_equity_gaps.py" in content
+    assert "--apply-local" in content
+    assert "--reconciliation-days" in content
+    assert (
+        "@('--tables', 'equities', '--reconciliation-days', '60', "
+        "'--minimum-date', '2026-05-01')"
+    ) in content
+    assert (
+        "@('--tables', 'indicators', '--reconciliation-days', '60', "
+        "'--minimum-date', '2026-05-01')"
+    ) in content
     assert "Invoke-IndicatorBatches" not in content
     assert content.index("pgSQL_equities_auto.py' 'pgSQL_equities_auto.py'") < content.index(
         "pgSQL_daily_bulk_sync_to_neon.py' 'pgSQL_daily_bulk_sync_to_neon.py'"
