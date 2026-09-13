@@ -19,7 +19,7 @@ The private Hermes runtime lives at `%LOCALAPPDATA%\hermes`. Do not commit its `
 Run an unlimited Quick Scan from PowerShell:
 
 ```powershell
-Set-Location C:\Users\User\OneDrive\Coding\DB_builder
+Set-Location C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder
 .\hermes-agent\scripts\run-maintenance.ps1 -Job quick
 ```
 
@@ -28,7 +28,7 @@ The command streams Hermes tool previews and writes a permanent timestamped log 
 Follow the latest run from a second PowerShell window:
 
 ```powershell
-Set-Location C:\Users\User\OneDrive\Coding\DB_builder
+Set-Location C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder
 .\hermes-agent\scripts\watch-latest-run.ps1
 ```
 

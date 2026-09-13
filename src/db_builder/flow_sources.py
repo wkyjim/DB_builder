@@ -9,9 +9,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+import pandas_market_calendars as mcal
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
 from sqlalchemy import text
+from urllib3.util.retry import Retry
 
 
 CFTC_HISTORICAL_COMPRESSED_URL = "https://www.cftc.gov/MarketReports/CommitmentsofTraders/HistoricalCompressed/index.htm"
@@ -56,6 +59,18 @@ def http_session() -> requests.Session:
             "Accept": "text/html,text/csv,application/zip,application/octet-stream,*/*",
         }
     )
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.75,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD", "POST"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
 
@@ -151,6 +166,10 @@ def finra_short_volume_url(for_date: date, *, market: str = "CNMS") -> str:
     return f"https://cdn.finra.org/equity/regsho/daily/{market}shvol{for_date:%Y%m%d}.txt"
 
 
+def finra_short_interest_url(settlement_date: date) -> str:
+    return f"https://cdn.finra.org/equity/otcmarket/biweekly/shrt{settlement_date:%Y%m%d}.csv"
+
+
 def recent_business_dates(days: int = 10, *, today: date | None = None) -> list[date]:
     current = today or datetime.now(timezone.utc).date()
     dates = []
@@ -172,6 +191,13 @@ def business_dates_between(start_date: date, end_date: date) -> list[date]:
             dates.append(cursor)
         cursor += timedelta(days=1)
     return dates
+
+
+def market_session_dates_between(start_date: date, end_date: date) -> list[date]:
+    if end_date < start_date:
+        raise ValueError("end_date must be on or after start_date")
+    schedule = mcal.get_calendar("NYSE").schedule(start_date=start_date, end_date=end_date)
+    return [timestamp.date() for timestamp in schedule.index]
 
 
 def probe_cftc(timeout: int = 20) -> SourceProbeResult:

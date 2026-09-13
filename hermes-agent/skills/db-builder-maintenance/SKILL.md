@@ -5,7 +5,7 @@ description: Report-only maintenance audit for the DB_builder code, services, pi
 
 # DB Builder Maintenance
 
-Operate from `C:\Users\User\OneDrive\Coding\DB_builder` and obey the root `AGENTS.md`.
+Operate from `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder` and obey the root `AGENTS.md`.
 
 ## Workflow
 
@@ -20,4 +20,3 @@ Operate from `C:\Users\User\OneDrive\Coding\DB_builder` and obey the root `AGENT
 ## Hard stops
 
 Do not install/upgrade dependencies, edit application source, deploy, commit, push, delete, run migrations, grant privileges, write data, or create/drop/reindex database objects. Report recommended actions for human review.
-

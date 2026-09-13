@@ -10,7 +10,11 @@ from sqlalchemy import text
 from db_builder.config import RAW_TABLE
 
 
-NON_CORE_TYPES = {"warrant", "right", "unit", "preferred", "debt", "when_issued"}
+NON_CORE_TYPES = {
+    "warrant", "right", "unit", "preferred", "debt", "when_issued",
+    "etf", "etn", "closed_end_fund", "trust", "spac",
+    "fund",
+}
 
 
 def classify_security_type(ticker: str, name: str | None) -> str:
@@ -28,13 +32,27 @@ def classify_security_type(ticker: str, name: str | None) -> str:
         return "preferred"
     if re.search(r"\b(NOTES? DUE|BOND|DEBENTURE)\b", label):
         return "debt"
-    if " ETF" in f" {label}" or label.endswith("ETF"):
+    if re.search(r"\b(ETN|EXCHANGE TRADED NOTE)\b", label):
+        return "etn"
+    if re.search(r"\b(CLOSED END|CLOSED-END)\b", label):
+        return "closed_end_fund"
+    if " ETF" in f" {label}" or label.endswith("ETF") or re.search(
+        r"\b(ISHARES|SPDR|VANECK|VANGUARD|FIRST TRUST|INVESCO)\b", label
+    ):
         return "etf"
+    if re.search(r"\b(2X|3X|ULTRASHORT|DAILY INVERSE|CLO)\b", label):
+        return "fund"
+    if re.search(r"\bFUND\b", label):
+        return "fund"
+    if re.search(r"\b(UNIT INVESTMENT TRUST|COMMODITY TRUST|BITCOIN TRUST)\b", label):
+        return "trust"
+    if re.search(r"\b(ACQUISITION CORP|ACQUISITION CO|BLANK CHECK)\b", label):
+        return "spac"
     if re.search(r"\bADR\b", label):
         return "adr"
     if symbol.endswith("_U"):
         return "unit"
-    return "common_or_fund"
+    return "common_stock"
 
 
 def is_core_coverage_security(ticker: str, name: str | None, close) -> bool:

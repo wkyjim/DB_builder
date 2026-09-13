@@ -133,6 +133,39 @@ def test_extract_latest_unfinished_row_skips_completed_bar(monkeypatch):
     assert row is None
 
 
+def test_replace_macro_live_deduplicates_symbols_before_insert():
+    executions = []
+
+    class FakeConnection:
+        def execute(self, statement, parameters=None):
+            executions.append((str(statement), parameters))
+
+    class FakeTransaction:
+        def __enter__(self):
+            return FakeConnection()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class FakeEngine:
+        def begin(self):
+            return FakeTransaction()
+
+    rows = [
+        {"symbol": "^VIX", "close": 14.1},
+        {"symbol": "^VIX", "close": 14.2},
+        {"symbol": "ES=F", "close": 7800.0},
+    ]
+
+    macro_data_fetch.replace_macro_live(FakeEngine(), rows)
+
+    assert "pg_advisory_xact_lock" in executions[0][0]
+    inserted = executions[2][1]
+    assert len(inserted) == 2
+    assert {row["symbol"] for row in inserted} == {"^VIX", "ES=F"}
+    assert next(row for row in inserted if row["symbol"] == "^VIX")["close"] == 14.2
+
+
 def test_fetch_investiny_symbol_df_normalizes_historical_payload(monkeypatch):
     def fake_historical_data(*, investing_id, from_date, to_date, interval):
         assert investing_id == macro_data_fetch.INVESTINY_ASSETS["US10YT=X"]
@@ -181,6 +214,48 @@ def test_fetch_investiny_symbol_df_drops_weekend_rows(monkeypatch):
     )
 
     assert [item.date() for item in df["Date"]] == [date(2026, 7, 3), date(2026, 7, 6)]
+
+
+def test_investiny_403_uses_exponential_cooldown(monkeypatch):
+    monkeypatch.setattr(macro_data_fetch.random, "uniform", lambda *_args: 0.0)
+
+    assert macro_data_fetch._investiny_retry_delay("HTTP 403", 1) == 8.0
+    assert macro_data_fetch._investiny_retry_delay("HTTP 403", 2) == 16.0
+    assert macro_data_fetch._investiny_retry_delay("HTTP 403", 4) == 60.0
+
+
+def test_fetch_investiny_symbol_df_recovers_after_403(monkeypatch):
+    attempts = []
+    sleeps = []
+
+    def fake_historical_data(**_kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise ConnectionError("Request failed with error code: 403")
+        return {
+            "date": ["07/01/2026"],
+            "open": [4.4],
+            "high": [4.6],
+            "low": [4.3],
+            "close": [4.55],
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "investiny",
+        types.SimpleNamespace(historical_data=fake_historical_data),
+    )
+    monkeypatch.setattr(macro_data_fetch.time, "sleep", sleeps.append)
+    monkeypatch.setattr(macro_data_fetch.random, "uniform", lambda *_args: 0.0)
+
+    df, _ = macro_data_fetch.fetch_investiny_symbol_df(
+        "US10YT=X",
+        start_date=date(2026, 7, 1),
+    )
+
+    assert len(attempts) == 3
+    assert sleeps == [0.0, 8.0, 0.0, 16.0, 0.0]
+    assert df.iloc[0]["Close"] == 4.55
 
 
 def test_process_investiny_oil_live_row_uses_investing_source(monkeypatch):

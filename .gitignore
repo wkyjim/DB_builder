@@ -14,6 +14,12 @@ artifacts/
 
 # Pytest cache
 .pytest_cache/
+.pytest-tmp*/
+
+# Test coverage output
+.coverage
+coverage.xml
+htmlcov/
 
 # Python cache
 __pycache__/
@@ -42,6 +48,8 @@ Desktop.ini
 *.csv
 *.dump
 *.sql
+!migrations/
+!migrations/*.sql
 
 # Separate deployment repo
 neon-api/

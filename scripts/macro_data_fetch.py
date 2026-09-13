@@ -269,6 +269,19 @@ def replace_macro_live(engine, rows):
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.where(pd.notna(df), None)
+        duplicate_count = int(df.duplicated(subset=["symbol"], keep="last").sum())
+        if duplicate_count:
+            duplicate_symbols = sorted(
+                df.loc[df.duplicated(subset=["symbol"], keep=False), "symbol"]
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            print(
+                "[LIVE SNAPSHOT DEDUPLICATED] "
+                f"rows={duplicate_count:,} symbols={duplicate_symbols}"
+            )
+            df = df.drop_duplicates(subset=["symbol"], keep="last")
 
     insert_sql = text("""
         INSERT INTO public.macro_live (
@@ -282,10 +295,29 @@ def replace_macro_live(engine, rows):
             :open, :high, :low, :close, :adj_close, :volume,
             :prev_close, :change, :pct_chg, :amplitude,
             :is_market_closed, :source
-        );
+        )
+        ON CONFLICT (symbol) DO UPDATE SET
+            market_date = EXCLUDED.market_date,
+            observed_at = EXCLUDED.observed_at,
+            name = EXCLUDED.name,
+            asset_type = EXCLUDED.asset_type,
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            adj_close = EXCLUDED.adj_close,
+            volume = EXCLUDED.volume,
+            prev_close = EXCLUDED.prev_close,
+            change = EXCLUDED.change,
+            pct_chg = EXCLUDED.pct_chg,
+            amplitude = EXCLUDED.amplitude,
+            is_market_closed = EXCLUDED.is_market_closed,
+            source = EXCLUDED.source;
     """)
 
     with engine.begin() as conn:
+        # Serialize overlapping hourly/manual refreshes within each database.
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('macro_live_replace'))"))
         # This table intentionally contains only the latest fetch snapshot.
         conn.execute(text("DELETE FROM public.macro_live"))
         if not df.empty:
@@ -601,7 +633,14 @@ def _investiny_date(value):
     return pd.to_datetime(value, format="%m/%d/%Y", errors="coerce")
 
 
-def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=3):
+def _investiny_retry_delay(error, attempt):
+    """Return a longer cooldown when Investing.com throttles with HTTP 403."""
+    if "403" in str(error):
+        return min(60.0, 8.0 * (2 ** (attempt - 1))) + random.uniform(0.0, 3.0)
+    return random.uniform(3.0, 8.0)
+
+
+def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=5):
     investing_id = INVESTINY_ASSETS[symbol]
     source_symbol = INVESTING_SOURCE_SYMBOLS.get(symbol, symbol)
     target_start_date = start_date or (datetime.now().date() - timedelta(days=LOOKBACK_DAYS))
@@ -652,7 +691,9 @@ def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_ret
             print(f"[INVESTINY RETRY {attempt}/{max_retries}] {symbol}: {e}")
             if attempt == max_retries:
                 raise
-            time.sleep(random.uniform(3.0, 8.0))
+            delay = _investiny_retry_delay(e, attempt)
+            print(f"[INVESTINY COOLDOWN] {symbol}: {delay:.1f}s")
+            time.sleep(delay)
 
 
 def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None):
@@ -1036,6 +1077,10 @@ def run_daily_update(
         except Exception as e:
             print(f"[INVESTINY PROCESS ERROR] {symbol}: {e}")
             time.sleep(random.uniform(2.0, 5.0))
+        else:
+            # Investing.com intermittently returns 403 when symbols are fetched
+            # back-to-back, even though each individual instrument is valid.
+            time.sleep(random.uniform(3.0, 6.0))
 
     print(f"\n[LIVE SNAPSHOT TOTAL] rows={len(all_live_rows):,}")
     if not update_live:

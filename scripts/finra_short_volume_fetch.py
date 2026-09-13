@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 import _bootstrap  # noqa: F401
 
 from db_builder.config import local_engine
+from db_builder.finra_short_analytics import refresh_daily_short_volume_features
 from db_builder.finra_short_volume import latest_finra_summary, run_finra_fetch
-from db_builder.flow_sources import business_dates_between, recent_business_dates
+from db_builder.flow_sources import market_session_dates_between, recent_business_dates
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upsert-local", action="store_true")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--summary", action="store_true")
+    parser.add_argument("--refresh-existing", action="store_true", help="Re-download dates already marked successful (for revisions).")
+    parser.add_argument("--refresh-analytics", action="store_true", help="Recompute rolling analytics from stored history after ingestion.")
     return parser.parse_args()
 
 
@@ -33,7 +36,7 @@ def _dates(value: str, days: int, start_date: str | None, end_date: str | None):
         return [_parse_date(item.strip()) for item in value.split(",") if item.strip()]
     if start_date:
         end = _parse_date(end_date) if end_date else datetime.now(timezone.utc).date()
-        return business_dates_between(_parse_date(start_date), end)
+        return market_session_dates_between(_parse_date(start_date), end)
     return recent_business_dates(days)
 
 
@@ -52,11 +55,20 @@ def main() -> None:
         market=args.market,
         dry_run=args.dry_run or not args.upsert_local,
         timeout=args.timeout,
+        skip_existing=not args.refresh_existing,
+        progress=lambda message: print(message, flush=True),
     )
     if args.dry_run or not args.upsert_local:
         print(f"[DRY RUN] rows={result['rows']:,} latest={result['latest_available_date']} no database writes")
         return
-    print(f"[UPSERT LOCAL] rows={result['upserted']:,} latest={result['latest_available_date']}")
+    print(
+        f"[UPSERT LOCAL] rows={result['upserted']:,} latest={result['latest_available_date']} "
+        f"success_dates={len(result['successful_dates'])} missing={len(result['missing_dates'])} "
+        f"failed={len(result['failed_dates'])} skipped={len(result['skipped_dates'])}"
+    )
+    if args.refresh_analytics:
+        analytics_start = min(selected_dates, default=None)
+        refresh_daily_short_volume_features(engine, output_start_date=analytics_start)
     summary = latest_finra_summary(engine)
     print(summary.to_string(index=False) if not summary.empty else "No local FINRA short-sale volume rows found.")
 

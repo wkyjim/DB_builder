@@ -20,7 +20,7 @@ Main technologies:
 - Neon PostgreSQL for selected deployed/API data.
 - Render FastAPI app in nested repo `neon-api/`.
 - GitHub Pages dashboard in separate local repo:
-  `C:\Users\User\OneDrive\Coding\market-dashboard`.
+  `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard`.
 - Conda environment: `PostgreSQL_db`.
 
 Important entry points:
@@ -136,7 +136,7 @@ Important details:
 
 - `rule_based_market_update.py --save --publish-dashboard --push-dashboard` now:
   - saves a timestamped report under `reports/`;
-  - copies it to `C:\Users\User\OneDrive\Coding\market-dashboard\data\latest-report.md`;
+  - copies it to `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard\data\latest-report.md`;
   - commits and pushes the dashboard repo if the report changed.
 - `auto_news_intelligence.bat` now calls the publish/push flags, so scheduled daily rule-based reports update the website.
 - Latest dashboard report was pushed to `wkyjim/market-dashboard` at commit `08a4488 Update latest market report`.
@@ -278,11 +278,11 @@ Recent ETF flow report output:
 
 Nested repo:
 
-- `C:\Users\User\OneDrive\Coding\DB_builder\neon-api`
+- `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\neon-api`
 
 Dashboard repo:
 
-- `C:\Users\User\OneDrive\Coding\market-dashboard`
+- `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard`
 
 Recent dashboard work:
 
@@ -368,7 +368,7 @@ Priority checklist:
      - generate/publish rule-based market report.
 
 7. Expand market dashboard frontend only after API deployment state is confirmed.
-   - Repo: `C:\Users\User\OneDrive\Coding\market-dashboard`.
+   - Repo: `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard`.
    - Existing frontend now supports OHLCV chart and grouped tape using current API.
 
 8. Backtest ETF flow forward setup features before treating them as probabilities.
@@ -393,7 +393,7 @@ Priority checklist:
 - Nested git repos are separate:
   - `DB_builder` root
   - `DB_builder/neon-api`
-  - `C:\Users\User\OneDrive\Coding\market-dashboard`
+  - `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard`
 - ETF flow analytics scores can be distorted by limited issuer coverage. The report now surfaces concentration/audit flags; do not hide those.
 - Current ETF flow forward setup labels are descriptive heuristic buckets, not calibrated probabilities.
 
@@ -422,7 +422,7 @@ Rejected or deferred approaches:
 Setup:
 
 ```powershell
-cd C:\Users\User\OneDrive\Coding\DB_builder
+cd C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder
 conda activate PostgreSQL_db
 ```
 
@@ -480,9 +480,10 @@ scripts\auto_macro_db.bat
 
 Environment variables:
 
-- `.env` is required locally and ignored by git.
-- Do not print or commit secrets.
-- `neon-api/.env` belongs to the nested API repo and is ignored.
+- Local private files live outside the repository under the sibling `DB_builder_env` directory.
+- DB_builder uses `DB_builder_env/.env`; nested services use mirrored subdirectories.
+- `DB_BUILDER_ENV_DIR` may override the external location when needed.
+- Do not read, print, archive, or commit secrets. See `docs/SECRET_STORAGE.md`.
 
 External dependencies:
 
@@ -497,7 +498,7 @@ External dependencies:
 Start with:
 
 ```powershell
-cd C:\Users\User\OneDrive\Coding\DB_builder
+cd C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder
 git status --short
 python -m pytest tests\test_rule_based_market_update_script.py tests\test_scoring_rules.py
 python -m pytest tests\test_etf_flow_analytics.py tests\test_etf_flows.py tests\test_positioning_flow_signals.py tests\test_scoring_rules.py
@@ -520,9 +521,9 @@ Then inspect:
 
 If the task is dashboard/API related, inspect:
 
-- `C:\Users\User\OneDrive\Coding\market-dashboard\app.js`
-- `C:\Users\User\OneDrive\Coding\market-dashboard\data\latest-report.md`
-- `C:\Users\User\OneDrive\Coding\DB_builder\neon-api\main.py`
+- `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard\app.js`
+- `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard\data\latest-report.md`
+- `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\neon-api\main.py`
 
 ## Reference Map
 
@@ -539,4 +540,4 @@ If the task is dashboard/API related, inspect:
 - `migrations/`: idempotent PostgreSQL schema migrations. Currently ignored by `*.sql`; use `git add -f` for committed migrations.
 - `docs/`: implementation documentation. Currently ignored by `*.md`; use `git add -f` for committed docs.
 - `src/db_builder/etf_flow/`: ETF flow analytics package.
-- `C:\Users\User\OneDrive\Coding\market-dashboard`: separate GitHub Pages repo.
+- `C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard`: separate GitHub Pages repo.

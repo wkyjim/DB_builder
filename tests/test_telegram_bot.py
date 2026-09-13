@@ -2,13 +2,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+import requests
+
 from db_builder.telegram_bot import (
+    TelegramConfig,
+    _raise_for_telegram_status,
     build_command_response,
     build_report_update_summary,
     build_sector_summary,
     extract_section,
     split_telegram_message,
 )
+
+
+def test_telegram_http_error_does_not_expose_token_url():
+    response = requests.Response()
+    response.status_code = 403
+    response.url = "https://api.telegram.org/botsecret-token/sendMessage"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _raise_for_telegram_status(response, "sendMessage")
+
+    assert "secret-token" not in str(exc_info.value)
+    assert str(exc_info.value) == "Telegram sendMessage failed with HTTP 403"
 
 
 SAMPLE_REPORT = """# Rule-Based Institutional Market Update
@@ -102,3 +119,26 @@ def test_split_telegram_message_chunks_long_text():
     chunks = split_telegram_message("a" * 8000, limit=3900)
     assert len(chunks) == 3
     assert all(len(chunk) <= 3900 for chunk in chunks)
+
+
+def test_telegram_config_loads_standalone_bot_env(monkeypatch):
+    import db_builder.telegram_bot as telegram_bot
+
+    loaded_paths = []
+    monkeypatch.delenv("TG_TOKEN", raising=False)
+    monkeypatch.delenv("TG_CHAT_ID", raising=False)
+
+    def fake_load_external_env(path, *, override):
+        loaded_paths.append(Path(path))
+        if Path(path).parent.name == "market-intelligence-telegram-bot":
+            monkeypatch.setenv("TG_TOKEN", "test-token")
+            monkeypatch.setenv("TG_CHAT_ID", "test-chat")
+
+    monkeypatch.setattr(telegram_bot, "load_external_env", fake_load_external_env)
+
+    config = TelegramConfig.from_env()
+
+    assert config.token == "test-token"
+    assert config.chat_id == "test-chat"
+    assert loaded_paths[-1].name == ".env"
+    assert loaded_paths[-1].parent.name == "market-intelligence-telegram-bot"

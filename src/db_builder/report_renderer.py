@@ -522,10 +522,7 @@ def _positioning_flow_lines(rows: list[dict]) -> list[str]:
     by_source: dict[str, list[dict]] = {}
     for row in rows:
         by_source.setdefault(row.get("source", "Other"), []).append(row)
-    lines = [
-        "Positioning and flow data is used as confirmation only. FINRA short-sale volume is not short interest.",
-        "",
-    ]
+    lines = ["Positioning and flow data is used as confirmation only.", ""]
     if by_source.get("CFTC COT"):
         lines.extend(["### Futures Positioning", ""])
         lines.extend(
@@ -546,32 +543,9 @@ def _positioning_flow_lines(rows: list[dict]) -> list[str]:
             )
         )
         lines.append("")
-    if by_source.get("FINRA short-sale volume"):
-        lines.extend(["### Short-Sale Pressure", ""])
-        lines.append("Curated to broad index ETFs, sector/theme ETFs, Mag 7, and high-beta chip names. FINRA short-sale volume is not short interest.")
-        lines.append("")
-        lines.extend(
-            table(
-                ["Date", "Ticker", "Group", "Ratio", "Z", "Price Move", "Market Implication"],
-                [
-                    [
-                        row.get("signal_date", "n/a"),
-                        row.get("asset_id", "n/a"),
-                        row.get("asset_group", "n/a"),
-                        fmt(row.get("signal_value"), 4),
-                        fmt(row.get("z_score")),
-                        fmt(row.get("pct_chg")),
-                        row.get("market_implication") or row.get("interpretation", ""),
-                    ]
-                    for row in by_source["FINRA short-sale volume"][:15]
-                ],
-            )
-        )
-        lines.append("")
     missing_sections = [
         "Official ETF / fund flows: current report uses shares-outstanding-derived net fund flow estimates from free ETF metadata.",
         "Institutional Ownership: not available until SEC 13F ingestion is implemented.",
-        "Crowding / Squeeze Risks: initial coverage uses CFTC crowded positioning and FINRA elevated short-sale volume only.",
         "Grouped exposure flow reliability: use issuer coverage and availability status before treating ETF flow as confirmation.",
     ]
     lines.extend(["### Deferred Flow Sections", ""])

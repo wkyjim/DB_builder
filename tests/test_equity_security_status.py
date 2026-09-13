@@ -13,6 +13,9 @@ def test_classifies_non_core_exchange_instruments():
     assert classify_security_type("AACOW", "Abony Acquisition Corp Wt") == "warrant"
     assert classify_security_type("AACPR", "Apogee Acquisition Corp Rt") == "right"
     assert classify_security_type("AESPU", "Aeon Acquisition I Corp Unit Cons") == "unit"
+    assert classify_security_type("ETHA", "iShares Ethereum Trust ETF") == "etf"
+    assert classify_security_type("BTCW", "WisdomTree Bitcoin Fund") == "fund"
+    assert classify_security_type("AAPL", "Apple Inc") == "common_stock"
     assert not is_core_coverage_security("AACOW", "Abony Acquisition Corp Wt", 0.25)
     assert is_core_coverage_security("AAPL", "Apple Inc", 200)
 

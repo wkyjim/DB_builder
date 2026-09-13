@@ -8,38 +8,13 @@ back to hardcoded passwords.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from urllib.parse import quote_plus
 
 from sqlalchemy import create_engine
-
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional local convenience
-    load_dotenv = None
+from db_builder.env_loader import load_external_env
 
 
-if load_dotenv is not None:
-    load_dotenv()
-
-
-def _load_project_env_fallback() -> None:
-    env_path = Path(__file__).resolve().parents[2] / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
-
-
-_load_project_env_fallback()
+load_external_env()
 
 
 LOCAL_DB_NAME = "us_equities_historical"

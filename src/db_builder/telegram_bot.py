@@ -17,15 +17,28 @@ from typing import Callable, Iterable
 import requests
 
 from db_builder.config import local_engine
+from db_builder.env_loader import load_external_env
 from db_builder.rule_based_market_data import fetch_macro_snapshot, fetch_market_technicals
-
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional dependency in local env
-    load_dotenv = None
 
 
 MAX_TELEGRAM_MESSAGE_LENGTH = 3900
+
+
+def _raise_for_telegram_status(response: requests.Response, operation: str) -> None:
+    """Raise without exposing the credential-bearing Telegram request URL."""
+    if response.ok:
+        return
+    raise RuntimeError(f"Telegram {operation} failed with HTTP {response.status_code}")
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def load_telegram_environment() -> None:
+    """Load private Telegram settings from the external env directory."""
+    load_external_env(".env", override=False)
+    load_external_env(Path("market-intelligence-telegram-bot") / ".env", override=False)
 
 @dataclass(frozen=True)
 class TelegramConfig:
@@ -36,8 +49,7 @@ class TelegramConfig:
 
     @classmethod
     def from_env(cls) -> "TelegramConfig":
-        if load_dotenv is not None:
-            load_dotenv()
+        load_telegram_environment()
         token = os.getenv("TG_token") or os.getenv("TG_TOKEN")
         chat_id = os.getenv("TG_chat_id") or os.getenv("TG_CHAT_ID")
         username = os.getenv("TG_username") or os.getenv("TG_USERNAME")
@@ -54,10 +66,6 @@ class TelegramConfig:
     @property
     def get_updates_url(self) -> str:
         return f"{self.api_base}/bot{self.token}/getUpdates"
-
-
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
 
 DEFAULT_DASHBOARD_REPORT = project_root() / "market-dashboard" / "data" / "latest-report.md"
 
@@ -123,7 +131,7 @@ def send_telegram_message(
             },
             timeout=timeout,
         )
-        response.raise_for_status()
+        _raise_for_telegram_status(response, "sendMessage")
         sent.append(chunk)
     return sent
 
@@ -379,7 +387,7 @@ def get_updates(config: TelegramConfig, *, offset: int | None = None, timeout: i
     if offset is not None:
         params["offset"] = offset
     response = requests.get(config.get_updates_url, params=params, timeout=timeout + 10)
-    response.raise_for_status()
+    _raise_for_telegram_status(response, "getUpdates")
     payload = response.json()
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram getUpdates failed: {payload}")

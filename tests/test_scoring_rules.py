@@ -355,5 +355,29 @@ def test_rule_based_report_renders_positioning_flow_rows():
     assert "**Sector / Thematic ETF Flows**" not in markdown
     assert "QQQ - Growth / Nasdaq" not in markdown
     assert "XLK - Technology" not in markdown
-    assert "### Short-Sale Pressure" in markdown
-    assert "FINRA short-sale volume is not short interest" in markdown
+    assert "### Short-Sale Pressure" not in markdown
+    assert "FINRA short-sale volume is not short interest" not in markdown
+
+
+def test_rule_based_report_excludes_short_positioning():
+    data = sample_data()
+    data["short_analytics"] = [
+        {
+            "analytics_date": "2026-08-11",
+            "ticker": "AAA",
+            "short_regime": "STRUCTURAL_FUNDING_SHORT",
+            "regime_confidence": 82,
+            "funding_short_score": 80,
+            "short_position_score": 78,
+            "short_activity_score": 55,
+            "unwind_risk_score": 20,
+            "days_to_cover": 2,
+            "rel_return_3m": -0.1,
+        }
+    ]
+
+    markdown = render_rule_based_market_update(data)
+
+    assert "## Short Positioning Analytics" not in markdown
+    assert "Structural Funding Short" not in markdown
+    assert "not proof of hedge-fund identity" not in markdown

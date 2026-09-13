@@ -45,6 +45,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def sync_dashboard_repo(dashboard_repo: Path) -> None:
+    """Fast-forward the dashboard branch before creating an automated report commit."""
+    subprocess.run(
+        ["git", "-C", str(dashboard_repo), "fetch", "origin", "main"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(dashboard_repo), "merge", "--ff-only", "origin/main"],
+        check=True,
+    )
+
+
 def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool = False, dry_run: bool = False) -> Path:
     if not dashboard_repo.exists():
         raise FileNotFoundError(f"Dashboard repository not found: {dashboard_repo}")
@@ -57,6 +69,9 @@ def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool 
         if push:
             print("[DRY RUN] Would commit and push data/latest-report.md to market-dashboard.")
         return target
+
+    if push:
+        sync_dashboard_repo(dashboard_repo)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(report_path, target)

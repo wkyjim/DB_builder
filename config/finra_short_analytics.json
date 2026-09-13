@@ -1,0 +1,46 @@
+{
+  "history": {
+    "daily_normalization_observations": 252,
+    "daily_baseline_observations": 60,
+    "minimum_daily_history": 40,
+    "short_interest_observations_per_year": 24
+  },
+  "short_interest_direction_thresholds": {
+    "increase": 0.03,
+    "decrease": -0.03
+  },
+  "activity": {
+    "high_percentile": 0.8,
+    "extreme_percentile": 0.9,
+    "minimum_total_volume": 1,
+    "score_weights": {
+      "svr_5d_percentile": 0.15,
+      "svr_20d_percentile": 0.20,
+      "svr_60d_percentile": 0.10,
+      "persistence_above_75p_20d": 0.10,
+      "casv_20d_percentile": 0.30,
+      "svr_acceleration_percentile": 0.15
+    }
+  },
+  "persistence": {
+    "industry_percentile_threshold": 0.7
+  },
+  "scores": {
+    "funding_short": {
+      "short_interest_persistence": 0.20,
+      "industry_relative_weakness": 0.20,
+      "short_interest_trend": 0.15,
+      "short_interest_stability": 0.10,
+      "institutional_liquidity": 0.10,
+      "capture_asymmetry": 0.10,
+      "pressure_effectiveness": 0.05,
+      "daily_short_activity": 0.05,
+      "technical_compatibility": 0.05
+    }
+  },
+  "quality": {
+    "minimum_daily_file_rows": 1000,
+    "maximum_short_volume_ratio": 1.05,
+    "split_change_threshold": 1.0
+  }
+}

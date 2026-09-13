@@ -1,11 +1,12 @@
 @echo off
 call "C:\Users\User\anaconda3\Scripts\activate.bat"
 call conda activate PostgreSQL_db
-cd /d "C:\Users\User\OneDrive\Coding\DB_builder"
+for %%I in ("%~dp0..") do set "DB_BUILDER_ROOT=%%~fI"
+cd /d "%DB_BUILDER_ROOT%"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
-  "$Root = 'C:\Users\User\OneDrive\Coding\DB_builder';" ^
+  "$Root = $env:DB_BUILDER_ROOT;" ^
   "$Python = 'C:\Users\User\anaconda3\envs\PostgreSQL_db\python.exe';" ^
   "$LogDir = Join-Path $Root 'logs';" ^
   "New-Item -ItemType Directory -Force -Path $LogDir | Out-Null;" ^
