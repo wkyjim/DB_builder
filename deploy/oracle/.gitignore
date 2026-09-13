@@ -1,0 +1,4 @@
+oracle.env
+*.local.env
+*.key
+*.pem

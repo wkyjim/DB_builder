@@ -1,0 +1,92 @@
+name: market-intelligence
+
+services:
+  neon-api:
+    build:
+      context: ${NEON_API_CONTEXT:?Set NEON_API_CONTEXT in oracle.env}
+    env_file:
+      - ${NEON_API_ENV_FILE:?Set NEON_API_ENV_FILE in oracle.env}
+    expose:
+      - "8000"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  telegram-bot:
+    build:
+      context: ${TELEGRAM_BOT_CONTEXT:?Set TELEGRAM_BOT_CONTEXT in oracle.env}
+    env_file:
+      - ${TELEGRAM_BOT_ENV_FILE:?Set TELEGRAM_BOT_ENV_FILE in oracle.env}
+    expose:
+      - "8000"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - telegram-state:/var/lib/market-intelligence-bot
+    depends_on:
+      neon-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      API_HOST: ${API_HOST:?Set API_HOST in oracle.env}
+      BOT_HOST: ${BOT_HOST:?Set BOT_HOST in oracle.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      neon-api:
+        condition: service_healthy
+      telegram-bot:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  caddy-data:
+  caddy-config:
+  telegram-state:

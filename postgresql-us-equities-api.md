@@ -53,7 +53,7 @@ whenever possible.
 # API BASE URL
 
 ```text
-https://postgresql-us-equities-api.onrender.com
+https://api.138.2.69.165.sslip.io
 ```
 
 ---

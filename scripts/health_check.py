@@ -13,9 +13,6 @@ from db_builder.trading_calendar import fetch_max_equity_date
 from db_builder.trading_calendar import latest_completed_nyse_session_date
 
 
-DEFAULT_API_HEALTH_URL = "https://postgresql-us-equities-api.onrender.com/"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check equity-pipeline dependencies.")
     parser.add_argument(
@@ -26,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require-api",
         action="store_true",
-        help="Fail when the public Render API is unavailable.",
+        help="Fail when the configured public market API is unavailable.",
     )
     return parser.parse_args()
 
@@ -63,7 +60,10 @@ def check_latest_nyse_session() -> bool:
 
 
 def check_api_health() -> bool:
-    url = os.getenv("API_HEALTH_URL", DEFAULT_API_HEALTH_URL)
+    url = (os.getenv("API_HEALTH_URL") or os.getenv("MARKET_API_BASE_URL") or "").rstrip("/")
+    if not url:
+        print("[FAIL] API health endpoint: MARKET_API_BASE_URL is not configured")
+        return False
 
     try:
         response = requests.get(url, timeout=20)
