@@ -100,8 +100,14 @@ def _etf_flow_score(etf_flow: dict | None) -> tuple[float, list[str]]:
     if not etf_flow:
         return 50.0, ["grouped ETF flow unavailable; neutral"]
     regime = etf_flow.get("flow_regime") or {}
-    score = flt(regime.get("flow_regime_score") or regime.get("score"), 50.0)
-    reliability = flt(regime.get("flow_regime_confidence") or regime.get("confidence"), 0.0)
+    score_value = regime.get("flow_regime_score")
+    if score_value is None:
+        score_value = regime.get("score")
+    reliability_value = regime.get("flow_regime_confidence")
+    if reliability_value is None:
+        reliability_value = regime.get("confidence")
+    score = flt(score_value, 50.0)
+    reliability = flt(reliability_value, 0.0)
     adjusted = clamp(50.0 + (score - 50.0) * reliability / 100.0)
     return adjusted, [f"grouped ETF flow score={round(score, 2)} reliability={round(reliability, 2)}"]
 
@@ -154,7 +160,7 @@ def compute_confidence(regime: dict, market_strength: dict, technical_rows: list
     expected_macro = {
         "^GSPC", "^IXIC", "^RUT", "^VIX", "^SKEW", "^MOVE",
         "US2YT=X", "US5YT=X", "US10YT=X", "US30YT=X",
-        "GC=F", "CL=F", "HG=F", "HYG", "LQD", "RSP",
+        "DXY", "GC=F", "CL=F", "HG=F", "HYG", "LQD", "RSP",
     }
     present_macro = {row.get("symbol") for row in macro_rows}
     if "DX-Y.NYB" in present_macro:
