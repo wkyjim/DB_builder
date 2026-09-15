@@ -48,7 +48,9 @@ def score_return_momentum(row: dict) -> float:
 
 
 def score_rsi(row: dict) -> float:
-    rsi = flt(row.get("rsi_14"), 50.0)
+    rsi = flt(row.get("rsi_14"), None)
+    if rsi is None or not math.isfinite(rsi):
+        return 50.0
     if 50 <= rsi <= 65:
         return 75.0
     if 65 < rsi <= 75:
@@ -108,8 +110,9 @@ def market_breadth(rows: list[dict]) -> dict:
     valid_200 = [row for row in rows if flt(row.get("close"), None) is not None and flt(row.get("ma_200"), None)]
     above_50 = sum(flt(row.get("close")) >= flt(row.get("ma_50")) for row in valid_50) / len(valid_50) if valid_50 else None
     above_200 = sum(flt(row.get("close")) >= flt(row.get("ma_200")) for row in valid_200) / len(valid_200) if valid_200 else None
-    positive_20d_rows = [row for row in rows if row.get("return_20d") is not None]
-    positive_20d = sum(flt(row.get("return_20d")) > 0 for row in positive_20d_rows) / len(positive_20d_rows) if positive_20d_rows else None
+    return_20d_values = [flt(row.get("return_20d"), None) for row in rows]
+    return_20d_values = [value for value in return_20d_values if value is not None and not math.isnan(value)]
+    positive_20d = sum(value > 0 for value in return_20d_values) / len(return_20d_values) if return_20d_values else None
     components = [value * 100 for value in [above_50, above_200, positive_20d] if value is not None]
     score = round(avg(components), 4)
     return {
