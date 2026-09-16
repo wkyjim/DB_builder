@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from db_builder.market_strength import avg, clamp, flt, score_above_ma, score_macd, score_rsi, score_volume, trend_label
 from db_builder.rule_based_config import SECTOR_ETF_MAP, scoring_weights
 
@@ -63,10 +65,14 @@ def score_sector(name: str, rows: list[dict], news_signals: list[dict], flow_by_
     trend = avg([score_above_ma(row) for row in sector_rows])
     momentum = avg([clamp(50 + flt(row.get("return_20d")) * 0.5 + flt(row.get("return_60d")) * 0.3) for row in sector_rows])
     relative_strength = avg([clamp(50 + (flt(row.get("return_20d")) - spy_20) * 0.6 + (flt(row.get("return_60d")) - spy_60) * 0.4) for row in sector_rows])
-    breadth = avg([
-        100.0 if flt(row.get("close"), None) is not None and flt(row.get("ma_50"), None) and flt(row.get("close")) >= flt(row.get("ma_50")) else 0.0
-        for row in sector_rows
-    ])
+    breadth_values = []
+    for row in sector_rows:
+        close = flt(row.get("close"), None)
+        ma_50 = flt(row.get("ma_50"), None)
+        if close is None or ma_50 is None or not math.isfinite(close) or not math.isfinite(ma_50):
+            continue
+        breadth_values.append(100.0 if close >= ma_50 else 0.0)
+    breadth = avg(breadth_values)
     vol_adj = avg([clamp(50 + flt(row.get("return_20d")) / max(flt(row.get("volatility_20d"), 1), 1) * 10) for row in sector_rows])
     flow_score, flow_reliability = _flow_for(name, flow_by_exposure)
     components = {
