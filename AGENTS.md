@@ -118,3 +118,5 @@ Exercise extreme caution when modifying:
 - Do not remove files merely because they look deprecated
 - Do not make speculative refactors or "improvements"
 - Do not change `.gitignore` without understanding its current behavior
+- **Do not create, patch, edit, or delete any Hermes skill, SOUL, memory file, profile configuration, or agent instruction unless explicitly authorized**
+- **Self-improvement review is READ-ONLY: it may identify improvements and recommend changes, but may not apply them without explicit approval**
