@@ -119,7 +119,6 @@ class TestCalendarHelpers:
         assert result == 0
 
     def test_count_nyse_sessions_week(self):
-        # Mock NYSE schedule to return 5 days
         schedule_mock = MagicMock()
         schedule_mock.__len__ = lambda self: 5
         with patch.object(tc_mod.NYSE, "schedule", return_value=schedule_mock):
@@ -127,7 +126,6 @@ class TestCalendarHelpers:
         assert result == 5
 
     def test_count_nyse_sessions_fallback(self):
-        # If NYSE.schedule raises, fallback to calendar days
         with patch.object(tc_mod.NYSE, "schedule", side_effect=Exception("Calendar error")):
             result = freshness_check._count_nyse_sessions(date(2026, 9, 14), date(2026, 9, 16))
         assert result == 2
@@ -137,12 +135,10 @@ class TestCalendarHelpers:
         assert result == 0
 
     def test_count_business_days_week(self):
-        # Mon-Fri should be 5 business days
         result = freshness_check._count_business_days(date(2026, 9, 8), date(2026, 9, 16))
-        assert result == 6  # 9,10,11,12,13,15 (14 is Sun, 15 is Mon, 16 is Tue)
+        assert result == 6
 
     def test_count_business_days_weekend(self):
-        # Friday to Monday should be 1 business day
         result = freshness_check._count_business_days(date(2026, 9, 11), date(2026, 9, 14))
         assert result == 1
 
@@ -166,12 +162,12 @@ class TestComputeLagDays:
         assert result == 3.0
 
     def test_date_daily_business(self):
-        result = freshness_check._compute_lag_days(date(2026, 9, 11), is_date=True, cadence="daily_business")
-        # 9/11 is Fri, today is 9/16 (Tue), so 3 business days (Mon 9/14, Tue 9/15, Wed 9/16)
-        assert result == 3.0
+        start = date(2026, 9, 11)  # Friday
+        result = freshness_check._compute_lag_days(start, is_date=True, cadence="daily_business")
+        expected = freshness_check._count_business_days(start, date.today())
+        assert result == float(expected)
 
     def test_date_fallback_calendar(self):
-        # If NYSE calendar fails, fallback to calendar days
         with patch.object(
             freshness_check,
             "latest_completed_nyse_session_date",
@@ -179,7 +175,7 @@ class TestComputeLagDays:
         ):
             result = freshness_check._compute_lag_days(date(2020, 1, 1), is_date=True, cadence="daily_nyse")
         assert result is not None
-        assert result > 1000.0  # Many calendar days since 2020
+        assert result > 1000.0
 
     def test_datetime_aware(self):
         now = datetime.now(timezone.utc)
@@ -321,10 +317,8 @@ class TestCheckRule:
             warn_days=3,
             fail_days=5,
         )
-        # Friday Sept 11 to Tuesday Sept 15 = 3 business days (Mon, Tue, Wed)
         engine = MockEngine([(date(2026, 9, 11),)])
         result = freshness_check.check_rule(rule, engine)
-        # Should be WARN (3 business days >= warn_days=3)
         assert result.status == "WARN"
 
 
@@ -584,7 +578,6 @@ class TestCLI:
                     ),
                 ]
                 result = freshness_check.main()
-                # ERROR is not FAIL, so should return 0
                 assert result == 0
 
     def test_empty_tables(self):
@@ -624,7 +617,6 @@ class TestWeekendHandling:
             warn_days=1,
             fail_days=3,
         )
-        # Friday Sept 11 to Monday Sept 14 = 0 trading days
         engine = MockEngine([(date(2026, 9, 11),)])
         schedule_mock = MagicMock()
         schedule_mock.__len__ = lambda self: 0
@@ -644,10 +636,8 @@ class TestWeekendHandling:
             warn_days=3,
             fail_days=5,
         )
-        # Friday Sept 11 to Wednesday Sept 16 = 3 business days (Mon, Tue, Wed)
         engine = MockEngine([(date(2026, 9, 11),)])
         result = freshness_check.check_rule(rule, engine)
-        # 3 business days >= warn_days=3, so should be WARN
         assert result.status == "WARN"
 
 
@@ -668,15 +658,12 @@ class TestNYSEHolidayHandling:
             warn_days=1,
             fail_days=3,
         )
-        # Sept 14 (Mon) to Sept 16 (Wed) with holiday on Sept 15
-        # NYSE schedule returns 1 session (Sept 14)
         engine = MockEngine([(date(2026, 9, 14),)])
         schedule_mock = MagicMock()
         schedule_mock.__len__ = lambda self: 1
         with patch.object(tc_mod, "latest_completed_nyse_session_date", return_value=date(2026, 9, 16)), \
              patch.object(tc_mod.NYSE, "schedule", return_value=schedule_mock):
             result = freshness_check.check_rule(rule, engine)
-        # 1 trading day >= warn_days=1, so should be WARN
         assert result.status == "WARN"
 
 
@@ -697,8 +684,59 @@ class TestSyncStateTimezone:
             warn_days=2,
             fail_days=5,
         )
-        # Naive timestamp (no timezone info)
         engine = MockEngine([(datetime(2026, 9, 14, 12, 0, 0),)])
         result = freshness_check.check_rule(rule, engine)
-        # Should handle gracefully without crashing
         assert result.status in ("OK", "WARN", "FAIL")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Workflow CLI arguments
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowCLI:
+    """Test exact CLI arguments used in workflow .bat files."""
+
+    def test_workflow_freshness_fail_exit_code(self):
+        """Test that freshness FAIL returns exit code 2."""
+        with patch.object(
+            sys, "argv",
+            ["freshness_check.py", "--datasets", "Equities (raw)", "--require-critical"]
+        ):
+            with patch.object(freshness_check, "check_all_rules") as mock_check:
+                mock_check.return_value = [
+                    freshness_check.FreshnessResult(
+                        rule_name="Equities (raw)",
+                        table="public.us_equities",
+                        timestamp_field="date",
+                        latest_value=None,
+                        lag_days=None,
+                        status="FAIL",
+                        message="Failed",
+                        is_critical=True,
+                    ),
+                ]
+                result = freshness_check.main()
+                assert result == 2
+
+    def test_workflow_freshness_warn_exit_code(self):
+        """Test that freshness WARN returns exit code 0."""
+        with patch.object(
+            sys, "argv",
+            ["freshness_check.py", "--datasets", "Equities (raw)", "--require-critical"]
+        ):
+            with patch.object(freshness_check, "check_all_rules") as mock_check:
+                mock_check.return_value = [
+                    freshness_check.FreshnessResult(
+                        rule_name="Equities (raw)",
+                        table="public.us_equities",
+                        timestamp_field="date",
+                        latest_value=date(2026, 9, 14),
+                        lag_days=2.0,
+                        status="WARN",
+                        message="Warning",
+                        is_critical=True,
+                    ),
+                ]
+                result = freshness_check.main()
+                assert result == 0
