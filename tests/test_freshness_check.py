@@ -15,16 +15,6 @@ import pytest
 scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(scripts_dir))
 
-# Mock heavy dependencies
-for name in ["pandas", "sqlalchemy"]:
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-
-sys.modules["pandas"].DataFrame = MagicMock
-sys.modules["pandas"].notna = lambda x: x is not None
-sys.modules["sqlalchemy"].text = lambda x: x
-
-
 class MockResult:
     def __init__(self, rows):
         self._rows = rows
@@ -53,7 +43,28 @@ class MockEngine:
         pass
 
 
-# Create db_builder stubs
+def business_days_before(end: date, count: int) -> date:
+    current = end
+    remaining = count
+    while remaining:
+        current -= timedelta(days=1)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
+
+# Import the script with narrowly scoped db_builder stubs. Restoring sys.modules
+# immediately prevents these doubles from contaminating other test modules.
+_stubbed_module_names = (
+    "db_builder",
+    "db_builder.config",
+    "db_builder.trading_calendar",
+)
+_missing_module = object()
+_saved_modules = {
+    name: sys.modules.get(name, _missing_module) for name in _stubbed_module_names
+}
+
 if "db_builder" not in sys.modules:
     db_builder_mod = types.ModuleType("db_builder")
     db_builder_mod.__path__ = []
@@ -69,7 +80,14 @@ tc_mod.NYSE = MagicMock()
 tc_mod.latest_completed_nyse_session_date = lambda: date(2026, 9, 16)
 sys.modules["db_builder.trading_calendar"] = tc_mod
 
-import freshness_check
+try:
+    import freshness_check
+finally:
+    for _name, _original_module in _saved_modules.items():
+        if _original_module is _missing_module:
+            sys.modules.pop(_name, None)
+        else:
+            sys.modules[_name] = _original_module
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +182,9 @@ class TestComputeLagDays:
     def test_date_daily_business(self):
         start = date(2026, 9, 11)  # Friday
         result = freshness_check._compute_lag_days(start, is_date=True, cadence="daily_business")
-        expected = freshness_check._count_business_days(start, date.today())
+        expected = freshness_check._count_business_days(
+            start, datetime.now(timezone.utc).date()
+        )
         assert result == float(expected)
 
     def test_date_fallback_calendar(self):
@@ -317,7 +337,8 @@ class TestCheckRule:
             warn_days=3,
             fail_days=5,
         )
-        engine = MockEngine([(date(2026, 9, 11),)])
+        latest = business_days_before(datetime.now(timezone.utc).date(), 3)
+        engine = MockEngine([(latest,)])
         result = freshness_check.check_rule(rule, engine)
         assert result.status == "WARN"
 
@@ -636,7 +657,8 @@ class TestWeekendHandling:
             warn_days=3,
             fail_days=5,
         )
-        engine = MockEngine([(date(2026, 9, 11),)])
+        latest = business_days_before(datetime.now(timezone.utc).date(), 3)
+        engine = MockEngine([(latest,)])
         result = freshness_check.check_rule(rule, engine)
         assert result.status == "WARN"
 
