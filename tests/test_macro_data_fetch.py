@@ -2,9 +2,11 @@ from datetime import date, datetime
 from pathlib import Path
 import sys
 import types
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -275,12 +277,33 @@ def test_process_investiny_oil_live_row_uses_investing_source(monkeypatch):
         lambda df, _symbol: df,
     )
 
-    _rows, live_row = macro_data_fetch.process_investiny_symbol(
+    _rows, live_row, rows_fetched, latest_observation = macro_data_fetch.process_investiny_symbol(
         "BZ=F",
         {"name": "Brent Crude Oil Future", "asset_type": "futures"},
     )
 
     assert live_row["source"] == "investing.com"
+    assert rows_fetched == 2
+    assert latest_observation == date(2026, 7, 8)
+
+
+def test_process_investiny_failure_preserves_fetched_row_count(monkeypatch):
+    one_row = sample_bars().iloc[:1].copy()
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "fetch_investiny_symbol_df",
+        lambda *_args, **_kwargs: (one_row, date(2026, 7, 7)),
+    )
+
+    with pytest.raises(macro_data_fetch.SymbolProcessingError) as exc_info:
+        macro_data_fetch.process_investiny_symbol(
+            "US10YT=X",
+            {"name": "United States 10-Year Treasury Yield", "asset_type": "ust_yield"},
+        )
+
+    assert exc_info.value.rows_fetched == 1
+    assert exc_info.value.latest_observation is None
+    assert "insufficient provider observations" in str(exc_info.value)
 
 
 def test_upsert_new_macro_rows_checks_neon_independently(monkeypatch):
@@ -419,3 +442,361 @@ def test_macro_etf_flow_post_step_dry_run_does_not_refresh_signals(monkeypatch):
         ("plan", None, None),
         ("fetch", ["SPY"], True, date(2026, 7, 16), date(2026, 7, 17), False),
     ]
+
+
+def make_outcome(symbol, *, success=True, provider=None, reason=None):
+    asset = next(item for item in macro_data_fetch.ASSETS if item[0] == symbol)
+    return macro_data_fetch.SymbolFetchOutcome(
+        symbol=symbol,
+        name=asset[1],
+        provider=provider or macro_data_fetch.provider_for_symbol(symbol),
+        required=symbol in macro_data_fetch.REQUIRED_SYMBOLS,
+        success=success,
+        rows_fetched=2 if success else 0,
+        latest_observation=date(2026, 9, 17) if success else None,
+        failure_reason=reason,
+    )
+
+
+def configure_macro_run(monkeypatch, *, yf_failures=None, investiny_failures=None):
+    yf_failures = yf_failures or {}
+    investiny_failures = investiny_failures or {}
+    live_actions = []
+
+    monkeypatch.setattr(macro_data_fetch.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(macro_data_fetch, "create_macro_table", lambda *_args: None)
+    monkeypatch.setattr(macro_data_fetch, "create_macro_live_table", lambda *_args: None)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "download_recent_batch",
+        lambda *_args, **_kwargs: (pd.DataFrame({"placeholder": [1]}), date(2026, 9, 12)),
+    )
+
+    def fake_extract(_batch_df, symbol):
+        failure = yf_failures.get(symbol)
+        if failure == "empty":
+            return pd.DataFrame()
+        if failure == "malformed":
+            return pd.DataFrame({"Date": [pd.Timestamp("2026-09-17")]})
+        if isinstance(failure, Exception):
+            raise failure
+        return sample_bars()
+
+    def fake_process_investiny(symbol, _meta, **_kwargs):
+        failure = investiny_failures.get(symbol)
+        if failure:
+            raise failure
+        return (
+            [{"date": date(2026, 7, 8), "symbol": symbol}],
+            None,
+            2,
+            date(2026, 7, 8),
+        )
+
+    monkeypatch.setattr(macro_data_fetch, "extract_symbol_df_from_batch", fake_extract)
+    monkeypatch.setattr(macro_data_fetch, "extract_latest_unfinished_row", lambda **_kwargs: None)
+    monkeypatch.setattr(macro_data_fetch, "remove_unfinished_bars", lambda df, _symbol: df)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "calculate_rows_for_symbol",
+        lambda df, symbol, name, asset_type: [
+            {"date": date(2026, 7, 8), "symbol": symbol}
+        ],
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "filter_rows_to_target_window",
+        lambda rows, target_start_date: rows,
+    )
+    monkeypatch.setattr(macro_data_fetch, "process_investiny_symbol", fake_process_investiny)
+    monkeypatch.setattr(macro_data_fetch, "upsert_new_macro_rows", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "replace_macro_live",
+        lambda _engine, rows: live_actions.append(("replace", list(rows))),
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "merge_macro_live",
+        lambda _engine, rows, symbols: live_actions.append(
+            ("merge", list(rows), set(symbols))
+        ),
+    )
+    return live_actions
+
+
+def test_required_symbol_policy_is_explicit_and_valid():
+    configured = {symbol for symbol, _name, _asset_type in macro_data_fetch.ASSETS}
+
+    assert macro_data_fetch.REQUIRED_SYMBOLS <= configured
+    assert {"^GSPC", "CL=F", "BZ=F", "US2YT=X", "US10YT=X", "US30YT=X"} <= (
+        macro_data_fetch.REQUIRED_SYMBOLS
+    )
+    assert macro_data_fetch.MIN_COVERAGE_PCT == 90.0
+
+
+def test_coverage_summary_all_provider_success():
+    outcomes = [make_outcome(symbol) for symbol, _name, _asset_type in macro_data_fetch.ASSETS]
+
+    summary = macro_data_fetch.summarize_outcomes(outcomes)
+
+    assert summary.configured_count == len(macro_data_fetch.ASSETS)
+    assert summary.successful_count == len(macro_data_fetch.ASSETS)
+    assert summary.failed_count == 0
+    assert summary.coverage_pct == 100.0
+    assert summary.provider_failure_counts == (("investing.com", 0), ("yfinance", 0))
+    assert summary.exit_code == 0
+
+
+def test_run_with_yfinance_and_investing_success_logs_success(monkeypatch, capsys):
+    configure_macro_run(monkeypatch)
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["^GSPC", "US10YT=X"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    output = capsys.readouterr().out
+    assert summary.configured_count == 2
+    assert summary.successful_count == 2
+    assert summary.exit_code == 0
+    assert "[MACRO UPDATE SUCCESS]" in output
+    assert "[MACRO UPDATE PARTIAL FAILURE]" not in output
+
+
+def test_required_symbol_failure_is_not_accepted():
+    outcomes = [make_outcome("^GSPC", success=False, reason="empty provider response")]
+
+    summary = macro_data_fetch.summarize_outcomes(outcomes)
+
+    assert summary.required_failed_symbols == ("^GSPC",)
+    assert summary.coverage_satisfied is False
+    assert summary.exit_code == 1
+
+
+def test_supplementary_only_failure_within_threshold_is_accepted():
+    supplementary = [
+        symbol
+        for symbol, _name, _asset_type in macro_data_fetch.ASSETS
+        if symbol not in macro_data_fetch.REQUIRED_SYMBOLS
+    ][:10]
+    outcomes = [make_outcome(symbol, success=symbol != supplementary[-1]) for symbol in supplementary]
+
+    summary = macro_data_fetch.summarize_outcomes(outcomes)
+
+    assert summary.coverage_pct == 90.0
+    assert summary.required_failed_symbols == ()
+    assert summary.coverage_satisfied is True
+    assert summary.failed_count == 1
+    assert summary.exit_code == 0
+
+
+def test_accepted_supplementary_failure_logs_partial_failure(monkeypatch, capsys):
+    symbols = [
+        "^IXIC",
+        "^RUT",
+        "^SKEW",
+        "^MOVE",
+        "^KS200",
+        "000001.SS",
+        "^FTSE",
+        "^GDAXI",
+        "^FCHI",
+        "NQ=F",
+    ]
+    configure_macro_run(monkeypatch, yf_failures={"^SKEW": "empty"})
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=symbols,
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    output = capsys.readouterr().out
+    assert summary.coverage_pct == 90.0
+    assert summary.exit_code == 0
+    assert "[MACRO UPDATE PARTIAL FAILURE]" in output
+    assert "[MACRO UPDATE SUCCESS]" not in output
+
+
+def test_partial_supplementary_failure_below_coverage_is_rejected():
+    supplementary = [
+        symbol
+        for symbol, _name, _asset_type in macro_data_fetch.ASSETS
+        if symbol not in macro_data_fetch.REQUIRED_SYMBOLS
+    ][:10]
+    outcomes = [make_outcome(symbol, success=index < 8) for index, symbol in enumerate(supplementary)]
+
+    summary = macro_data_fetch.summarize_outcomes(outcomes)
+
+    assert summary.coverage_pct == 80.0
+    assert summary.required_failed_symbols == ()
+    assert summary.coverage_satisfied is False
+    assert summary.exit_code == 1
+
+
+def test_all_investing_failures_return_nonzero_and_do_not_replace_live(monkeypatch, capsys):
+    failures = {
+        symbol: ConnectionError("Request failed with error code: 403")
+        for symbol in macro_data_fetch.INVESTINY_ASSETS
+    }
+    live_actions = configure_macro_run(monkeypatch, investiny_failures=failures)
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=list(macro_data_fetch.INVESTINY_ASSETS),
+        upsert_neon=False,
+        update_etf_flows=False,
+    )
+
+    output = capsys.readouterr().out
+    assert summary.failed_count == 12
+    assert summary.provider_failure_counts == (("investing.com", 12),)
+    assert summary.exit_code == 1
+    assert "[MACRO UPDATE FAILURE]" in output
+    assert "SUCCESS" not in output
+    assert all(action[0] == "merge" for action in live_actions)
+    assert all(action[2] == set() for action in live_actions)
+
+
+def test_partial_investing_failure_below_required_coverage_returns_nonzero(monkeypatch):
+    successful = {"CL=F", "BZ=F"}
+    failures = {
+        symbol: ConnectionError("403")
+        for symbol in macro_data_fetch.INVESTINY_ASSETS
+        if symbol not in successful
+    }
+    configure_macro_run(monkeypatch, investiny_failures=failures)
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=list(macro_data_fetch.INVESTINY_ASSETS),
+        upsert_neon=False,
+        update_etf_flows=False,
+        update_live=False,
+    )
+
+    assert summary.successful_count == 2
+    assert summary.failed_count == 10
+    assert summary.coverage_pct < macro_data_fetch.MIN_COVERAGE_PCT
+    assert summary.exit_code == 1
+
+
+def test_yfinance_batch_exception_is_recorded_and_returns_nonzero(monkeypatch):
+    configure_macro_run(monkeypatch)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "download_recent_batch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("provider unavailable")),
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["^GSPC", "^SKEW"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    assert summary.failed_count == 2
+    assert all(item.failure_reason == "ConnectionError: provider unavailable" for item in summary.outcomes)
+    assert summary.exit_code == 1
+
+
+def test_investing_database_write_error_remains_fatal(monkeypatch):
+    configure_macro_run(monkeypatch)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "upsert_new_macro_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        macro_data_fetch.run_daily_update(
+            symbol_filter=["US10YT=X"],
+            upsert_neon=False,
+            update_etf_flows=False,
+            update_live=False,
+        )
+
+
+def test_empty_and_malformed_provider_responses_are_failures(monkeypatch):
+    configure_macro_run(
+        monkeypatch,
+        yf_failures={"^GSPC": "empty", "^SKEW": "malformed"},
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["^GSPC", "^SKEW"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcomes = {item.symbol: item for item in summary.outcomes}
+    assert outcomes["^GSPC"].failure_reason == "ValueError: empty provider response"
+    assert outcomes["^SKEW"].failure_reason == (
+        "ValueError: malformed provider response: Date/Close columns required"
+    )
+    assert summary.exit_code == 1
+
+
+def test_partial_live_merge_retains_failed_symbol_and_original_timestamp():
+    executions = []
+
+    class FakeConnection:
+        def execute(self, statement, parameters=None):
+            executions.append((str(statement), parameters))
+
+    class FakeTransaction:
+        def __enter__(self):
+            return FakeConnection()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class FakeEngine:
+        def begin(self):
+            return FakeTransaction()
+
+    fresh_row = {
+        "symbol": "^GSPC",
+        "observed_at": datetime(2026, 9, 18, tzinfo=ZoneInfo("UTC")),
+    }
+    macro_data_fetch.merge_macro_live(FakeEngine(), [fresh_row], {"^GSPC"})
+
+    assert "WHERE symbol = ANY" in executions[1][0]
+    assert executions[1][1] == {"symbols": ["^GSPC"]}
+    delete_statements = [statement for statement, _parameters in executions if "DELETE FROM" in statement]
+    assert len(delete_statements) == 1
+    assert "WHERE symbol = ANY" in delete_statements[0]
+    assert executions[2][1][0]["observed_at"] == fresh_row["observed_at"]
+    assert all("US10YT=X" not in str(parameters) for _statement, parameters in executions)
+
+
+def test_coverage_summary_logging_is_deterministic(capsys):
+    outcomes = [
+        make_outcome("^SKEW", success=False, reason="empty provider response"),
+        make_outcome("^GSPC"),
+    ]
+    summary = macro_data_fetch.summarize_outcomes(outcomes)
+
+    macro_data_fetch.log_coverage_summary(summary)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "symbol=^GSPC" in lines[0]
+    assert "symbol=^SKEW" in lines[1]
+    assert "configured=2 successful=1 failed=1 coverage=50.00%" in lines[2]
+    assert lines[3] == "[MACRO FAILED SYMBOLS] ^SKEW(CBOE SKEW Index)"
+    assert lines[-1] == "[MACRO PROVIDER FAILURES] provider=yfinance failed=1"
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_cli_main_propagates_coverage_exit_code(monkeypatch, exit_code):
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "run_daily_update",
+        lambda **_kwargs: SimpleNamespace(exit_code=exit_code),
+    )
+
+    assert macro_data_fetch.main(["--skip-etf-flows", "--skip-live-replace"]) == exit_code

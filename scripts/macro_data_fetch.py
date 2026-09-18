@@ -3,8 +3,10 @@ import random
 import pandas as pd
 import yfinance as yf
 import argparse
+import sys
 
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
@@ -28,6 +30,37 @@ LOOKBACK_DAYS = 5
 # Extra days to fetch before the target window so the first target day
 # can calculate prev_close/change/pct_chg/amplitude correctly.
 CALC_BUFFER_DAYS = 5
+
+# A refresh is operationally acceptable only when every core market series is
+# available and at least 90% of the requested registry returns a usable daily
+# observation. All other configured symbols are supplementary: isolated
+# failures may be accepted, but are reported as PARTIAL FAILURE rather than
+# SUCCESS. Provider fallback is intentionally outside this policy.
+MIN_COVERAGE_PCT = 90.0
+REQUIRED_SYMBOLS = frozenset(
+    {
+        "^GSPC",
+        "^NDX",
+        "^DJI",
+        "^VIX",
+        "^HSI",
+        "^N225",
+        "^KS11",
+        "GC=F",
+        "CL=F",
+        "BZ=F",
+        "^FVX",
+        "^TNX",
+        "^TYX",
+        "US2YT=X",
+        "US10YT=X",
+        "US30YT=X",
+        "DX-Y.NYB",
+        "EURUSD=X",
+        "JPY=X",
+        "CNY=X",
+    }
+)
 
 local_engine = make_local_engine()
 neon_engine = make_neon_engine()
@@ -105,6 +138,41 @@ ASSETS = [
     ("IEF", "iShares 7-10 Year Treasury Bond ETF", "duration_rates"),
     ("SHY", "iShares 1-3 Year Treasury Bond ETF", "duration_rates"),
 ]
+
+
+@dataclass(frozen=True)
+class SymbolFetchOutcome:
+    symbol: str
+    name: str
+    provider: str
+    required: bool
+    success: bool
+    rows_fetched: int
+    latest_observation: date | None
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MacroCoverageSummary:
+    outcomes: tuple[SymbolFetchOutcome, ...]
+    configured_count: int
+    successful_count: int
+    failed_count: int
+    coverage_pct: float
+    required_failed_symbols: tuple[str, ...]
+    provider_failure_counts: tuple[tuple[str, int], ...]
+    coverage_satisfied: bool
+
+    @property
+    def exit_code(self):
+        return 0 if self.coverage_satisfied else 1
+
+
+class SymbolProcessingError(RuntimeError):
+    def __init__(self, message, *, rows_fetched=0, latest_observation=None):
+        super().__init__(message)
+        self.rows_fetched = rows_fetched
+        self.latest_observation = latest_observation
 
 INVESTINY_ASSETS = {
     "US2YT=X": 23701,
@@ -264,8 +332,7 @@ def create_macro_live_table(engine):
         conn.execute(sql)
 
 
-def replace_macro_live(engine, rows):
-    """Atomically replace the transient intraday snapshot."""
+def _prepare_macro_live_rows(rows):
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.where(pd.notna(df), None)
@@ -282,8 +349,11 @@ def replace_macro_live(engine, rows):
                 f"rows={duplicate_count:,} symbols={duplicate_symbols}"
             )
             df = df.drop_duplicates(subset=["symbol"], keep="last")
+    return df
 
-    insert_sql = text("""
+
+def _macro_live_upsert_sql():
+    return text("""
         INSERT INTO public.macro_live (
             symbol, market_date, observed_at, name, asset_type,
             open, high, low, close, adj_close, volume,
@@ -315,13 +385,37 @@ def replace_macro_live(engine, rows):
             source = EXCLUDED.source;
     """)
 
+
+def replace_macro_live(engine, rows):
+    """Atomically replace a complete transient intraday snapshot."""
+    df = _prepare_macro_live_rows(rows)
+
     with engine.begin() as conn:
         # Serialize overlapping hourly/manual refreshes within each database.
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('macro_live_replace'))"))
         # This table intentionally contains only the latest fetch snapshot.
         conn.execute(text("DELETE FROM public.macro_live"))
         if not df.empty:
-            conn.execute(insert_sql, df.to_dict(orient="records"))
+            conn.execute(_macro_live_upsert_sql(), df.to_dict(orient="records"))
+
+
+def merge_macro_live(engine, rows, successful_symbols):
+    """Refresh successful symbols while retaining failed symbols unchanged."""
+    symbols = sorted(set(successful_symbols))
+    if not symbols:
+        return
+
+    df = _prepare_macro_live_rows(rows)
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('macro_live_replace'))"))
+        # Only successful symbols are cleared. Failed symbols keep their prior
+        # observed_at, making retained stale observations distinguishable.
+        conn.execute(
+            text("DELETE FROM public.macro_live WHERE symbol = ANY(:symbols)"),
+            {"symbols": symbols},
+        )
+        if not df.empty:
+            conn.execute(_macro_live_upsert_sql(), df.to_dict(orient="records"))
 
 
 def fetch_existing_symbol_dates(engine, symbols, min_date, max_date):
@@ -698,42 +792,49 @@ def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_ret
 
 def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None):
     symbol_df, target_start_date = fetch_investiny_symbol_df(symbol, start_date=start_date)
-    if symbol_df.empty:
-        print(f"[INVESTINY NO DATA] {symbol}")
-        return [], None
+    rows_fetched = len(symbol_df)
+    latest_observation = None
+    try:
+        rows_fetched, latest_observation = observation_metadata(symbol_df)
 
-    print(
-        f"[INVESTINY DATES RAW] {symbol} | "
-        f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
-    )
+        print(
+            f"[INVESTINY DATES RAW] {symbol} | "
+            f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
+        )
 
-    live_row = extract_latest_unfinished_row(
-        df=symbol_df,
-        symbol=symbol,
-        name=meta["name"],
-        asset_type=meta["asset_type"],
-        observed_at=observed_at,
-    )
-    if live_row:
-        live_row["source"] = "investing.com"
+        live_row = extract_latest_unfinished_row(
+            df=symbol_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+            observed_at=observed_at,
+        )
+        if live_row:
+            live_row["source"] = "investing.com"
 
-    symbol_df = remove_unfinished_bars(symbol_df, symbol)
-    if symbol_df.empty:
-        print(f"[INVESTINY NO FINISHED BARS] {symbol}")
-        return [], live_row
+        symbol_df = remove_unfinished_bars(symbol_df, symbol)
+        if symbol_df.empty:
+            print(f"[INVESTINY NO FINISHED BARS] {symbol}")
+            return [], live_row, rows_fetched, latest_observation
 
-    rows = calculate_rows_for_symbol(
-        df=symbol_df,
-        symbol=symbol,
-        name=meta["name"],
-        asset_type=meta["asset_type"],
-    )
-    rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start_date)
-    if rows:
-        print(f"[INVESTINY ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
-    else:
-        print(f"[INVESTINY NO VALID ROWS IN TARGET WINDOW] {symbol}")
-    return rows, live_row
+        rows = calculate_rows_for_symbol(
+            df=symbol_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+        )
+        rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start_date)
+        if rows:
+            print(f"[INVESTINY ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
+        else:
+            print(f"[INVESTINY NO VALID ROWS IN TARGET WINDOW] {symbol}")
+        return rows, live_row, rows_fetched, latest_observation
+    except Exception as exc:
+        raise SymbolProcessingError(
+            f"{type(exc).__name__}: {exc}",
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+        ) from exc
 
 
 # ============================================================
@@ -816,6 +917,94 @@ def extract_symbol_df_from_batch(batch_df, symbol):
     df = df.dropna(subset=[close_col], how="all")
 
     return df
+
+
+def provider_for_symbol(symbol):
+    return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
+
+
+def observation_metadata(symbol_df):
+    """Return usable row count and latest daily observation date."""
+    if symbol_df is None or symbol_df.empty:
+        raise ValueError("empty provider response")
+    if "Date" not in symbol_df.columns or "Close" not in symbol_df.columns:
+        raise ValueError("malformed provider response: Date/Close columns required")
+
+    dates = pd.to_datetime(symbol_df["Date"], errors="coerce")
+    valid_rows = symbol_df.loc[dates.notna() & symbol_df["Close"].notna()]
+    if valid_rows.empty:
+        raise ValueError("malformed provider response: no valid Date/Close observations")
+    if len(valid_rows) < 2:
+        raise ValueError("insufficient provider observations: at least 2 required")
+    return len(valid_rows), pd.to_datetime(valid_rows["Date"]).max().date()
+
+
+def summarize_outcomes(outcomes, minimum_coverage_pct=MIN_COVERAGE_PCT):
+    ordered = tuple(sorted(outcomes, key=lambda item: item.symbol))
+    configured_count = len(ordered)
+    successful_count = sum(item.success for item in ordered)
+    failed = tuple(item for item in ordered if not item.success)
+    raw_coverage_pct = (
+        (successful_count / configured_count) * 100.0 if configured_count else 0.0
+    )
+    coverage_pct = round(raw_coverage_pct, 2)
+    required_failed = tuple(item.symbol for item in failed if item.required)
+    providers = sorted({item.provider for item in ordered})
+    provider_failure_counts = tuple(
+        (provider, sum(not item.success for item in ordered if item.provider == provider))
+        for provider in providers
+    )
+    coverage_satisfied = (
+        configured_count > 0
+        and not required_failed
+        and raw_coverage_pct >= minimum_coverage_pct
+    )
+    return MacroCoverageSummary(
+        outcomes=ordered,
+        configured_count=configured_count,
+        successful_count=successful_count,
+        failed_count=len(failed),
+        coverage_pct=coverage_pct,
+        required_failed_symbols=required_failed,
+        provider_failure_counts=provider_failure_counts,
+        coverage_satisfied=coverage_satisfied,
+    )
+
+
+def log_coverage_summary(summary):
+    for outcome in summary.outcomes:
+        status = "OK" if outcome.success else "FAILED"
+        latest = outcome.latest_observation.isoformat() if outcome.latest_observation else "none"
+        reason = outcome.failure_reason or "none"
+        print(
+            f"[MACRO SYMBOL {status}] symbol={outcome.symbol} name={outcome.name} "
+            f"provider={outcome.provider} "
+            f"required={'yes' if outcome.required else 'no'} rows_fetched={outcome.rows_fetched} "
+            f"latest_observation={latest} reason={reason}"
+        )
+
+    failed_symbols = [
+        f"{item.symbol}({item.name})" for item in summary.outcomes if not item.success
+    ]
+    print(
+        f"[MACRO COVERAGE] configured={summary.configured_count} "
+        f"successful={summary.successful_count} failed={summary.failed_count} "
+        f"coverage={summary.coverage_pct:.2f}% threshold={MIN_COVERAGE_PCT:.2f}%"
+    )
+    print(
+        "[MACRO FAILED SYMBOLS] "
+        + (",".join(failed_symbols) if failed_symbols else "none")
+    )
+    print(
+        "[MACRO REQUIRED FAILURES] "
+        + (
+            ",".join(summary.required_failed_symbols)
+            if summary.required_failed_symbols
+            else "none"
+        )
+    )
+    for provider, failure_count in summary.provider_failure_counts:
+        print(f"[MACRO PROVIDER FAILURES] provider={provider} failed={failure_count}")
 
 
 # ============================================================
@@ -955,6 +1144,7 @@ def run_daily_update(
         print("[LOCAL ONLY] Neon upsert disabled.")
 
     all_live_rows = []
+    outcomes = {}
     observed_at = datetime.now(ZoneInfo("UTC"))
 
     for batch in chunk_list(yfinance_symbols, BATCH_SIZE):
@@ -964,21 +1154,33 @@ def run_daily_update(
             batch_df, target_start_date = download_recent_batch(batch, start_date=start_date)
         except Exception as e:
             print(f"[BATCH ERROR] {e}")
+            for symbol in batch:
+                meta = asset_map[symbol]
+                outcomes[symbol] = SymbolFetchOutcome(
+                    symbol=symbol,
+                    name=meta["name"],
+                    provider="yfinance",
+                    required=symbol in REQUIRED_SYMBOLS,
+                    success=False,
+                    rows_fetched=0,
+                    latest_observation=None,
+                    failure_reason=f"{type(e).__name__}: {e}",
+                )
             time.sleep(random.uniform(5.0, 15.0))
             continue
 
         all_yf_rows = []
 
         for symbol in batch:
+            rows_fetched = 0
+            latest_observation = None
             try:
                 meta = asset_map[symbol]
                 print(f"[PROCESS YF] {symbol}")
 
                 symbol_df = extract_symbol_df_from_batch(batch_df, symbol)
-
-                if symbol_df.empty:
-                    print(f"[NO DATA] {symbol}")
-                    continue
+                rows_fetched = len(symbol_df)
+                rows_fetched, latest_observation = observation_metadata(symbol_df)
 
                 print(
                     f"[YF DATES RAW] {symbol} | "
@@ -1004,6 +1206,15 @@ def run_daily_update(
 
                 if symbol_df.empty:
                     print(f"[NO FINISHED BARS] {symbol}")
+                    outcomes[symbol] = SymbolFetchOutcome(
+                        symbol=symbol,
+                        name=meta["name"],
+                        provider="yfinance",
+                        required=symbol in REQUIRED_SYMBOLS,
+                        success=True,
+                        rows_fetched=rows_fetched,
+                        latest_observation=latest_observation,
+                    )
                     continue
 
                 rows = calculate_rows_for_symbol(
@@ -1020,6 +1231,15 @@ def run_daily_update(
 
                 if not rows:
                     print(f"[NO VALID ROWS IN TARGET WINDOW] {symbol}")
+                    outcomes[symbol] = SymbolFetchOutcome(
+                        symbol=symbol,
+                        name=meta["name"],
+                        provider="yfinance",
+                        required=symbol in REQUIRED_SYMBOLS,
+                        success=True,
+                        rows_fetched=rows_fetched,
+                        latest_observation=latest_observation,
+                    )
                     continue
 
                 print(
@@ -1028,9 +1248,29 @@ def run_daily_update(
                 )
 
                 all_yf_rows.extend(rows)
+                outcomes[symbol] = SymbolFetchOutcome(
+                    symbol=symbol,
+                    name=meta["name"],
+                    provider="yfinance",
+                    required=symbol in REQUIRED_SYMBOLS,
+                    success=True,
+                    rows_fetched=rows_fetched,
+                    latest_observation=latest_observation,
+                )
 
             except Exception as e:
                 print(f"[PROCESS ERROR] {symbol}: {e}")
+                meta = asset_map[symbol]
+                outcomes[symbol] = SymbolFetchOutcome(
+                    symbol=symbol,
+                    name=meta["name"],
+                    provider="yfinance",
+                    required=symbol in REQUIRED_SYMBOLS,
+                    success=False,
+                    rows_fetched=rows_fetched,
+                    latest_observation=latest_observation,
+                    failure_reason=f"{type(e).__name__}: {e}",
+                )
                 time.sleep(random.uniform(2.0, 5.0))
 
         if not all_yf_rows:
@@ -1052,49 +1292,112 @@ def run_daily_update(
     if investiny_symbols:
         print(f"\n[INVESTING.COM SYMBOLS] {investiny_symbols}")
     for symbol in investiny_symbols:
+        meta = asset_map[symbol]
         try:
-            meta = asset_map[symbol]
             print(f"[PROCESS INVESTING.COM] {symbol}")
-            rows, live_row = process_investiny_symbol(
+            rows, live_row, rows_fetched, latest_observation = process_investiny_symbol(
                 symbol,
                 meta,
                 start_date=start_date,
                 observed_at=observed_at,
             )
-            if live_row:
-                all_live_rows.append(live_row)
-                print(
-                    f"[INVESTING.COM LIVE SNAPSHOT] {symbol} | "
-                    f"market_date={live_row['market_date']} close={live_row['close']}"
-                )
-            upsert_new_macro_rows(
-                rows,
-                [symbol],
-                upsert_neon=upsert_neon,
-                dry_run=dry_run,
-                provider_label="INVESTING.COM",
-            )
         except Exception as e:
             print(f"[INVESTINY PROCESS ERROR] {symbol}: {e}")
+            rows_fetched = getattr(e, "rows_fetched", 0)
+            latest_observation = getattr(e, "latest_observation", None)
+            failure_reason = (
+                str(e)
+                if isinstance(e, SymbolProcessingError)
+                else f"{type(e).__name__}: {e}"
+            )
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="investing.com",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=False,
+                rows_fetched=rows_fetched,
+                latest_observation=latest_observation,
+                failure_reason=failure_reason,
+            )
             time.sleep(random.uniform(2.0, 5.0))
-        else:
-            # Investing.com intermittently returns 403 when symbols are fetched
-            # back-to-back, even though each individual instrument is valid.
-            time.sleep(random.uniform(3.0, 6.0))
+            continue
+
+        if live_row:
+            all_live_rows.append(live_row)
+            print(
+                f"[INVESTING.COM LIVE SNAPSHOT] {symbol} | "
+                f"market_date={live_row['market_date']} close={live_row['close']}"
+            )
+        # Database write errors are fatal and must not be reclassified as an
+        # accepted supplementary provider failure.
+        upsert_new_macro_rows(
+            rows,
+            [symbol],
+            upsert_neon=upsert_neon,
+            dry_run=dry_run,
+            provider_label="INVESTING.COM",
+        )
+        outcomes[symbol] = SymbolFetchOutcome(
+            symbol=symbol,
+            name=meta["name"],
+            provider="investing.com",
+            required=symbol in REQUIRED_SYMBOLS,
+            success=True,
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+        )
+        # Investing.com intermittently returns 403 when symbols are fetched
+        # back-to-back, even though each individual instrument is valid.
+        time.sleep(random.uniform(3.0, 6.0))
+
+    for symbol in symbols:
+        if symbol not in outcomes:
+            meta = asset_map[symbol]
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider=provider_for_symbol(symbol),
+                required=symbol in REQUIRED_SYMBOLS,
+                success=False,
+                rows_fetched=0,
+                latest_observation=None,
+                failure_reason="symbol was not attempted",
+            )
+
+    summary = summarize_outcomes(outcomes.values())
+    log_coverage_summary(summary)
+
+    successful_symbols = {
+        outcome.symbol for outcome in summary.outcomes if outcome.success
+    }
+    is_complete_registry_refresh = (
+        summary.failed_count == 0 and set(symbols) == set(asset_map)
+    )
 
     print(f"\n[LIVE SNAPSHOT TOTAL] rows={len(all_live_rows):,}")
     if not update_live:
         print("[LIVE REPLACE SKIP] Historical backfill mode.")
     elif dry_run:
         print("[DRY RUN SKIP LIVE REPLACE]")
-    else:
+    elif is_complete_registry_refresh:
         print(f"[REPLACE LOCAL LIVE] rows={len(all_live_rows):,}")
         replace_macro_live(local_engine, all_live_rows)
         if upsert_neon:
             print(f"[REPLACE NEON LIVE] rows={len(all_live_rows):,}")
             replace_macro_live(neon_engine, all_live_rows)
-
-    print("\n[DAILY UPDATE DONE]")
+    else:
+        print(
+            f"[MERGE LOCAL LIVE] rows={len(all_live_rows):,} "
+            f"successful_symbols={len(successful_symbols):,} retained_failed={summary.failed_count:,}"
+        )
+        merge_macro_live(local_engine, all_live_rows, successful_symbols)
+        if upsert_neon:
+            print(
+                f"[MERGE NEON LIVE] rows={len(all_live_rows):,} "
+                f"successful_symbols={len(successful_symbols):,} retained_failed={summary.failed_count:,}"
+            )
+            merge_macro_live(neon_engine, all_live_rows, successful_symbols)
 
     if update_etf_flows:
         try:
@@ -1109,8 +1412,22 @@ def run_daily_update(
     else:
         print("[ETF FLOW SKIP] ETF daily flow refresh disabled.")
 
+    if summary.failed_count == 0:
+        print("[MACRO UPDATE SUCCESS] Required coverage satisfied; all configured symbols succeeded.")
+    elif summary.coverage_satisfied:
+        print(
+            "[MACRO UPDATE PARTIAL FAILURE] Required coverage satisfied; "
+            "supplementary failures retained and reported."
+        )
+    else:
+        print(
+            "[MACRO UPDATE FAILURE] Required coverage not satisfied; "
+            "returning non-zero."
+        )
+    return summary
 
-def parse_args():
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Fetch macro/index/ETF data into public.macro.")
     parser.add_argument("--symbols", default=None, help="Comma-separated symbol subset.")
     parser.add_argument("--start-date", default=None, help="Target start date in YYYY-MM-DD format.")
@@ -1120,16 +1437,16 @@ def parse_args():
     parser.add_argument("--skip-live-replace", action="store_true", help="Do not replace public.macro_live; useful for historical symbol-subset backfills.")
     parser.add_argument("--etf-flow-start-date", default=None, help="Optional ETF flow backfill start date in YYYY-MM-DD format.")
     parser.add_argument("--etf-flow-tickers", default=None, help="Optional comma-separated ETF subset for ETF flow refresh.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     requested_symbols = [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()] if args.symbols else None
     start = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
     etf_flow_start = datetime.strptime(args.etf_flow_start_date, "%Y-%m-%d").date() if args.etf_flow_start_date else None
     etf_flow_tickers = [ticker.strip().upper() for ticker in args.etf_flow_tickers.split(",") if ticker.strip()] if args.etf_flow_tickers else None
-    run_daily_update(
+    summary = run_daily_update(
         symbol_filter=requested_symbols,
         start_date=start,
         upsert_neon=not args.local_only,
@@ -1139,3 +1456,8 @@ if __name__ == "__main__":
         etf_flow_tickers=etf_flow_tickers,
         update_live=not args.skip_live_replace,
     )
+    return summary.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
