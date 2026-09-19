@@ -464,6 +464,11 @@ def configure_macro_run(monkeypatch, *, yf_failures=None, investiny_failures=Non
     live_actions = []
 
     monkeypatch.setattr(macro_data_fetch.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "latest_completed_nyse_session_date",
+        lambda **_kwargs: date(2026, 7, 8),
+    )
     monkeypatch.setattr(macro_data_fetch, "create_macro_table", lambda *_args: None)
     monkeypatch.setattr(macro_data_fetch, "create_macro_live_table", lambda *_args: None)
     monkeypatch.setattr(
@@ -652,13 +657,299 @@ def test_all_investing_failures_return_nonzero_and_do_not_replace_live(monkeypat
     )
 
     output = capsys.readouterr().out
-    assert summary.failed_count == 12
-    assert summary.provider_failure_counts == (("investing.com", 12),)
+    assert summary.successful_count == 2
+    assert summary.failed_count == 10
+    assert summary.provider_failure_counts == (("investing.com", 12), ("yfinance", 0))
     assert summary.exit_code == 1
     assert "[MACRO UPDATE FAILURE]" in output
     assert "SUCCESS" not in output
     assert all(action[0] == "merge" for action in live_actions)
-    assert all(action[2] == set() for action in live_actions)
+    assert all(action[2] == {"CL=F", "BZ=F"} for action in live_actions)
+
+
+def test_oil_investing_success_does_not_call_fallback(monkeypatch):
+    configure_macro_run(monkeypatch)
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "process_yfinance_fallback_symbol",
+        lambda *_args, **_kwargs: pytest.fail("fallback must not run after primary success"),
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["CL=F"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 0
+    assert outcome.provider == "investing.com"
+    assert outcome.primary_provider == "investing.com"
+    assert outcome.fallback_provider is None
+
+
+@pytest.mark.parametrize("symbol", ["CL=F", "BZ=F"])
+def test_oil_investing_403_falls_back_to_yfinance_with_canonical_symbol(
+    monkeypatch,
+    capsys,
+    symbol,
+):
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={symbol: ConnectionError("Request failed with error code: 403")},
+    )
+    writes = []
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "upsert_new_macro_rows",
+        lambda rows, symbols, **kwargs: writes.append((rows, symbols, kwargs)) or 1,
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=[symbol],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    output = capsys.readouterr().out
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 0
+    assert summary.coverage_pct == 100.0
+    assert outcome.success is True
+    assert outcome.provider == "yfinance"
+    assert outcome.primary_provider == "investing.com"
+    assert outcome.primary_failure_reason == "ConnectionError: Request failed with error code: 403"
+    assert outcome.fallback_provider == "yfinance"
+    assert outcome.fallback_failure_reason is None
+    assert summary.provider_failure_counts == (("investing.com", 1), ("yfinance", 0))
+    assert len(writes) == 1
+    assert writes[0][0][0]["symbol"] == symbol
+    assert writes[0][1] == [symbol]
+    assert writes[0][2]["provider_label"] == "YF FALLBACK"
+    assert f"[YF FALLBACK OK] {symbol}" in output
+    assert f"provider=yfinance" in output
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        macro_data_fetch.SymbolProcessingError("ValueError: empty provider response"),
+        macro_data_fetch.SymbolProcessingError(
+            "ValueError: malformed provider response: Date/Close columns required"
+        ),
+    ],
+)
+def test_oil_unusable_primary_response_falls_back_successfully(monkeypatch, primary_error):
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={"BZ=F": primary_error},
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["BZ=F"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 0
+    assert outcome.provider == "yfinance"
+    assert outcome.primary_failure_reason == str(primary_error)
+
+
+def test_oil_fallback_stale_response_is_rejected(monkeypatch):
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={"CL=F": ConnectionError("403")},
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "latest_completed_nyse_session_date",
+        lambda **_kwargs: date(2026, 7, 9),
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["CL=F"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 1
+    assert outcome.success is False
+    assert outcome.primary_failure_reason == "ConnectionError: 403"
+    assert "stale fallback response" in outcome.fallback_failure_reason
+    assert outcome.latest_observation == date(2026, 7, 8)
+    assert summary.provider_failure_counts == (("investing.com", 1), ("yfinance", 1))
+
+
+@pytest.mark.parametrize(
+    ("fallback_failure", "expected_reason"),
+    [
+        ("empty", "empty provider response"),
+        ("malformed", "malformed provider response"),
+    ],
+)
+def test_oil_fallback_empty_or_malformed_response_is_rejected(
+    monkeypatch,
+    fallback_failure,
+    expected_reason,
+):
+    configure_macro_run(
+        monkeypatch,
+        yf_failures={"BZ=F": fallback_failure},
+        investiny_failures={"BZ=F": ValueError("unusable primary response")},
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["BZ=F"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 1
+    assert outcome.success is False
+    assert expected_reason in outcome.fallback_failure_reason
+    assert "primary investing.com" in outcome.failure_reason
+    assert "fallback yfinance" in outcome.failure_reason
+
+
+def test_oil_fallback_non_finite_close_is_rejected(monkeypatch):
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={"CL=F": ConnectionError("403")},
+    )
+    non_finite = sample_bars()
+    non_finite["Close"] = [float("inf"), float("nan")]
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "extract_symbol_df_from_batch",
+        lambda _batch_df, _symbol: non_finite,
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["CL=F"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 1
+    assert outcome.success is False
+    assert "no finite Date/Close observations" in outcome.fallback_failure_reason
+
+
+def test_oil_primary_and_fallback_provider_exceptions_return_nonzero(monkeypatch):
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={"CL=F": ConnectionError("investing 403")},
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "process_yfinance_fallback_symbol",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ConnectionError("yfinance unavailable")
+        ),
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["CL=F"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    outcome = summary.outcomes[0]
+    assert summary.exit_code == 1
+    assert summary.required_failed_symbols == ("CL=F",)
+    assert outcome.primary_failure_reason == "ConnectionError: investing 403"
+    assert outcome.fallback_failure_reason == "ConnectionError: yfinance unavailable"
+
+
+def test_oil_fallback_scope_excludes_treasuries_and_other_symbols(monkeypatch):
+    assert macro_data_fetch.OIL_YFINANCE_FALLBACK_SYMBOLS == {"CL=F", "BZ=F"}
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={"US10YT=X": ConnectionError("403")},
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "process_yfinance_fallback_symbol",
+        lambda *_args, **_kwargs: pytest.fail("Treasury fallback is out of scope"),
+    )
+
+    summary = macro_data_fetch.run_daily_update(
+        symbol_filter=["US10YT=X"],
+        upsert_neon=False,
+        dry_run=True,
+        update_etf_flows=False,
+    )
+
+    assert summary.exit_code == 1
+    assert summary.outcomes[0].fallback_provider is None
+
+
+def test_oil_fallback_live_row_preserves_yfinance_provenance_and_observed_at(monkeypatch):
+    observed_at = datetime(2026, 7, 8, 15, 0, tzinfo=ZoneInfo("UTC"))
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "download_recent_batch",
+        lambda *_args, **_kwargs: (sample_bars(), date(2026, 7, 7)),
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "latest_completed_nyse_session_date",
+        lambda **_kwargs: date(2026, 7, 8),
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "symbol_date_has_closed",
+        lambda _symbol, _bar_date: False,
+    )
+
+    rows, live_row, rows_fetched, latest = (
+        macro_data_fetch.process_yfinance_fallback_symbol(
+            "CL=F",
+            {"name": "WTI Crude Oil Future", "asset_type": "futures"},
+            observed_at=observed_at,
+        )
+    )
+
+    assert rows == []
+    assert rows_fetched == 2
+    assert latest == date(2026, 7, 8)
+    assert live_row["symbol"] == "CL=F"
+    assert live_row["source"] == "yfinance"
+    assert live_row["observed_at"] == observed_at
+
+
+def test_oil_fallback_database_write_error_remains_fatal(monkeypatch):
+    configure_macro_run(
+        monkeypatch,
+        investiny_failures={"CL=F": ConnectionError("403")},
+    )
+    monkeypatch.setattr(
+        macro_data_fetch,
+        "upsert_new_macro_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("database unavailable")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        macro_data_fetch.run_daily_update(
+            symbol_filter=["CL=F"],
+            upsert_neon=False,
+            update_etf_flows=False,
+            update_live=False,
+        )
 
 
 def test_partial_investing_failure_below_required_coverage_returns_nonzero(monkeypatch):

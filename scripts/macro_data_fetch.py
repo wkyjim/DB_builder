@@ -1,5 +1,6 @@
 import time
 import random
+import math
 import pandas as pd
 import yfinance as yf
 import argparse
@@ -13,6 +14,7 @@ from sqlalchemy import text
 import _bootstrap  # noqa: F401
 from db_builder.config import MACRO_TABLE, local_engine as make_local_engine
 from db_builder.config import neon_engine as make_neon_engine
+from db_builder.trading_calendar import latest_completed_nyse_session_date
 
 # ============================================================
 # CONFIG
@@ -61,6 +63,7 @@ REQUIRED_SYMBOLS = frozenset(
         "CNY=X",
     }
 )
+OIL_YFINANCE_FALLBACK_SYMBOLS = frozenset({"CL=F", "BZ=F"})
 
 local_engine = make_local_engine()
 neon_engine = make_neon_engine()
@@ -150,6 +153,10 @@ class SymbolFetchOutcome:
     rows_fetched: int
     latest_observation: date | None
     failure_reason: str | None = None
+    primary_provider: str | None = None
+    primary_failure_reason: str | None = None
+    fallback_provider: str | None = None
+    fallback_failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -919,6 +926,104 @@ def extract_symbol_df_from_batch(batch_df, symbol):
     return df
 
 
+def validate_fallback_observations(symbol_df):
+    """Return fallback rows whose dates and closing prices are finite and usable."""
+    if symbol_df is None or symbol_df.empty:
+        raise ValueError("empty provider response")
+    if "Date" not in symbol_df.columns or "Close" not in symbol_df.columns:
+        raise ValueError("malformed provider response: Date/Close columns required")
+
+    dates = pd.to_datetime(symbol_df["Date"], errors="coerce")
+    closes = pd.to_numeric(symbol_df["Close"], errors="coerce")
+    finite_closes = closes.map(
+        lambda value: pd.notna(value) and math.isfinite(float(value))
+    )
+    valid_mask = dates.notna() & finite_closes
+    valid_rows = symbol_df.loc[valid_mask].copy()
+    if valid_rows.empty:
+        raise ValueError(
+            "malformed provider response: no finite Date/Close observations"
+        )
+    if len(valid_rows) < 2:
+        raise ValueError(
+            "insufficient provider observations: at least 2 finite observations required"
+        )
+
+    valid_rows["Date"] = dates.loc[valid_mask]
+    valid_rows["Close"] = closes.loc[valid_mask]
+    return valid_rows, len(valid_rows), valid_rows["Date"].max().date()
+
+
+def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_at=None):
+    """Fetch and transform one oil symbol through the guarded yfinance fallback."""
+    if symbol not in OIL_YFINANCE_FALLBACK_SYMBOLS:
+        raise ValueError(f"yfinance fallback is not enabled for {symbol}")
+
+    rows_fetched = 0
+    latest_observation = None
+    try:
+        batch_df, target_start_date = download_recent_batch(
+            [symbol],
+            start_date=start_date,
+        )
+        symbol_df = extract_symbol_df_from_batch(batch_df, symbol)
+        rows_fetched = len(symbol_df)
+        symbol_df, rows_fetched, latest_observation = validate_fallback_observations(
+            symbol_df
+        )
+
+        required_latest = latest_completed_nyse_session_date(now=observed_at)
+        if latest_observation < required_latest:
+            raise ValueError(
+                "stale fallback response: "
+                f"latest observation {latest_observation} is before required {required_latest}"
+            )
+
+        print(
+            f"[YF FALLBACK DATES RAW] {symbol} | "
+            f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
+        )
+        print(
+            f"[YF FALLBACK FRESHNESS OK] {symbol} | "
+            f"latest={latest_observation} required={required_latest}"
+        )
+
+        live_row = extract_latest_unfinished_row(
+            df=symbol_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+            observed_at=observed_at,
+        )
+
+        finished_df = remove_unfinished_bars(symbol_df, symbol)
+        if finished_df.empty:
+            print(f"[YF FALLBACK NO FINISHED BARS] {symbol}")
+            return [], live_row, rows_fetched, latest_observation
+
+        rows = calculate_rows_for_symbol(
+            df=finished_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+        )
+        rows = filter_rows_to_target_window(
+            rows=rows,
+            target_start_date=target_start_date,
+        )
+        if rows:
+            print(f"[YF FALLBACK ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
+        else:
+            print(f"[YF FALLBACK NO VALID ROWS IN TARGET WINDOW] {symbol}")
+        return rows, live_row, rows_fetched, latest_observation
+    except Exception as exc:
+        raise SymbolProcessingError(
+            f"{type(exc).__name__}: {exc}",
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+        ) from exc
+
+
 def provider_for_symbol(symbol):
     return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
 
@@ -949,11 +1054,28 @@ def summarize_outcomes(outcomes, minimum_coverage_pct=MIN_COVERAGE_PCT):
     )
     coverage_pct = round(raw_coverage_pct, 2)
     required_failed = tuple(item.symbol for item in failed if item.required)
-    providers = sorted({item.provider for item in ordered})
-    provider_failure_counts = tuple(
-        (provider, sum(not item.success for item in ordered if item.provider == provider))
-        for provider in providers
-    )
+    providers = {
+        provider
+        for item in ordered
+        for provider in (item.provider, item.primary_provider, item.fallback_provider)
+        if provider
+    }
+    provider_failure_counts = []
+    for provider in sorted(providers):
+        failure_count = 0
+        for item in ordered:
+            if item.primary_provider:
+                failure_count += int(
+                    item.primary_provider == provider
+                    and item.primary_failure_reason is not None
+                )
+                failure_count += int(
+                    item.fallback_provider == provider
+                    and item.fallback_failure_reason is not None
+                )
+            elif item.provider == provider and not item.success:
+                failure_count += 1
+        provider_failure_counts.append((provider, failure_count))
     coverage_satisfied = (
         configured_count > 0
         and not required_failed
@@ -966,7 +1088,7 @@ def summarize_outcomes(outcomes, minimum_coverage_pct=MIN_COVERAGE_PCT):
         failed_count=len(failed),
         coverage_pct=coverage_pct,
         required_failed_symbols=required_failed,
-        provider_failure_counts=provider_failure_counts,
+        provider_failure_counts=tuple(provider_failure_counts),
         coverage_satisfied=coverage_satisfied,
     )
 
@@ -980,7 +1102,11 @@ def log_coverage_summary(summary):
             f"[MACRO SYMBOL {status}] symbol={outcome.symbol} name={outcome.name} "
             f"provider={outcome.provider} "
             f"required={'yes' if outcome.required else 'no'} rows_fetched={outcome.rows_fetched} "
-            f"latest_observation={latest} reason={reason}"
+            f"latest_observation={latest} reason={reason} "
+            f"primary_provider={outcome.primary_provider or 'none'} "
+            f"primary_failure={outcome.primary_failure_reason or 'none'} "
+            f"fallback_provider={outcome.fallback_provider or 'none'} "
+            f"fallback_failure={outcome.fallback_failure_reason or 'none'}"
         )
 
     failed_symbols = [
@@ -1305,11 +1431,92 @@ def run_daily_update(
             print(f"[INVESTINY PROCESS ERROR] {symbol}: {e}")
             rows_fetched = getattr(e, "rows_fetched", 0)
             latest_observation = getattr(e, "latest_observation", None)
-            failure_reason = (
+            primary_failure_reason = (
                 str(e)
                 if isinstance(e, SymbolProcessingError)
                 else f"{type(e).__name__}: {e}"
             )
+
+            if symbol in OIL_YFINANCE_FALLBACK_SYMBOLS:
+                print(
+                    f"[YF FALLBACK ATTEMPT] {symbol} | "
+                    f"primary_failure={primary_failure_reason}"
+                )
+                try:
+                    rows, live_row, rows_fetched, latest_observation = (
+                        process_yfinance_fallback_symbol(
+                            symbol,
+                            meta,
+                            start_date=start_date,
+                            observed_at=observed_at,
+                        )
+                    )
+                except Exception as fallback_error:
+                    print(f"[YF FALLBACK ERROR] {symbol}: {fallback_error}")
+                    rows_fetched = getattr(fallback_error, "rows_fetched", 0)
+                    latest_observation = getattr(
+                        fallback_error,
+                        "latest_observation",
+                        None,
+                    )
+                    fallback_failure_reason = (
+                        str(fallback_error)
+                        if isinstance(fallback_error, SymbolProcessingError)
+                        else f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
+                    outcomes[symbol] = SymbolFetchOutcome(
+                        symbol=symbol,
+                        name=meta["name"],
+                        provider="investing.com",
+                        required=symbol in REQUIRED_SYMBOLS,
+                        success=False,
+                        rows_fetched=rows_fetched,
+                        latest_observation=latest_observation,
+                        failure_reason=(
+                            f"primary investing.com: {primary_failure_reason}; "
+                            f"fallback yfinance: {fallback_failure_reason}"
+                        ),
+                        primary_provider="investing.com",
+                        primary_failure_reason=primary_failure_reason,
+                        fallback_provider="yfinance",
+                        fallback_failure_reason=fallback_failure_reason,
+                    )
+                    time.sleep(random.uniform(2.0, 5.0))
+                    continue
+
+                if live_row:
+                    all_live_rows.append(live_row)
+                    print(
+                        f"[YF FALLBACK LIVE SNAPSHOT] {symbol} | "
+                        f"market_date={live_row['market_date']} close={live_row['close']}"
+                    )
+                # Keep database errors fatal, as in both primary provider paths.
+                upsert_new_macro_rows(
+                    rows,
+                    [symbol],
+                    upsert_neon=upsert_neon,
+                    dry_run=dry_run,
+                    provider_label="YF FALLBACK",
+                )
+                outcomes[symbol] = SymbolFetchOutcome(
+                    symbol=symbol,
+                    name=meta["name"],
+                    provider="yfinance",
+                    required=symbol in REQUIRED_SYMBOLS,
+                    success=True,
+                    rows_fetched=rows_fetched,
+                    latest_observation=latest_observation,
+                    primary_provider="investing.com",
+                    primary_failure_reason=primary_failure_reason,
+                    fallback_provider="yfinance",
+                )
+                print(
+                    f"[YF FALLBACK OK] {symbol} | "
+                    f"latest_observation={latest_observation}"
+                )
+                time.sleep(random.uniform(2.0, 5.0))
+                continue
+
             outcomes[symbol] = SymbolFetchOutcome(
                 symbol=symbol,
                 name=meta["name"],
@@ -1318,7 +1525,9 @@ def run_daily_update(
                 success=False,
                 rows_fetched=rows_fetched,
                 latest_observation=latest_observation,
-                failure_reason=failure_reason,
+                failure_reason=primary_failure_reason,
+                primary_provider="investing.com",
+                primary_failure_reason=primary_failure_reason,
             )
             time.sleep(random.uniform(2.0, 5.0))
             continue
@@ -1346,6 +1555,7 @@ def run_daily_update(
             success=True,
             rows_fetched=rows_fetched,
             latest_observation=latest_observation,
+            primary_provider="investing.com",
         )
         # Investing.com intermittently returns 403 when symbols are fetched
         # back-to-back, even though each individual instrument is valid.
