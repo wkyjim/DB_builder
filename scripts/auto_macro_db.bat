@@ -32,8 +32,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
       "elseif (-not (Invoke-RetryPython 'scripts\\rule_based_market_update.py' 'rule_based_market_update.py' '--save --window-hours 24 --publish-dashboard --push-dashboard --notify-telegram' 900)) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; $ExitCode = 1 }" ^
       "else {" ^
         "Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation';" ^
-        "$FreshnessExitCode = (Start-Process -FilePath $Python -ArgumentList 'scripts\\freshness_check.py','--datasets','Macro (close)','--require-critical' -Wait -PassThru -NoNewWindow).ExitCode;" ^
+        "$FreshnessArgs = @('scripts\\freshness_check.py','--datasets','Macro (close)','--require-critical');" ^
+        "$FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String);" ^
+        "Add-Content -LiteralPath $Log -Value $FreshnessOutput;" ^
+        "$FreshnessExitCode = $LASTEXITCODE;" ^
         "if ($FreshnessExitCode -eq 2) { Write-Log 'FRESHNESS FAIL' 'Critical macro data failed freshness check'; $ExitCode = 2 }" ^
+        "elseif ($FreshnessExitCode -eq 3) { Write-Log 'FRESHNESS CONFIG ERROR' 'Freshness invocation/config error (usage or unknown dataset) - NOT stale data'; $ExitCode = 3 }" ^
         "elseif ($FreshnessExitCode -eq 1) { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS WARN' 'Non-critical freshness warnings detected' }" ^
         "else { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS OK' 'Macro data passed freshness check' }" ^
       "}" ^

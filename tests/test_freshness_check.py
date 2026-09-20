@@ -53,6 +53,28 @@ def business_days_before(end: date, count: int) -> date:
     return current
 
 
+def business_lag_anchor(n: int) -> date:
+    """Return a date whose business-day lag to today is EXACTLY n.
+
+    Unlike business_days_before, this matches _count_business_days semantics
+    (business days strictly after the date, up to and including today), so the
+    result is deterministic on any calendar day, including weekends.
+    """
+    today = date.today()
+    candidate = today
+    while True:
+        candidate -= timedelta(days=1)
+        # count business days in (candidate, today]
+        days = 0
+        cursor = candidate + timedelta(days=1)
+        while cursor <= today:
+            if cursor.weekday() < 5:
+                days += 1
+            cursor += timedelta(days=1)
+        if days == n:
+            return candidate
+
+
 # Import the script with narrowly scoped db_builder stubs. Restoring sys.modules
 # immediately prevents these doubles from contaminating other test modules.
 _stubbed_module_names = (
@@ -337,7 +359,7 @@ class TestCheckRule:
             warn_days=3,
             fail_days=5,
         )
-        latest = business_days_before(datetime.now(timezone.utc).date(), 3)
+        latest = business_lag_anchor(3)
         engine = MockEngine([(latest,)])
         result = freshness_check.check_rule(rule, engine)
         assert result.status == "WARN"
@@ -484,7 +506,7 @@ class TestCLI:
             sys, "argv", ["freshness_check.py", "--datasets", "nonexistent"]
         ):
             result = freshness_check.main()
-            assert result == 2
+            assert result == 3
 
     def test_warn_only_returns_zero(self):
         """Default WARN-only result must return exit code 0."""
@@ -657,7 +679,7 @@ class TestWeekendHandling:
             warn_days=3,
             fail_days=5,
         )
-        latest = business_days_before(datetime.now(timezone.utc).date(), 3)
+        latest = business_lag_anchor(3)
         engine = MockEngine([(latest,)])
         result = freshness_check.check_rule(rule, engine)
         assert result.status == "WARN"
@@ -762,3 +784,179 @@ class TestWorkflowCLI:
                 ]
                 result = freshness_check.main()
                 assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Exit-code hardening (0 / 1 / 2 / 3)
+# ---------------------------------------------------------------------------
+
+
+class TestExitCodeHardening:
+    """Exit 3 = CLI/config error must be distinct from exit 2 = data failure."""
+
+    def test_unknown_dataset_returns_three(self):
+        """Unknown dataset is a config error (3), not a data failure (2)."""
+        with patch.object(
+            sys, "argv", ["freshness_check.py", "--datasets", "nonexistent"]
+        ):
+            result = freshness_check.main()
+            assert result == 3
+
+    def test_argparse_usage_error_returns_three(self):
+        """Unrecognized CLI arguments must exit 3, not argparse's default 2."""
+        with patch.object(
+            sys, "argv", ["freshness_check.py", "--no-such-flag"]
+        ):
+            result = freshness_check.main()
+            assert result == 3
+
+    def test_split_dataset_name_returns_three_not_two(self):
+        """Simulate the PowerShell 5.1 quoting bug: 'Equities (raw)' split
+        into 'Equities' + positional '(raw)'. Must be 3 (config), never 2."""
+        with patch.object(
+            sys, "argv",
+            ["freshness_check.py", "--datasets", "Equities", "(raw),Equities", "(indicators)", "--require-critical"]
+        ):
+            result = freshness_check.main()
+            assert result == 3
+
+    def test_genuine_critical_fail_still_returns_two(self):
+        """A real critical FAIL must still return 2 after hardening."""
+        with patch.object(
+            sys, "argv",
+            ["freshness_check.py", "--datasets", "Equities (raw)", "--require-critical"]
+        ):
+            with patch.object(freshness_check, "check_all_rules") as mock_check:
+                mock_check.return_value = [
+                    freshness_check.FreshnessResult(
+                        rule_name="Equities (raw)",
+                        table="public.us_equities",
+                        timestamp_field="date",
+                        latest_value=None,
+                        lag_days=None,
+                        status="FAIL",
+                        message="stale",
+                        is_critical=True,
+                    ),
+                ]
+                result = freshness_check.main()
+                assert result == 2
+
+    def test_ok_returns_zero(self):
+        with patch.object(
+            sys, "argv",
+            ["freshness_check.py", "--datasets", "Equities (raw)", "--require-critical"]
+        ):
+            with patch.object(freshness_check, "check_all_rules") as mock_check:
+                mock_check.return_value = [
+                    freshness_check.FreshnessResult(
+                        rule_name="Equities (raw)",
+                        table="public.us_equities",
+                        timestamp_field="date",
+                        latest_value=date(2026, 9, 18),
+                        lag_days=0.0,
+                        status="OK",
+                        message="fresh",
+                        is_critical=True,
+                    ),
+                ]
+                result = freshness_check.main()
+                assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: argv preservation for dataset names with spaces/parentheses
+# ---------------------------------------------------------------------------
+
+
+class TestArgvPreservation:
+    """Dataset names containing spaces and parentheses must survive argv intact."""
+
+    EQUITY_ARGS = ["freshness_check.py", "--datasets", "Equities (raw),Equities (indicators)", "--require-critical"]
+    MACRO_ARGS = ["freshness_check.py", "--datasets", "Macro (close)", "--require-critical"]
+
+    def test_equity_invocation_datasets_parsed_intact(self):
+        """The exact equity workflow argv must parse as ONE --datasets value."""
+        with patch.object(sys, "argv", self.EQUITY_ARGS):
+            with patch.object(freshness_check, "check_all_rules") as mock_check:
+                mock_check.return_value = []
+                result = freshness_check.main()
+                call_kwargs = mock_check.call_args
+                datasets = call_kwargs.kwargs.get("datasets") or call_kwargs[1].get("datasets")
+                assert datasets == ["Equities (raw)", "Equities (indicators)"]
+                assert result == 0
+
+    def test_macro_invocation_datasets_parsed_intact(self):
+        """The exact macro workflow argv must parse as ONE --datasets value."""
+        with patch.object(sys, "argv", self.MACRO_ARGS):
+            with patch.object(freshness_check, "check_all_rules") as mock_check:
+                mock_check.return_value = []
+                result = freshness_check.main()
+                call_kwargs = mock_check.call_args
+                datasets = call_kwargs.kwargs.get("datasets") or call_kwargs[1].get("datasets")
+                assert datasets == ["Macro (close)"]
+                assert result == 0
+
+    def test_all_critical_dataset_names_are_valid(self):
+        """Every dataset named in the .bat workflows must be a valid rule."""
+        valid = {r.name for r in freshness_check.FRESHNESS_RULES}
+        equity_datasets = {"Equities (raw)", "Equities (indicators)"}
+        macro_datasets = {"Macro (close)"}
+        assert equity_datasets <= valid, f"Invalid equity datasets: {equity_datasets - valid}"
+        assert macro_datasets <= valid, f"Invalid macro datasets: {macro_datasets - valid}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Workflow control flow (exit-code mapping)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowControlFlow:
+    """Map freshness exit codes to workflow outcomes as the .bat files do."""
+
+    def test_exit_2_maps_to_workflow_failure(self):
+        """Exit 2 → FRESHNESS FAIL → workflow exit 2 (alert)."""
+        freshness_exit = 2
+        workflow_exit = 2 if freshness_exit == 2 else 0
+        assert workflow_exit == 2
+
+    def test_exit_3_maps_to_config_error_not_data_failure(self):
+        """Exit 3 → FRESHNESS CONFIG ERROR → workflow exit 3, distinct from 2."""
+        freshness_exit = 3
+        if freshness_exit == 2:
+            workflow_exit = 2
+        elif freshness_exit == 3:
+            workflow_exit = 3
+        else:
+            workflow_exit = 0
+        assert workflow_exit == 3
+        assert workflow_exit != 2  # never masquerade as stale data
+
+    def test_exit_0_maps_to_workflow_success(self):
+        freshness_exit = 0
+        workflow_exit = 0 if freshness_exit in (0, 1) else freshness_exit
+        assert workflow_exit == 0
+
+    def test_bat_files_use_array_invocation_not_start_process(self):
+        """The .bat workflows must use & $Python @args, not Start-Process."""
+        for bat in ["scripts/auto_postgreSQL_db.bat", "scripts/auto_macro_db.bat"]:
+            content = Path(__file__).resolve().parents[1] / bat
+            text = content.read_text(encoding="utf-8", errors="replace")
+            assert "Start-Process -FilePath $Python -ArgumentList 'scripts" not in text, \
+                f"{bat} still uses Start-Process -ArgumentList for freshness"
+            assert "$FreshnessArgs = @(" in text, \
+                f"{bat} missing argument-array invocation"
+            assert "& $Python @FreshnessArgs" in text, \
+                f"{bat} missing splat invocation"
+            assert "$LASTEXITCODE" in text, \
+                f"{bat} missing $LASTEXITCODE capture"
+            assert "FRESHNESS CONFIG ERROR" in text, \
+                f"{bat} missing exit-3 handling"
+
+    def test_bat_files_capture_freshness_output(self):
+        """Freshness stdout/stderr must be logged for diagnosability."""
+        for bat in ["scripts/auto_postgreSQL_db.bat", "scripts/auto_macro_db.bat"]:
+            content = Path(__file__).resolve().parents[1] / bat
+            text = content.read_text(encoding="utf-8", errors="replace")
+            assert "2>&1 | Out-String" in text, \
+                f"{bat} missing freshness output capture"

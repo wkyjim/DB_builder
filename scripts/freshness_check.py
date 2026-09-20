@@ -7,8 +7,9 @@ produced current data.
 
 Exit codes:
     0 - All freshness checks passed (OK or non-critical WARN)
-    1 - Deprecated (reserved for future use)
-    2 - At least one FAIL threshold breached (action required)
+    1 - WARN only (informational; never treated as workflow failure)
+    2 - Genuine critical freshness FAIL (action required: stale data)
+    3 - CLI/config/usage error (bad arguments or unknown dataset) — NOT stale data
 
 In --require-critical mode:
     0 - No critical dataset FAIL
@@ -17,7 +18,7 @@ In --require-critical mode:
 Usage:
     python scripts/freshness_check.py
     python scripts/freshness_check.py --json
-    python scripts/freshness_check.py --datasets equities,news
+    python scripts/freshness_check.py --datasets "Equities (raw),Equities (indicators)"
     python scripts/freshness_check.py --require-critical
 """
 
@@ -580,11 +581,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List available dataset rules and exit.",
     )
-    return parser.parse_args()
+    # Exit 3 (not argparse's default 2) on usage errors so a CLI/config
+    # problem can never masquerade as a genuine critical freshness failure.
+    parser.exit_on_error = False if hasattr(parser, "exit_on_error") else None
+    try:
+        return parser.parse_args()
+    except SystemExit as exc:
+        # argparse raises SystemExit(2) for usage errors; remap to 3.
+        if exc.code not in (None, 0):
+            print("ERROR: freshness_check CLI usage error (exit 3)")
+            raise SystemExit(3) from exc
+        raise
 
 
 def main() -> int:
-    args = parse_args()
+    try:
+        args = parse_args()
+    except SystemExit as exc:
+        return int(exc.code)
 
     if args.list_datasets:
         print("Available freshness rules:")
@@ -599,12 +613,12 @@ def main() -> int:
         valid_names = {r.name.lower() for r in FRESHNESS_RULES}
         valid_tables = {r.table.lower() for r in FRESHNESS_RULES}
         valid_all = valid_names | valid_tables
-        
+
         unknown = datasets_lower - valid_all
         if unknown:
             print(f"ERROR: Unknown dataset(s): {', '.join(sorted(unknown))}")
             print(f"Available datasets: {', '.join(sorted(valid_names))}")
-            return 2
+            return 3
 
     # Create single engine shared across all rules
     engine = local_engine()

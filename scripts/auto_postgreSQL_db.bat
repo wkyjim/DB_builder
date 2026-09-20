@@ -30,8 +30,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
       "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_daily_bulk_sync_to_neon.py' 'indicator reconciliation to Neon' @('--tables', 'indicators', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'indicator reconciliation to Neon failed after 3 retries'; $ExitCode = 1 }" ^
       "else {" ^
         "Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation';" ^
-        "$FreshnessExitCode = (Start-Process -FilePath $Python -ArgumentList 'scripts\\freshness_check.py','--datasets','Equities (raw),Equities (indicators)','--require-critical' -Wait -PassThru -NoNewWindow).ExitCode;" ^
+        "$FreshnessArgs = @('scripts\\freshness_check.py','--datasets','Equities (raw),Equities (indicators)','--require-critical');" ^
+        "$FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String);" ^
+        "Add-Content -LiteralPath $Log -Value $FreshnessOutput;" ^
+        "$FreshnessExitCode = $LASTEXITCODE;" ^
         "if ($FreshnessExitCode -eq 2) { Write-Log 'FRESHNESS FAIL' 'Critical datasets failed freshness check'; $ExitCode = 2 }" ^
+        "elseif ($FreshnessExitCode -eq 3) { Write-Log 'FRESHNESS CONFIG ERROR' 'Freshness invocation/config error (usage or unknown dataset) - NOT stale data'; $ExitCode = 3 }" ^
         "elseif ($FreshnessExitCode -eq 1) { Write-Log 'SUCCESS' 'auto_postgreSQL_db workflow complete'; Write-Log 'FRESHNESS WARN' 'Non-critical freshness warnings detected' }" ^
         "else { Write-Log 'SUCCESS' 'auto_postgreSQL_db workflow complete'; Write-Log 'FRESHNESS OK' 'All critical datasets passed freshness check' }" ^
       "}" ^
