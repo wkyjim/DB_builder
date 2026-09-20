@@ -231,3 +231,79 @@ def database_latest_session_status(
 def database_has_latest_session(engine, raw_table: str = RAW_TABLE) -> tuple[bool, date | None, date]:
     status = database_latest_session_status(engine, raw_table)
     return status.should_skip, status.max_date, status.latest_session
+
+
+# ---------------------------------------------------------------------------
+# U.S. Treasury official publication calendar
+# ---------------------------------------------------------------------------
+
+# Treasury documents that daily par yield curve rates are usually published at
+# approximately 18:00 America/New_York on each trading day. The cutoff is
+# evaluated in Eastern wall-clock time (DST-aware), NOT a fixed UTC hour:
+# 18:00 ET = 23:00 UTC during EST and 22:00 UTC during EDT.
+TREASURY_PUBLICATION_LOCAL_TIME = 18, 0  # (hour, minute) America/New_York
+TREASURY_PUBLICATION_TZ_NAME = "America/New_York"
+
+# Treasury publishes on U.S. federal business days (Mon-Fri excluding federal
+# holidays). This intentionally differs from the NYSE calendar: Good Friday is
+# an NYSE holiday but a Treasury publication day.
+_FEDERAL_HOLIDAY_CALENDAR = None
+
+
+def _federal_holidays(start: date, end: date) -> set[date]:
+    """Return U.S. federal holidays in [start, end] (pandas built-in)."""
+    global _FEDERAL_HOLIDAY_CALENDAR
+    if _FEDERAL_HOLIDAY_CALENDAR is None:
+        from pandas.tseries.holiday import USFederalHolidayCalendar
+        _FEDERAL_HOLIDAY_CALENDAR = USFederalHolidayCalendar()
+    holidays = _FEDERAL_HOLIDAY_CALENDAR.holidays(
+        start=pd.Timestamp(start) - timedelta(days=1),
+        end=pd.Timestamp(end) + timedelta(days=1),
+    )
+    return {ts.date() for ts in holidays}
+
+
+def is_treasury_trading_day(day: date) -> bool:
+    """True when the Treasury publishes par yields for this date.
+
+    U.S. federal business day: Mon-Fri, excluding federal holidays.
+    Weekends are never publication days; Good Friday IS a publication day.
+    """
+    if day is None or day.weekday() >= 5:
+        return False
+    return day not in _federal_holidays(day, day)
+
+
+def previous_treasury_trading_day(day: date) -> date:
+    """Most recent Treasury publication day strictly before `day`."""
+    candidate = day - timedelta(days=1)
+    while not is_treasury_trading_day(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def expected_latest_treasury_publication(now: datetime | None = None) -> date:
+    """Latest Treasury trading day whose official par yields should be published.
+
+    DST-aware cutoff at approximately 18:00 America/New_York:
+    - before 18:00 ET: today's publication is not yet due; the most recent
+      trading day at or before yesterday is expected
+    - at/after 18:00 ET: today (if a trading day) becomes expected
+
+    Weekends and federal holidays walk back to the prior trading day.
+    """
+    from zoneinfo import ZoneInfo
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    tz = ZoneInfo(TREASURY_PUBLICATION_TZ_NAME)
+    now_et = now.astimezone(tz)
+    hour, minute = TREASURY_PUBLICATION_LOCAL_TIME
+    cutoff_today = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if now_et >= cutoff_today and is_treasury_trading_day(now_et.date()):
+        return now_et.date()
+    return previous_treasury_trading_day(now_et.date())

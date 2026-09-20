@@ -65,6 +65,42 @@ REQUIRED_SYMBOLS = frozenset(
 )
 OIL_YFINANCE_FALLBACK_SYMBOLS = frozenset({"CL=F", "BZ=F"})
 
+# P1B: U.S. Treasury official par-yield fallback.
+# Canonical DB symbols map to Treasury XML BC_*YEAR elements. The Treasury
+# par-yield curve is built from the most recently auctioned 2Y/3Y/5Y/7Y/10Y/
+# 20Y/30Y securities, so every tenor below has a direct on-the-run input.
+UST_TREASURY_FALLBACK_SYMBOLS = frozenset(
+    {
+        "US2YT=X",
+        "US3YT=X",
+        "US5YT=X",
+        "US7YT=X",
+        "US10YT=X",
+        "US20YT=X",
+        "US30YT=X",
+    }
+)
+TREASURY_XML_ELEMENT_MAP = {
+    "US2YT=X": "BC_2YEAR",
+    "US3YT=X": "BC_3YEAR",
+    "US5YT=X": "BC_5YEAR",
+    "US7YT=X": "BC_7YEAR",
+    "US10YT=X": "BC_10YEAR",
+    "US20YT=X": "BC_20YEAR",
+    "US30YT=X": "BC_30YEAR",
+}
+TREASURY_XML_URL_TEMPLATE = (
+    "https://home.treasury.gov/resource-center/data-chart-center/"
+    "interest-rates/pages/xml?data=daily_treasury_yield_curve"
+    "&field_tdr_date_value={year}"
+)
+TREASURY_YIELD_MIN = 0.10
+TREASURY_YIELD_MAX = 25.0
+
+# Per-run cache: the year-scoped Treasury XML document is fetched ONCE and
+# shared across all seven UST symbols in the same run.
+_treasury_xml_cache: dict[int, "pd.DataFrame"] = {}
+
 local_engine = make_local_engine()
 neon_engine = make_neon_engine()
 
@@ -1024,6 +1060,214 @@ def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_
         ) from exc
 
 
+        # ---------------------------------------------------------------------------
+# P1B: U.S. Treasury official par-yield fallback
+# ---------------------------------------------------------------------------
+
+
+def fetch_treasury_par_yields(year: int) -> pd.DataFrame:
+    """Fetch (with per-run caching) the Treasury daily par yield curve XML.
+
+    The year-scoped document is fetched ONCE per run and shared across all
+    seven UST fallback symbols. Returns a DataFrame indexed by date with one
+    column per BC_*YEAR element.
+    """
+    if year in _treasury_xml_cache:
+        return _treasury_xml_cache[year]
+
+    import requests
+    import xml.etree.ElementTree as ET
+
+    url = TREASURY_XML_URL_TEMPLATE.format(year=year)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Connection": "close",
+    }
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    # Treasury XML uses Atom-style entries with d: namespace prefixes.
+    ns = {"d": "http://schemas.microsoft.com/ado/2007/08/dataservices"}
+    entries = ET.fromstring(resp.content).findall(".//d:entry", ns) or \
+        ET.fromstring(resp.content).findall(".//{http://www.w3.org/2005/Atom}entry")
+
+    records = []
+    for entry in entries:
+        props = entry.find(".//d:properties", ns) or entry.find(
+            ".//{http://schemas.microsoft.com/ado/2007/08/dataservices/metadata}properties"
+        )
+        if props is None:
+            continue
+        row = {}
+        for child in props:
+            tag = child.tag.split("}")[-1]  # strip namespace
+            row[tag] = child.text
+        if "NEW_DATE" in row:
+            records.append(row)
+
+    if not records:
+        raise ValueError("empty treasury.gov response: no yield-curve entries")
+
+    df = pd.DataFrame(records)
+    df["NEW_DATE"] = pd.to_datetime(df["NEW_DATE"], errors="coerce", utc=True)
+    df = df.dropna(subset=["NEW_DATE"]).sort_values("NEW_DATE")
+    df = df.drop_duplicates(subset=["NEW_DATE"], keep="last").set_index("NEW_DATE")
+
+    _treasury_xml_cache[year] = df
+    return df
+
+
+def validate_treasury_observations(symbol, yields_df):
+    """Validate official par-yield observations for one canonical UST symbol.
+
+    Returns (symbol_df, rows_fetched, latest_observation) where symbol_df has
+    Date/Close columns consumable by the row-construction helpers.
+    """
+    element = TREASURY_XML_ELEMENT_MAP[symbol]
+    if element not in yields_df.columns:
+        raise ValueError(
+            f"malformed official data: element {element} missing from treasury.gov response"
+        )
+
+    series = pd.to_numeric(yields_df[element], errors="coerce")
+    dates = yields_df.index
+
+    valid_mask = series.notna() & series.map(
+        lambda v: math.isfinite(float(v))
+        and TREASURY_YIELD_MIN <= float(v) <= TREASURY_YIELD_MAX
+    )
+    if not valid_mask.any():
+        raise ValueError(
+            "malformed official data: no plausible finite yields "
+            f"(expected {TREASURY_YIELD_MIN}-{TREASURY_YIELD_MAX} percent)"
+        )
+    if int(valid_mask.sum()) < 2:
+        raise ValueError(
+            "insufficient official observations: at least 2 valid yields required"
+        )
+
+    symbol_df = pd.DataFrame(
+        {
+            "Date": dates[valid_mask],
+            "Open": series[valid_mask],
+            "High": series[valid_mask],
+            "Low": series[valid_mask],
+            "Close": series[valid_mask],
+            "Adj Close": series[valid_mask],
+            "Volume": None,
+        }
+    ).reset_index(drop=True)
+    return symbol_df, len(symbol_df), symbol_df["Date"].max().date()
+
+
+def classify_treasury_freshness(latest_observation, observed_at):
+    """Three-state publication-aware freshness classification.
+
+    Returns (status, expected_date) where status is one of:
+      - 'CURRENT'           latest >= expected publication
+      - 'PUBLICATION_DELAY' one publication day behind expected (WARN)
+      - 'STALE'             beyond one publication day behind (reject)
+    """
+    from db_builder.trading_calendar import (
+        expected_latest_treasury_publication,
+        previous_treasury_trading_day,
+    )
+
+    expected = expected_latest_treasury_publication(now=observed_at)
+    if latest_observation >= expected:
+        return "CURRENT", expected
+    if latest_observation >= previous_treasury_trading_day(expected):
+        return "PUBLICATION_DELAY", expected
+    return "STALE", expected
+
+
+def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_at=None):
+    """Fetch and transform one UST symbol via the official Treasury par-yield curve.
+
+    Fallback rows are SYNTHETIC single-point daily observations, not true OHLC
+    bars: open = high = low = close = official par yield, volume = NULL.
+    """
+    if symbol not in UST_TREASURY_FALLBACK_SYMBOLS:
+        raise ValueError(f"treasury.gov fallback is not enabled for {symbol}")
+
+    rows_fetched = 0
+    latest_observation = None
+    try:
+        from db_builder.trading_calendar import previous_treasury_trading_day
+
+        now = observed_at or datetime.now(ZoneInfo("UTC"))
+        # Fetch the current year and, when January may need prior-year context,
+        # also the prior year (both cached; at most two documents per run).
+        years = {now.year}
+        if start_date is not None:
+            years.add(start_date.year)
+        else:
+            years.add(now.year - 1)
+
+        combined = pd.concat(
+            [fetch_treasury_par_yields(y) for y in sorted(years)]
+        ).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+
+        symbol_df, rows_fetched, latest_observation = validate_treasury_observations(
+            symbol, combined
+        )
+
+        status, expected = classify_treasury_freshness(latest_observation, now)
+        if status == "STALE":
+            raise ValueError(
+                f"stale official publication: latest observation {latest_observation} "
+                f"is before tolerated {previous_treasury_trading_day(expected)}"
+            )
+        if status == "PUBLICATION_DELAY":
+            print(
+                f"[UST FALLBACK PUBLICATION DELAY] {symbol} | "
+                f"latest={latest_observation} expected={expected} "
+                f"(official source one publication day behind — accepted with warning)"
+            )
+        else:
+            print(
+                f"[UST FALLBACK FRESHNESS OK] {symbol} | "
+                f"latest={latest_observation} expected={expected}"
+            )
+
+        # Synthetic single-point rows: Date/Close only; OHLC all equal.
+        target_start = start_date or (now.date() - timedelta(days=LOOKBACK_DAYS + CALC_BUFFER_DAYS))
+
+        rows = calculate_rows_for_symbol(
+            df=symbol_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+        )
+        rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start)
+        if rows:
+            print(
+                f"[UST FALLBACK ROW DATES TARGET] {symbol} | "
+                f"{[row['date'] for row in rows]}"
+            )
+        else:
+            print(f"[UST FALLBACK NO VALID ROWS IN TARGET WINDOW] {symbol}")
+
+        # Live snapshot: official publication is final — no unfinished bar.
+        live_row = None
+        if rows:
+            latest = dict(rows[-1])
+            latest["market_date"] = latest.pop("date")
+            latest["observed_at"] = observed_at or datetime.now(ZoneInfo("UTC"))
+            latest["is_market_closed"] = True
+            latest["source"] = "treasury.gov"
+            live_row = latest
+
+        return rows, live_row, rows_fetched, latest_observation
+    except Exception as exc:
+        raise SymbolProcessingError(
+            f"{type(exc).__name__}: {exc}",
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+        ) from exc
+
+
 def provider_for_symbol(symbol):
     return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
 
@@ -1513,6 +1757,88 @@ def run_daily_update(
                 print(
                     f"[YF FALLBACK OK] {symbol} | "
                     f"latest_observation={latest_observation}"
+                )
+                time.sleep(random.uniform(2.0, 5.0))
+                continue
+
+            if symbol in UST_TREASURY_FALLBACK_SYMBOLS:
+                print(
+                    f"[UST FALLBACK ATTEMPT] {symbol} | "
+                    f"primary_failure={primary_failure_reason}"
+                )
+                try:
+                    rows, live_row, rows_fetched, latest_observation = (
+                        process_treasury_fallback_symbol(
+                            symbol,
+                            meta,
+                            start_date=start_date,
+                            observed_at=observed_at,
+                        )
+                    )
+                except Exception as fallback_error:
+                    print(f"[UST FALLBACK ERROR] {symbol}: {fallback_error}")
+                    rows_fetched = getattr(fallback_error, "rows_fetched", 0)
+                    latest_observation = getattr(
+                        fallback_error,
+                        "latest_observation",
+                        None,
+                    )
+                    fallback_failure_reason = (
+                        str(fallback_error)
+                        if isinstance(fallback_error, SymbolProcessingError)
+                        else f"{type(fallback_error).__name__}: {fallback_error}"
+                    )
+                    outcomes[symbol] = SymbolFetchOutcome(
+                        symbol=symbol,
+                        name=meta["name"],
+                        provider="investing.com",
+                        required=symbol in REQUIRED_SYMBOLS,
+                        success=False,
+                        rows_fetched=rows_fetched,
+                        latest_observation=latest_observation,
+                        failure_reason=(
+                            f"primary investing.com: {primary_failure_reason}; "
+                            f"fallback treasury.gov: {fallback_failure_reason}"
+                        ),
+                        primary_provider="investing.com",
+                        primary_failure_reason=primary_failure_reason,
+                        fallback_provider="treasury.gov",
+                        fallback_failure_reason=fallback_failure_reason,
+                    )
+                    time.sleep(random.uniform(2.0, 5.0))
+                    continue
+
+                if live_row:
+                    all_live_rows.append(live_row)
+                    print(
+                        f"[UST FALLBACK LIVE SNAPSHOT] {symbol} | "
+                        f"market_date={live_row.get('market_date')} "
+                        f"close={live_row.get('close')} "
+                        f"source={live_row.get('source')}"
+                    )
+                # Keep database errors fatal, as in both primary provider paths.
+                upsert_new_macro_rows(
+                    rows,
+                    [symbol],
+                    upsert_neon=upsert_neon,
+                    dry_run=dry_run,
+                    provider_label="UST FALLBACK",
+                )
+                outcomes[symbol] = SymbolFetchOutcome(
+                    symbol=symbol,
+                    name=meta["name"],
+                    provider="treasury.gov",
+                    required=symbol in REQUIRED_SYMBOLS,
+                    success=True,
+                    rows_fetched=rows_fetched,
+                    latest_observation=latest_observation,
+                    primary_provider="investing.com",
+                    primary_failure_reason=primary_failure_reason,
+                    fallback_provider="treasury.gov",
+                )
+                print(
+                    f"[UST FALLBACK OK] {symbol} | "
+                    f"latest_observation={latest_observation} synthetic_ohlc=point"
                 )
                 time.sleep(random.uniform(2.0, 5.0))
                 continue
