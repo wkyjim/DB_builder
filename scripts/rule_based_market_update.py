@@ -221,7 +221,14 @@ def main() -> None:
 
 
 def _commit_and_push_dashboard(dashboard_repo: Path) -> None:
-    """Commit and push the dashboard latest report. Never force-push."""
+    """Commit and push the dashboard latest report. Never force-push.
+
+    Push failure is NON-FATAL by design (REPORT_READY vs PUBLISHED
+    separation): a failed push prints a warning and the script still exits
+    0, so callers do not retry the whole report generation — retrying would
+    regenerate + recommit duplicate reports. The next cycle's
+    sync_dashboard_repo + push publishes the outstanding commit.
+    """
     subprocess.run(
         ["git", "-C", str(dashboard_repo), "add", "data/latest-report.md"],
         check=True,
@@ -237,11 +244,20 @@ def _commit_and_push_dashboard(dashboard_repo: Path) -> None:
         ["git", "-C", str(dashboard_repo), "commit", "-m", "Update latest market report"],
         check=True,
     )
-    subprocess.run(
+    push_result = subprocess.run(
         ["git", "-C", str(dashboard_repo), "push", "origin", "main"],
-        check=True,
+        check=False,
     )
-    print("Pushed latest report to market-dashboard.")
+    if push_result.returncode == 0:
+        print("Pushed latest report to market-dashboard.")
+    else:
+        print(
+            "[PUSH FAILED] git push exited "
+            f"{push_result.returncode}; the commit is local and the report is "
+            "REPORT_READY. Publication will be completed by the next cycle's "
+            "sync+push. NOT retrying report generation (prevents duplicate "
+            "commits)."
+        )
 
 
 if __name__ == "__main__":
