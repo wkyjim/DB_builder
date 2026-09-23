@@ -1,0 +1,410 @@
+<#
+.SYNOPSIS
+    Hourly full-refresh pipeline orchestrator (Phase 1 - manual run).
+
+.DESCRIPTION
+    Runs ONE complete data-refresh + full latest-report.md generation cycle
+    with parallel independent branches, per-source status recording, cycle
+    state JSON, atomic publication, and separated REPORT_READY vs PUBLISHED
+    status. Designed to be scheduled hourly later; Phase 1 is manual-only.
+
+    Branches (independent table ownership - no cross-branch write contention):
+      A. equities + indicators      -> us_equities, us_equities_indicators
+      B. macro markets              -> macro, macro_live (+ETF flow refresh inside)
+      C. economic data              -> economic_* tables
+      D. FINRA / short analytics    -> finra_*, short analytics
+      E. news                       -> news_* tables
+    JOIN -> rule_based_market_update.py (full report) -> atomic publish -> commit/push.
+
+    Source severity (see scripts/pipeline_state.py):
+      CRITICAL: us_equities, equity_indicators, macro_rates,
+                macro_fx_commodities, macro_market_indices
+      IMPORTANT: economic_releases, etf_flows, finra_short, news_fetch, news_signals
+      OPTIONAL:  news_classify, asia_futures
+
+    Exit codes:
+      0 = REPORT_READY (publication may still be PUSH_FAILED - check state JSON)
+      1 = FAILED (critical source failure or report generation failed)
+
+.NOTES
+    Mutex: Local\DBBuilderHourlyPipeline prevents overlapping cycles.
+    news_classify exit 75 = Ollama unavailable -> DEGRADED (not a failure).
+    macro_data_fetch has an Investing.com 403 circuit breaker (max 2 trips).
+#>
+
+param(
+    [switch]$DryRun,
+    [int]$MacroTimeoutSeconds = 900
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+call "C:\Users\User\anaconda3\Scripts\activate.bat" 2>$null
+$Root = $PSScriptRoot | Split-Path -Parent
+$Python = 'C:\Users\User\anaconda3\envs\PostgreSQL_db\python.exe'
+$LogDir = Join-Path $Root 'logs'
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$StateDir = Join-Path $Root 'reports\state'
+New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+
+$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$Log = Join-Path $LogDir ("hourly_pipeline_" + $Stamp + ".log")
+
+# Cycle ID in HKT
+$HktZone = [System.TimeZoneInfo]::FindSystemTimeZoneById('China Standard Time')
+$NowHkt = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $HktZone)
+$CycleId = $NowHkt.ToString('yyyyMMdd_HHmm') + '_HKT'
+$CycleStart = Get-Date
+
+function Write-Log($Level, $Message) {
+    $Line = ('{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message)
+    Add-Content -LiteralPath $Log -Value $Line
+    Write-Host $Line
+}
+
+function Invoke-PythonStep {
+    param(
+        [string]$Script,
+        [string]$Arguments = '',
+        [int]$TimeoutSeconds = 600,
+        [int]$MaxAttempts = 1,
+        [string]$StepName
+    )
+    for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+        Write-Log 'START' ("$StepName attempt $Attempt")
+        $Out = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.out.log')
+        $Err = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.err.log')
+        $Cmd = ('/c ""{0}" "{1}" {2} > "{3}" 2> "{4}"' -f $Python, (Join-Path $Root $Script), $Arguments, $Out, $Err)
+        $Psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $Psi.FileName = 'cmd.exe'
+        $Psi.Arguments = $Cmd
+        $Psi.WorkingDirectory = $Root
+        $Psi.UseShellExecute = $false
+        $P = [System.Diagnostics.Process]::Start($Psi)
+        $TimeoutMs = [Math]::Max(1, $TimeoutSeconds) * 1000
+        if (-not $P.WaitForExit($TimeoutMs)) {
+            $null = & taskkill.exe /PID $P.Id /T /F 2>&1
+            Write-Log 'TIMEOUT' ("$StepName exceeded $TimeoutSeconds seconds")
+            if (Test-Path $Out) { Get-Content $Out | Add-Content -LiteralPath $Log }
+            if (Test-Path $Err) { Get-Content $Err | Add-Content -LiteralPath $Log }
+            if ($Attempt -lt $MaxAttempts) { Start-Sleep -Seconds 30; continue }
+            return @{ Ok = $false; ExitCode = -1; Output = 'TIMEOUT' }
+        }
+        $P.WaitForExit()
+        $ExitCode = $P.ExitCode
+        if (Test-Path $Out) { Get-Content $Out | Add-Content -LiteralPath $Log }
+        if (Test-Path $Err) { Get-Content $Err | Add-Content -LiteralPath $Log }
+        if ($ExitCode -eq 0) {
+            Write-Log 'SUCCESS' $StepName
+            return @{ Ok = $true; ExitCode = 0; Output = (Get-Content $Out -Raw -ErrorAction SilentlyContinue) }
+        }
+        Write-Log 'ERROR' ("$StepName exited with code $ExitCode")
+        if ($Attempt -lt $MaxAttempts) { Start-Sleep -Seconds 30; continue }
+        return @{ Ok = $false; ExitCode = $ExitCode; Output = (Get-Content $Out -Raw -ErrorAction SilentlyContinue) }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Mutex: never overlap cycles
+# ---------------------------------------------------------------------------
+$Mutex = [System.Threading.Mutex]::new($false, 'Local\DBBuilderHourlyPipeline')
+$HasMutex = $false
+try {
+    try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
+    if (-not $HasMutex) {
+        Write-Log 'SKIP' 'Another hourly pipeline cycle is already running'
+        exit 1
+    }
+
+    Write-Log 'START' ("Hourly full-refresh pipeline cycle $CycleId" + $(if ($DryRun) { ' [DRY RUN]' } else { '' }))
+
+    # -----------------------------------------------------------------------
+    # State: RUNNING
+    # -----------------------------------------------------------------------
+    $StateJson = Join-Path $StateDir 'latest_report_status.json'
+    $PrevState = $null
+    if (Test-Path $StateJson) {
+        try { $PrevState = Get-Content $StateJson -Raw | ConvertFrom-Json } catch {}
+    }
+    $SourceMetaFile = Join-Path $StateDir ("cycle_" + $CycleId + "_sources.json")
+
+    # -----------------------------------------------------------------------
+    # PARALLEL BRANCHES (independent table ownership)
+    # -----------------------------------------------------------------------
+    Write-Log 'BRANCHES' 'Starting parallel data-refresh branches A-E'
+
+    $BranchJobs = @()
+
+    # Branch A: equities + indicators (us_equities, us_equities_indicators)
+    $BranchJobs += Start-Job -Name 'BranchA_Equities' -ScriptBlock {
+        param($Root, $Python, $Log, $DryRun)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r1 = & $Python (Join-Path $Root 'scripts\pgSQL_equities_auto.py') --local-only 2>&1
+        $r2 = & $Python (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') --local-only 2>&1
+        $r3 = & $Python (Join-Path $Root 'scripts\indicator_staged_backfill.py') --local-only 2>&1
+        $sw.Stop()
+        @{ Branch='A_equities'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 + $r3 | Out-String) }
+    } -ArgumentList $Root, $Python, $Log, $DryRun
+
+    # Branch B: macro markets (macro, macro_live) — includes ETF flow refresh
+    $BranchJobs += Start-Job -Name 'BranchB_Macro' -ScriptBlock {
+        param($Root, $Python, $MacroTimeoutSeconds)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = $Python
+        $pinfo.Arguments = '"' + (Join-Path $Root 'scripts\macro_data_fetch.py') + '"'
+        $pinfo.WorkingDirectory = $Root
+        $pinfo.UseShellExecute = $false
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+        $p = [System.Diagnostics.Process]::Start($pinfo)
+        $out = $p.StandardOutput.ReadToEnd()
+        $err = $p.StandardError.ReadToEnd()
+        if (-not $p.WaitForExit($MacroTimeoutSeconds * 1000)) {
+            $p.Kill(); $sw.Stop()
+            return @{ Branch='B_macro'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after ' + $MacroTimeoutSeconds + 's'); ExitCode=-1 }
+        }
+        $sw.Stop()
+        @{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($out + $err); ExitCode=$p.ExitCode }
+    } -ArgumentList $Root, $Python, $MacroTimeoutSeconds
+
+    # Branch C: economic data (economic_* tables) — natural cadence: check for new releases
+    $BranchJobs += Start-Job -Name 'BranchC_Economic' -ScriptBlock {
+        param($Root, $Python)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r1 = & $Python (Join-Path $Root 'scripts\economic_data_fetch.py') --upsert-local 2>&1
+        $r2 = & $Python (Join-Path $Root 'scripts\global_economic_data_fetch.py') --upsert-local 2>&1
+        $sw.Stop()
+        @{ Branch='C_economic'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 | Out-String) }
+    } -ArgumentList $Root, $Python
+
+    # Branch D: FINRA / short analytics (finra_*, short analytics)
+    $BranchJobs += Start-Job -Name 'BranchD_Finra' -ScriptBlock {
+        param($Root, $Python)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r1 = & $Python (Join-Path $Root 'scripts\finra_short_incremental.py') 2>&1
+        $r2 = & $Python (Join-Path $Root 'scripts\short_analytics_latest_sync.py') 2>&1
+        $sw.Stop()
+        @{ Branch='D_finra'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 | Out-String) }
+    } -ArgumentList $Root, $Python
+
+    # Branch E: news (news_* tables) — classify has Ollama circuit breaker (exit 75 = DEGRADED)
+    $BranchJobs += Start-Job -Name 'BranchE_News' -ScriptBlock {
+        param($Root, $Python)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r1 = & $Python (Join-Path $Root 'scripts\news_fetch.py') --upsert-local --limit 200 2>&1
+        $newsFetchOk = ($LASTEXITCODE -eq 0)
+        $r2 = & $Python (Join-Path $Root 'scripts\news_classify.py') --upsert-local --limit 100 --max-seconds 300 2>&1
+        $classifyExit = $LASTEXITCODE
+        $r3 = & $Python (Join-Path $Root 'scripts\news_signals.py') --upsert-local --all-windows 2>&1
+        $signalsOk = ($LASTEXITCODE -eq 0)
+        $sw.Stop()
+        # classify exit 75 = Ollama unavailable -> DEGRADED not FAILED
+        $classifyDegraded = ($classifyExit -eq 75)
+        $ok = $newsFetchOk -and $signalsOk -and ($classifyExit -eq 0 -or $classifyDegraded)
+        @{ Branch='E_news'; Ok=$ok; Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 + $r3 | Out-String); ClassifyDegraded=$classifyDegraded }
+    } -ArgumentList $Root, $Python
+
+    # -----------------------------------------------------------------------
+    # JOIN: wait for all branches (bounded — jobs have their own timeouts)
+    # -----------------------------------------------------------------------
+    Write-Log 'JOIN' 'Waiting for all branches to complete...'
+    $BranchResults = @()
+    foreach ($Job in $BranchJobs) {
+        $Result = Wait-Job -Job $Job -Timeout 2400 | Receive-Job -Job $Job
+        Remove-Job -Job $Job -Force
+        if ($null -eq $Result) {
+            $Result = @{ Branch = $Job.Name; Ok = $false; Seconds = 0; Output = 'JOB RETURNED NOTHING (timeout or crash)' }
+        }
+        $BranchResults += $Result
+        $Status = if ($Result.Ok) { 'OK' } else { 'FAIL' }
+        Write-Log 'BRANCH' ("{0}: {1} ({2:N0}s)" -f $Result.Branch, $Status, $Result.Seconds)
+        if ($Result.Output) {
+            $Result.Output | Out-String -Width 4096 | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ } | Add-Content -LiteralPath $Log
+        }
+    }
+
+    $BranchRuntime = ($BranchResults | Measure-Object -Property Seconds -Maximum).Maximum
+    Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $BranchRuntime)
+
+    # -----------------------------------------------------------------------
+    # Map branch results -> source statuses (with DB-derived observation dates)
+    # -----------------------------------------------------------------------
+    $BranchA = $BranchResults | Where-Object { $_.Branch -eq 'A_equities' }
+    $BranchB = $BranchResults | Where-Object { $_.Branch -eq 'B_macro' }
+    $BranchC = $BranchResults | Where-Object { $_.Branch -eq 'C_economic' }
+    $BranchD = $BranchResults | Where-Object { $_.Branch -eq 'D_finra' }
+    $BranchE = $BranchResults | Where-Object { $_.Branch -eq 'E_news' }
+
+    # Macro branch: PARTIAL (exit 1 with coverage satisfied) still usable for rates/FX
+    $MacroPartial = ($BranchB.Ok -eq $false -and $BranchB.ExitCode -eq 1 -and $BranchB.Output -match 'coverage satisfied')
+
+    $SourceMeta = @{
+        cycle_id = $CycleId
+        data_refresh_completed_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+        sources = @{}
+        degraded_sources = @()
+    }
+
+    function Add-Source($Name, $Ok, $ObservationDate, $Note) {
+        $Status = if ($Ok) { 'OK' } else { 'FAILED' }
+        $SourceMeta.sources[$Name] = @{
+            status = $Status
+            observation_date = $ObservationDate
+            retrieved_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+        }
+        if ($Note) { $SourceMeta.sources[$Name].note = $Note }
+    }
+
+    Add-Source 'us_equities' ($BranchA.Ok) $null $null
+    Add-Source 'equity_indicators' ($BranchA.Ok) $null $null
+    Add-Source 'macro_rates' ($BranchB.Ok -or $MacroPartial) $null $null
+    Add-Source 'macro_fx_commodities' ($BranchB.Ok -or $MacroPartial) $null $null
+    Add-Source 'macro_market_indices' ($BranchB.Ok -or $MacroPartial) $null $null
+    Add-Source 'economic_releases' ($BranchC.Ok) $null 'natural cadence: latest official release'
+    Add-Source 'etf_flows' ($BranchB.Ok -or $MacroPartial) $null 'refreshed inside macro branch'
+    Add-Source 'finra_short' ($BranchD.Ok) $null 'natural cadence: bi-weekly settlement'
+    Add-Source 'news_fetch' ($BranchE.Ok) $null $null
+    Add-Source 'news_signals' ($BranchE.Ok) $null $null
+    Add-Source 'news_classify' ($true) $null $(if ($BranchE.ClassifyDegraded) { 'Ollama unavailable this cycle (exit 75) - DEGRADED' } else { 'classified normally' })
+    Add-Source 'asia_futures' ($true) $null 'Investing.com primary; yfinance cash-index proxy fallback active'
+
+    if ($BranchE.ClassifyDegraded) { $SourceMeta.degraded_sources += 'news_classify' }
+    if ($MacroPartial) { $SourceMeta.degraded_sources += 'macro_partial_coverage' }
+
+    # Persist source meta for the report generator
+    $SourceMeta | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $SourceMetaFile -Encoding UTF8
+    Write-Log 'STATE' "Source metadata written: $SourceMetaFile"
+
+    # -----------------------------------------------------------------------
+    # CRITICAL source gate: proceed only if all CRITICAL sources OK
+    # -----------------------------------------------------------------------
+    $CriticalFailed = @('us_equities','equity_indicators','macro_rates','macro_fx_commodities','macro_market_indices') |
+        Where-Object { $SourceMeta.sources[$_].status -ne 'OK' }
+    if ($CriticalFailed) {
+        Write-Log 'FAIL' ("Critical sources failed: " + ($CriticalFailed -join ', '))
+        # Write FAILED state
+        $FailState = @{
+            cycle_id = $CycleId
+            started_at = $CycleStart.ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+            completed_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+            overall_status = 'FAILED'
+            publication_status = 'NOT_PUBLISHED'
+            consecutive_failures = $(if ($PrevState -and $PrevState.overall_status -eq 'FAILED') { [int]$PrevState.consecutive_failures + 1 } else { 1 })
+            failure_reason = ('critical sources failed: ' + ($CriticalFailed -join ', '))
+            sources = $SourceMeta.sources
+            degraded_sources = $SourceMeta.degraded_sources
+            latest_report = @{ generated_at = $null; path = $null; sha256 = $null; cycle_id = $CycleId }
+            git = @{ commit = $null; pushed = $false; head_equals_origin = $null; error = $null }
+        }
+        $FailState | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateJson -Encoding UTF8
+        exit 1
+    }
+
+    # -----------------------------------------------------------------------
+    # FULL REPORT GENERATION (all sections preserved)
+    # -----------------------------------------------------------------------
+    Write-Log 'REPORT' 'Generating FULL rule-based market update report...'
+    $ReportArgs = ('--save --window-hours 24 --publish-dashboard --cycle-id {0} --source-meta-json "{1}"' -f $CycleId, $SourceMetaFile)
+    if (-not $DryRun) { $ReportArgs += ' --push-dashboard' }
+    else { Write-Log 'DRYRUN' 'Push disabled for dry run' }
+    $ReportResult = Invoke-PythonStep -Script 'scripts\rule_based_market_update.py' -Arguments $ReportArgs -TimeoutSeconds 900 -StepName 'rule_based_market_update.py'
+    if (-not $ReportResult.Ok) {
+        Write-Log 'FAIL' 'Report generation failed'
+        $FailState = @{
+            cycle_id = $CycleId
+            started_at = $CycleStart.ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+            completed_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+            overall_status = 'FAILED'
+            publication_status = 'NOT_PUBLISHED'
+            consecutive_failures = $(if ($PrevState -and $PrevState.overall_status -eq 'FAILED') { [int]$PrevState.consecutive_failures + 1 } else { 1 })
+            failure_reason = 'report generation failed'
+            sources = $SourceMeta.sources
+            degraded_sources = $SourceMeta.degraded_sources
+            latest_report = @{ generated_at = $null; path = $null; sha256 = $null; cycle_id = $CycleId }
+            git = @{ commit = $null; pushed = $false; head_equals_origin = $null; error = $null }
+        }
+        $FailState | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateJson -Encoding UTF8
+        exit 1
+    }
+
+    # -----------------------------------------------------------------------
+    # Post-report: compute SHA, verify, write FINAL state
+    # -----------------------------------------------------------------------
+    $DashboardReport = Join-Path $Root 'market-dashboard\data\latest-report.md'
+    $ReportSha = $null
+    $CommitHash = $null
+    $Pushed = $false
+    $HeadEqualsOrigin = $null
+    $GitError = $null
+
+    if (Test-Path $DashboardReport) {
+        $ReportSha = (Get-FileHash -LiteralPath $DashboardReport -Algorithm SHA256).Hash.ToLower()
+    }
+
+    if (-not $DryRun) {
+        # Commit/push was attempted inside rule_based_market_update.py; inspect git state
+        try {
+            $CommitHash = & git -C (Join-Path $Root 'market-dashboard') rev-parse HEAD 2>$null
+            if ($LASTEXITCODE -ne 0) { $CommitHash = $null }
+        } catch { $CommitHash = $null }
+        try {
+            & git -C (Join-Path $Root 'market-dashboard') fetch origin main 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $LocalHead = & git -C (Join-Path $Root 'market-dashboard') rev-parse HEAD
+                $OriginHead = & git -C (Join-Path $Root 'market-dashboard') rev-parse origin/main
+                $HeadEqualsOrigin = ($LocalHead -eq $OriginHead)
+                # Pushed if HEAD is on origin (commit reachable from origin/main)
+                if ($HeadEqualsOrigin) { $Pushed = $true }
+                else {
+                    # Check if HEAD commit is behind origin (rebase needed) or ahead (push failed)
+                    $AheadCount = & git -C (Join-Path $Root 'market-dashboard') rev-list --count origin/main..HEAD
+                    if ([int]$AheadCount -gt 0) { $Pushed = $false; $GitError = 'push failed or not attempted; local is ahead of origin' }
+                }
+            } else { $GitError = 'git fetch failed - cannot verify publication' }
+        } catch { $GitError = $_.Exception.Message }
+    }
+
+    $PubStatus = if ($DryRun) { 'NOT_PUBLISHED' }
+                 elseif ($null -eq $CommitHash) { 'COMMIT_FAILED' }
+                 elseif ($Pushed -and $HeadEqualsOrigin) { 'PUSHED' }
+                 else { 'PUSH_FAILED' }
+
+    $FinalState = @{
+        cycle_id = $CycleId
+        started_at = $CycleStart.ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+        completed_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+        overall_status = 'REPORT_READY'
+        publication_status = $PubStatus
+        consecutive_failures = 0
+        branch_runtimes = ($BranchResults | ForEach-Object { @{ branch = $_.Branch; seconds = [math]::Round($_.Seconds, 1); ok = $_.Ok } })
+        total_runtime_seconds = [math]::Round(((Get-Date) - $CycleStart).TotalSeconds, 1)
+        sources = $SourceMeta.sources
+        degraded_sources = $SourceMeta.degraded_sources
+        latest_report = @{
+            generated_at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss+08:00')
+            path = $DashboardReport
+            sha256 = $ReportSha
+            cycle_id = $CycleId
+        }
+        git = @{
+            commit = $CommitHash
+            pushed = $Pushed
+            head_equals_origin = $HeadEqualsOrigin
+            error = $GitError
+        }
+    }
+    $FinalState | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StateJson -Encoding UTF8
+    Write-Log 'STATE' "Final state written: $StateJson (REPORT_READY / $PubStatus)"
+
+    $TotalMin = [math]::Round(((Get-Date) - $CycleStart).TotalMinutes, 1)
+    Write-Log 'SUCCESS' ("Cycle $CycleId complete in $TotalMin minutes. Status: REPORT_READY / $PubStatus")
+    exit 0
+
+} finally {
+    if ($HasMutex) { $Mutex.ReleaseMutex() }
+    $Mutex.Dispose()
+}

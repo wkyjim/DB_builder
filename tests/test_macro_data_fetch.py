@@ -226,14 +226,47 @@ def test_investiny_403_uses_exponential_cooldown(monkeypatch):
     assert macro_data_fetch._investiny_retry_delay("HTTP 403", 4) == 60.0
 
 
-def test_fetch_investiny_symbol_df_recovers_after_403(monkeypatch):
+def test_fetch_investiny_symbol_df_403_trips_provider_breaker(monkeypatch):
+    """A provider-level 403 must raise InvestinyProviderUnavailable on the
+    FIRST attempt (no exponential-backoff burn) so the cycle-level circuit
+    breaker can route the symbol to its fallback provider."""
     attempts = []
     sleeps = []
 
     def fake_historical_data(**_kwargs):
         attempts.append(1)
-        if len(attempts) < 3:
-            raise ConnectionError("Request failed with error code: 403")
+        raise ConnectionError("Request failed with error code: 403")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "investiny",
+        types.SimpleNamespace(historical_data=fake_historical_data),
+    )
+    monkeypatch.setattr(macro_data_fetch.time, "sleep", sleeps.append)
+    monkeypatch.setattr(macro_data_fetch.random, "uniform", lambda *_args: 0.0)
+
+    with pytest.raises(macro_data_fetch.InvestinyProviderUnavailable):
+        macro_data_fetch.fetch_investiny_symbol_df(
+            "US10YT=X",
+            start_date=date(2026, 7, 1),
+        )
+
+    # Exactly one provider call, and only the single pre-call jitter sleep —
+    # no exponential-backoff cooldowns: the breaker trips immediately instead
+    # of burning the old 8s/16s/32s/60s chain.
+    assert len(attempts) == 1
+    assert sleeps == [0.0]
+
+
+def test_fetch_investiny_symbol_df_recovers_after_transient_error(monkeypatch):
+    """Non-403 transient errors still retry (max 2 attempts) and recover."""
+    attempts = []
+    sleeps = []
+
+    def fake_historical_data(**_kwargs):
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise ConnectionError("timed out")
         return {
             "date": ["07/01/2026"],
             "open": [4.4],
@@ -255,8 +288,7 @@ def test_fetch_investiny_symbol_df_recovers_after_403(monkeypatch):
         start_date=date(2026, 7, 1),
     )
 
-    assert len(attempts) == 3
-    assert sleeps == [0.0, 8.0, 0.0, 16.0, 0.0]
+    assert len(attempts) == 2
     assert df.iloc[0]["Close"] == 4.55
 
 

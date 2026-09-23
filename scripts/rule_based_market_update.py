@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -20,6 +21,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-hours", type=int, default=24)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--save", action="store_true")
+    parser.add_argument(
+        "--cycle-id",
+        default=None,
+        help="Pipeline cycle identifier (e.g. 20260923_0800_HKT) embedded in report metadata.",
+    )
+    parser.add_argument(
+        "--source-meta-json",
+        type=Path,
+        default=None,
+        help="Optional JSON file with per-source observation dates/degradation recorded by the orchestrator.",
+    )
     parser.add_argument(
         "--publish-dashboard",
         action="store_true",
@@ -43,6 +55,50 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--json-output", type=Path, default=None)
     return parser.parse_args()
+
+
+def build_cycle_metadata_block(cycle_id: str | None, source_meta: dict | None, generated_at) -> str:
+    """Machine-readable cycle/source metadata appended to the full report.
+
+    Preserves every existing report section — this block is ADDITIVE. All
+    execution timestamps are HKT. observation_date (what the data is current
+    through) is distinguished from retrieved_at (when we checked it).
+    """
+    lines = ["", "## Cycle Metadata", ""]
+    if cycle_id:
+        lines.append(f"- Cycle ID: {cycle_id}")
+    lines.append(f"- Report generated at: {generated_at:%d %B %Y, %H:%M:%S} (HKT)")
+    if source_meta:
+        refresh_completed = source_meta.get("data_refresh_completed_at")
+        if refresh_completed:
+            lines.append(f"- Data refresh completed at: {refresh_completed}")
+        label_map = {
+            "us_equities": "Equity data through",
+            "macro_rates": "Rates data through",
+            "macro_fx_commodities": "FX data through",
+            "macro_fx_commodities_commodities": "Commodities data through",
+            "macro_market_indices": "Macro-market data through",
+            "economic_releases": "Economic releases through",
+            "etf_flows": "ETF flow data through",
+            "finra_short": "FINRA data through",
+            "news_fetch": "News data through",
+            "asia_futures": "Asia futures data through",
+        }
+        sources = source_meta.get("sources") or {}
+        for key, label in label_map.items():
+            entry = sources.get(key)
+            if not entry:
+                continue
+            obs = entry.get("observation_date") or "unknown"
+            note = f" ({entry['note']})" if entry.get("note") else ""
+            lines.append(f"- {label}: {obs}{note}")
+        degraded = source_meta.get("degraded_sources") or []
+        if degraded:
+            lines.append(f"- Degraded sources: {', '.join(degraded)}")
+        else:
+            lines.append("- Degraded sources: none")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def sync_dashboard_repo(dashboard_repo: Path) -> None:
@@ -96,21 +152,62 @@ def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool 
     return target
 
 
+def atomic_publish_to_dashboard(report_path: Path, dashboard_repo: Path) -> Path:
+    """Atomically replace latest-report.md (temp write + os.replace)."""
+    import os
+    import tempfile
+
+    target = dashboard_repo / "data" / "latest-report.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".latest-report.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as out, open(report_path, "rb") as src:
+            shutil.copyfileobj(src, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    print(f"Atomically published latest report to dashboard: {target}")
+    return target
+
+
 def main() -> None:
     args = parse_args()
     engine = local_engine(use_insertmanyvalues=True)
     data = collect_rule_based_inputs(engine, window_hours=args.window_hours)
     scores = score_all(data)
     markdown = render_rule_based_market_update(data, scores)
+
+    generated_at = data.get("generated_at")
+    source_meta = None
+    if args.source_meta_json and args.source_meta_json.is_file():
+        import json
+
+        source_meta = json.loads(args.source_meta_json.read_text(encoding="utf-8"))
+    markdown = markdown + build_cycle_metadata_block(args.cycle_id, source_meta, generated_at)
+
     if args.json_output:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(scores_to_json(scores), encoding="utf-8")
     if args.save:
-        path = save_rule_based_report(markdown, generated_at=data.get("generated_at"))
+        path = save_rule_based_report(markdown, generated_at=generated_at)
         print(f"Saved rule-based market update report: {path}")
         notification_path = path
-        if args.publish_dashboard:
-            notification_path = publish_to_dashboard(path, args.dashboard_repo, push=args.push_dashboard, dry_run=args.dry_run)
+        if args.publish_dashboard and not args.dry_run:
+            notification_path = atomic_publish_to_dashboard(path, args.dashboard_repo)
+            if args.push_dashboard:
+                _commit_and_push_dashboard(args.dashboard_repo)
+        elif args.publish_dashboard:
+            print(f"[DRY RUN] Would atomically publish latest report to dashboard: {args.dashboard_repo / 'data' / 'latest-report.md'}")
+            if args.push_dashboard:
+                print("[DRY RUN] Would commit and push data/latest-report.md to market-dashboard.")
         if args.notify_telegram:
             from db_builder.telegram_bot import build_report_update_summary, send_telegram_message
 
@@ -121,6 +218,30 @@ def main() -> None:
     if args.publish_dashboard:
         raise ValueError("--publish-dashboard requires --save")
     print(markdown)
+
+
+def _commit_and_push_dashboard(dashboard_repo: Path) -> None:
+    """Commit and push the dashboard latest report. Never force-push."""
+    subprocess.run(
+        ["git", "-C", str(dashboard_repo), "add", "data/latest-report.md"],
+        check=True,
+    )
+    diff_result = subprocess.run(
+        ["git", "-C", str(dashboard_repo), "diff", "--cached", "--quiet"],
+        check=False,
+    )
+    if diff_result.returncode == 0:
+        print("Dashboard latest report unchanged; nothing to commit.")
+        return
+    subprocess.run(
+        ["git", "-C", str(dashboard_repo), "commit", "-m", "Update latest market report"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(dashboard_repo), "push", "origin", "main"],
+        check=True,
+    )
+    print("Pushed latest report to market-dashboard.")
 
 
 if __name__ == "__main__":

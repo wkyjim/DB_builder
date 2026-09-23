@@ -65,6 +65,19 @@ REQUIRED_SYMBOLS = frozenset(
 )
 OIL_YFINANCE_FALLBACK_SYMBOLS = frozenset({"CL=F", "BZ=F"})
 
+# Asia futures fallback: Investing.com is the primary source for HK50
+# (Hang Seng futures), KOR200c1 (KOSPI 200 futures) and CIHc1 (SSE 50
+# futures). When the provider is unavailable, yfinance cash-index
+# proxies keep the series alive with an explicit source annotation.
+# These are CASH INDEX proxies, not futures — spreads/basis vs the
+# futures contract are not comparable, but level/direction/trend are.
+ASIA_INDEX_YFINANCE_FALLBACK_MAP = {
+    "HK50": {"symbol": "^HSI", "name": "Hang Seng Index (cash proxy)"},
+    "KOR200c1": {"symbol": "^KS11", "name": "KOSPI Composite Index (cash proxy)"},
+    "CIHc1": {"symbol": "000001.SS", "name": "SSE Composite Index (cash proxy)"},
+}
+ASIA_INDEX_YFINANCE_FALLBACK_SYMBOLS = frozenset(ASIA_INDEX_YFINANCE_FALLBACK_MAP)
+
 # P1B: U.S. Treasury official par-yield fallback.
 # Canonical DB symbols map to Treasury XML BC_*YEAR elements. The Treasury
 # par-yield curve is built from the most recently auctioned 2Y/3Y/5Y/7Y/10Y/
@@ -587,7 +600,7 @@ def remove_unfinished_bars(df, symbol):
     return df[keep_mask].copy()
 
 
-def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None):
+def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None, source_label=None):
     """Return the latest incomplete daily bar as a transient live snapshot."""
     if df.empty or len(df) < 2:
         return None
@@ -613,7 +626,7 @@ def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None
     latest["market_date"] = latest.pop("date")
     latest["observed_at"] = observed_at or datetime.now(ZoneInfo("UTC"))
     latest["is_market_closed"] = False
-    latest["source"] = "yfinance"
+    latest["source"] = source_label or "yfinance"
     return latest
 
 
@@ -770,14 +783,44 @@ def _investiny_date(value):
     return pd.to_datetime(value, format="%m/%d/%Y", errors="coerce")
 
 
+# ============================================================
+# INVESTING.COM PROVIDER CIRCUIT BREAKER
+# ============================================================
+# Repeated HTTP 403 responses from Investing.com previously caused
+# 20+ minutes of per-symbol exponential backoff across 12 symbols.
+# After at most INVESTINY_CIRCUIT_BREAKER_TRIPS consecutive 403
+# responses, the provider is marked unavailable for the remainder of
+# the current cycle: no further Investing.com requests are attempted,
+# and every remaining Investing.com-routed symbol goes straight to its
+# fallback (Treasury.gov XML for UST, yfinance for oil, yfinance index
+# proxies for Asia futures). Symbols with no fallback are recorded as
+# DEGRADED in cycle metadata rather than silently dropped.
+INVESTINY_CIRCUIT_BREAKER_TRIPS = 2
+
+
+class InvestinyProviderUnavailable(RuntimeError):
+    """Raised internally when the Investing.com circuit breaker is open.
+
+    Carries the last observed 403 error text so callers can record the
+    provider-level failure reason in cycle metadata.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+def _is_investiny_403(error: BaseException) -> bool:
+    return "403" in str(error)
+
+
 def _investiny_retry_delay(error, attempt):
     """Return a longer cooldown when Investing.com throttles with HTTP 403."""
-    if "403" in str(error):
+    if _is_investiny_403(error):
         return min(60.0, 8.0 * (2 ** (attempt - 1))) + random.uniform(0.0, 3.0)
     return random.uniform(3.0, 8.0)
 
 
-def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=5):
+def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=2):
     investing_id = INVESTINY_ASSETS[symbol]
     source_symbol = INVESTING_SOURCE_SYMBOLS.get(symbol, symbol)
     target_start_date = start_date or (datetime.now().date() - timedelta(days=LOOKBACK_DAYS))
@@ -789,7 +832,7 @@ def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_ret
     print(
         f"[INVESTING.COM FETCH WINDOW] {symbol} source_symbol={source_symbol} "
         f"id={investing_id} "
-        f"fetch_start={fetch_start_date} | target_start={target_start_date} | end={fetch_end_date}"
+        f"fetch_start={from_date} | target_start={target_start_date} | end={to_date}"
     )
 
     for attempt in range(1, max_retries + 1):
@@ -826,6 +869,12 @@ def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_ret
             return df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]], target_start_date
         except Exception as e:
             print(f"[INVESTINY RETRY {attempt}/{max_retries}] {symbol}: {e}")
+            if _is_investiny_403(e):
+                # Provider-level block: trip the circuit breaker immediately
+                # instead of burning through per-symbol exponential backoff.
+                raise InvestinyProviderUnavailable(
+                    f"Investing.com provider blocked (HTTP 403) for {symbol}: {e}"
+                ) from e
             if attempt == max_retries:
                 raise
             delay = _investiny_retry_delay(e, attempt)
@@ -994,7 +1043,6 @@ def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_
     """Fetch and transform one oil symbol through the guarded yfinance fallback."""
     if symbol not in OIL_YFINANCE_FALLBACK_SYMBOLS:
         raise ValueError(f"yfinance fallback is not enabled for {symbol}")
-
     rows_fetched = 0
     latest_observation = None
     try:
@@ -1051,6 +1099,101 @@ def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_
             print(f"[YF FALLBACK ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
         else:
             print(f"[YF FALLBACK NO VALID ROWS IN TARGET WINDOW] {symbol}")
+        return rows, live_row, rows_fetched, latest_observation
+    except Exception as exc:
+        raise SymbolProcessingError(
+            f"{type(exc).__name__}: {exc}",
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+        ) from exc
+
+
+# ----------------------------------------------------------------------------
+# Asia index yfinance fallback (cash-index proxies for Investing.com futures)
+# ----------------------------------------------------------------------------
+
+
+def process_asia_index_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_at=None):
+    """Fetch one Asia futures symbol via its yfinance cash-index proxy.
+
+    HK50 -> ^HSI (Hang Seng Index), KOR200c1 -> ^KS200 (KOSPI 200),
+    CIHc1 -> 000016.SS (SSE 50). The proxy is a CASH INDEX, not a futures
+    contract: level/direction/trend are representative but basis/spread
+    versus the futures are not comparable. Rows are written under the
+    canonical DB symbol with source='yfinance (cash index proxy)'.
+    """
+    if symbol not in ASIA_INDEX_YFINANCE_FALLBACK_MAP:
+        raise ValueError(f"Asia index yfinance fallback is not enabled for {symbol}")
+
+    proxy = ASIA_INDEX_YFINANCE_FALLBACK_MAP[symbol]
+    proxy_symbol = proxy["symbol"]
+    proxy_name = proxy["name"]
+
+    rows_fetched = 0
+    latest_observation = None
+    try:
+        batch_df, target_start_date = download_recent_batch(
+            [proxy_symbol],
+            start_date=start_date,
+        )
+        symbol_df = extract_symbol_df_from_batch(batch_df, proxy_symbol)
+        rows_fetched = len(symbol_df)
+        symbol_df, rows_fetched, latest_observation = validate_fallback_observations(
+            symbol_df
+        )
+
+        # Asia sessions close before the US session, so require at least the
+        # prior completed NYSE session rather than the latest one.
+        required_latest = latest_completed_nyse_session_date(now=observed_at)
+        if latest_observation < required_latest:
+            # Allow one extra calendar day for regional holidays.
+            from datetime import timedelta as _td
+
+            if latest_observation < required_latest - _td(days=1):
+                raise ValueError(
+                    "stale Asia proxy response: "
+                    f"latest observation {latest_observation} is more than one "
+                    f"day before required {required_latest}"
+                )
+            print(
+                f"[ASIA PROXY FRESHNESS TOLERANCE] {symbol} | "
+                f"latest={latest_observation} required={required_latest} "
+                f"(regional holiday tolerance applied)"
+            )
+
+        print(
+            f"[ASIA PROXY FALLBACK] {symbol} <- {proxy_symbol} ({proxy_name}) | "
+            f"latest={latest_observation}"
+        )
+
+        live_row = extract_latest_unfinished_row(
+            df=symbol_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+            observed_at=observed_at,
+            source_label="yfinance (cash index proxy)",
+        )
+
+        finished_df = remove_unfinished_bars(symbol_df, proxy_symbol)
+        if finished_df.empty:
+            print(f"[ASIA PROXY NO FINISHED BARS] {symbol}")
+            return [], live_row, rows_fetched, latest_observation
+
+        rows = calculate_rows_for_symbol(
+            df=finished_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+        )
+        rows = filter_rows_to_target_window(
+            rows=rows,
+            target_start_date=target_start_date,
+        )
+        if rows:
+            print(f"[ASIA PROXY ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
+        else:
+            print(f"[ASIA PROXY NO VALID ROWS IN TARGET WINDOW] {symbol}")
         return rows, live_row, rows_fetched, latest_observation
     except Exception as exc:
         raise SymbolProcessingError(
@@ -1465,6 +1608,136 @@ def run_etf_flow_update_after_macro(*, start_date=None, tickers=None, dry_run=Fa
     return result
 
 
+def _process_investiny_fallback_for_symbol(
+    *,
+    symbol,
+    meta,
+    primary_failure_reason,
+    start_date=None,
+    observed_at=None,
+    outcomes,
+    all_live_rows,
+    upsert_neon=True,
+    dry_run=False,
+):
+    """Route one Investing.com-routed symbol to its fallback provider.
+
+    Fallback order (mirrors the existing per-symbol logic, now shared by the
+    circuit-breaker path):
+      - CL=F / BZ=F            -> yfinance (existing OIL fallback)
+      - US*YT=X                -> Treasury.gov par-yield XML (existing UST fallback)
+      - HK50/KOR200c1/CIHc1    -> yfinance cash-index proxy (new Asia fallback)
+      - anything else          -> recorded as failed (DEGRADED) — never silently
+                                   dropped; the outcome carries the provider
+                                   failure reason for cycle metadata.
+    """
+    fallback_fn = None
+    fallback_provider = None
+    if symbol in OIL_YFINANCE_FALLBACK_SYMBOLS:
+        fallback_fn = process_yfinance_fallback_symbol
+        fallback_provider = "yfinance"
+    elif symbol in UST_TREASURY_FALLBACK_SYMBOLS:
+        fallback_fn = process_treasury_fallback_symbol
+        fallback_provider = "treasury.gov"
+    elif symbol in ASIA_INDEX_YFINANCE_FALLBACK_SYMBOLS:
+        fallback_fn = process_asia_index_yfinance_fallback_symbol
+        fallback_provider = "yfinance (cash index proxy)"
+
+    if fallback_fn is None:
+        print(
+            f"[INVESTINY FALLBACK NONE] {symbol} | no fallback configured; "
+            f"recording as DEGRADED | primary_failure={primary_failure_reason}"
+        )
+        outcomes[symbol] = SymbolFetchOutcome(
+            symbol=symbol,
+            name=meta["name"],
+            provider="investing.com",
+            required=symbol in REQUIRED_SYMBOLS,
+            success=False,
+            rows_fetched=0,
+            latest_observation=None,
+            failure_reason=(
+                f"primary investing.com: {primary_failure_reason}; "
+                f"no fallback source configured"
+            ),
+            primary_provider="investing.com",
+            primary_failure_reason=primary_failure_reason,
+        )
+        return False
+
+    print(
+        f"[INVESTINY FALLBACK ATTEMPT] {symbol} -> {fallback_provider} | "
+        f"primary_failure={primary_failure_reason}"
+    )
+    try:
+        rows, live_row, rows_fetched, latest_observation = fallback_fn(
+            symbol,
+            meta,
+            start_date=start_date,
+            observed_at=observed_at,
+        )
+    except Exception as fallback_error:
+        print(f"[INVESTINY FALLBACK ERROR] {symbol}: {fallback_error}")
+        rows_fetched = getattr(fallback_error, "rows_fetched", 0)
+        latest_observation = getattr(fallback_error, "latest_observation", None)
+        fallback_failure_reason = (
+            str(fallback_error)
+            if isinstance(fallback_error, SymbolProcessingError)
+            else f"{type(fallback_error).__name__}: {fallback_error}"
+        )
+        outcomes[symbol] = SymbolFetchOutcome(
+            symbol=symbol,
+            name=meta["name"],
+            provider="investing.com",
+            required=symbol in REQUIRED_SYMBOLS,
+            success=False,
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+            failure_reason=(
+                f"primary investing.com: {primary_failure_reason}; "
+                f"fallback {fallback_provider}: {fallback_failure_reason}"
+            ),
+            primary_provider="investing.com",
+            primary_failure_reason=primary_failure_reason,
+            fallback_provider=fallback_provider,
+            fallback_failure_reason=fallback_failure_reason,
+        )
+        return False
+
+    if live_row:
+        all_live_rows.append(live_row)
+        print(
+            f"[INVESTINY FALLBACK LIVE SNAPSHOT] {symbol} | "
+            f"market_date={live_row.get('market_date')} close={live_row.get('close')} "
+            f"source={live_row.get('source')}"
+        )
+    # Keep database errors fatal, as in both primary provider paths.
+    upsert_new_macro_rows(
+        rows,
+        [symbol],
+        upsert_neon=upsert_neon,
+        dry_run=dry_run,
+        provider_label=f"{fallback_provider.upper()} FALLBACK",
+    )
+    outcomes[symbol] = SymbolFetchOutcome(
+        symbol=symbol,
+        name=meta["name"],
+        provider=fallback_provider,
+        required=symbol in REQUIRED_SYMBOLS,
+        success=True,
+        rows_fetched=rows_fetched,
+        latest_observation=latest_observation,
+        primary_provider="investing.com",
+        primary_failure_reason=primary_failure_reason,
+        fallback_provider=fallback_provider,
+    )
+    print(
+        f"[INVESTINY FALLBACK OK] {symbol} | provider={fallback_provider} | "
+        f"latest_observation={latest_observation}"
+    )
+    return True
+
+
 def run_daily_update(
     symbol_filter=None,
     start_date=None,
@@ -1659,10 +1932,45 @@ def run_daily_update(
 
         time.sleep(random.uniform(1.0, 3.0))
 
+    investiny_provider_unavailable = False
+    investiny_403_streak = 0
+    investiny_provider_failure_reason = None
     if investiny_symbols:
         print(f"\n[INVESTING.COM SYMBOLS] {investiny_symbols}")
     for symbol in investiny_symbols:
         meta = asset_map[symbol]
+
+        # ------------------------------------------------------------------
+        # Provider circuit breaker: once Investing.com is marked unavailable
+        # for this cycle, do NOT attempt further provider requests. Route
+        # every remaining symbol directly to its fallback (or DEGRADED).
+        # ------------------------------------------------------------------
+        if investiny_provider_unavailable:
+            print(
+                f"[INVESTINY CIRCUIT BREAKER OPEN] {symbol} | "
+                f"skipping Investing.com; routing to fallback | "
+                f"provider_failure={investiny_provider_failure_reason}"
+            )
+            rows = live_row = None
+            rows_fetched = 0
+            latest_observation = None
+            primary_failure_reason = (
+                f"investing.com provider unavailable (circuit breaker): "
+                f"{investiny_provider_failure_reason}"
+            )
+            _process_investiny_fallback_for_symbol(
+                symbol=symbol,
+                meta=meta,
+                primary_failure_reason=primary_failure_reason,
+                start_date=start_date,
+                observed_at=observed_at,
+                outcomes=outcomes,
+                all_live_rows=all_live_rows,
+                upsert_neon=upsert_neon,
+                dry_run=dry_run,
+            )
+            continue
+
         try:
             print(f"[PROCESS INVESTING.COM] {symbol}")
             rows, live_row, rows_fetched, latest_observation = process_investiny_symbol(
@@ -1671,6 +1979,41 @@ def run_daily_update(
                 start_date=start_date,
                 observed_at=observed_at,
             )
+            investiny_403_streak = 0
+        except InvestinyProviderUnavailable as e:
+            # Provider-level 403: count the trip, and open the breaker once
+            # the configured number of consecutive trips is reached.
+            investiny_403_streak += 1
+            print(
+                f"[INVESTINY 403 STREAK] {investiny_403_streak}/"
+                f"{INVESTINY_CIRCUIT_BREAKER_TRIPS} | {symbol}: {e}"
+            )
+            if investiny_403_streak >= INVESTINY_CIRCUIT_BREAKER_TRIPS:
+                investiny_provider_unavailable = True
+                investiny_provider_failure_reason = str(e)
+                print(
+                    "[INVESTINY CIRCUIT BREAKER TRIPPED] "
+                    "Investing.com marked unavailable for the remainder of this "
+                    "cycle; all remaining Investing.com symbols route to fallbacks."
+                )
+            rows = live_row = None
+            rows_fetched = 0
+            latest_observation = None
+            primary_failure_reason = (
+                f"investing.com provider blocked (HTTP 403): {e}"
+            )
+            _process_investiny_fallback_for_symbol(
+                symbol=symbol,
+                meta=meta,
+                primary_failure_reason=primary_failure_reason,
+                start_date=start_date,
+                observed_at=observed_at,
+                outcomes=outcomes,
+                all_live_rows=all_live_rows,
+                upsert_neon=upsert_neon,
+                dry_run=dry_run,
+            )
+            continue
         except Exception as e:
             print(f"[INVESTINY PROCESS ERROR] {symbol}: {e}")
             rows_fetched = getattr(e, "rows_fetched", 0)

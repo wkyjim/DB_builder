@@ -10,11 +10,39 @@ from db_builder.news_classifier import (
     ClassificationError,
     classify_with_ollama,
     ollama_model,
+    ollama_url,
     persist_classification,
     record_classification_failure,
     reset_new_for_premium_sources,
     select_articles_for_classification,
 )
+
+
+def ollama_available(timeout_seconds: float = 3.0) -> bool:
+    """Quick availability probe of the configured Ollama service.
+
+    Performs a cheap GET against the Ollama base URL (stripping the
+    /api/chat path) with a short timeout. Used as a circuit breaker so an
+    offline local classifier does not burn minutes of per-article retries:
+    when this returns False, news_classify exits cleanly and the caller
+    marks the news_classify source DEGRADED for the cycle.
+    """
+    import os
+    from urllib.parse import urlsplit
+
+    import requests as _requests
+
+    url = ollama_url()
+    parts = urlsplit(url)
+    base = f"{parts.scheme}://{parts.netloc}"
+    probe_path = os.getenv("OLLAMA_PROBE_PATH", "/api/tags")
+    try:
+        response = _requests.get(base + probe_path, timeout=timeout_seconds)
+        # Any HTTP response (even 404 on odd builds) proves the service is
+        # listening; connection errors are the unavailability signal.
+        return True
+    except Exception:
+        return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +145,23 @@ def classify_articles(
 def main() -> None:
     args = parse_args()
     dry_run = args.dry_run or not args.upsert_local
+
+    # ------------------------------------------------------------------
+    # Ollama availability circuit breaker: probe the configured service
+    # BEFORE selecting articles. When the local classifier is offline,
+    # exit with code 75 (EX_TEMPFAIL-like) so the hourly orchestrator
+    # can mark news_classify DEGRADED and continue with raw news —
+    # instead of spending minutes in per-article connection retries.
+    # ------------------------------------------------------------------
+    if not ollama_available():
+        print(
+            "[OLLAMA UNAVAILABLE] Ollama service not reachable at "
+            f"{ollama_url()}; skipping classification this cycle. "
+            "Caller should mark news_classify as DEGRADED and continue "
+            "with fetched raw news."
+        )
+        raise SystemExit(75)
+
     engine = local_engine()
     if args.reset_new_for_premium:
         if args.source_priority_min is None:
