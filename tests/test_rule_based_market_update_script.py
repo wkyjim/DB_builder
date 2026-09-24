@@ -1,14 +1,74 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT))
 
 from scripts.rule_based_market_update import publish_to_dashboard
+
+
+def test_build_cycle_metadata_block_localizes_utc_to_hkt():
+    """Regression: a UTC-generated_at must render as HKT (UTC+8), not UTC.
+
+    The 20:05 UTC → 04:05 HKT (next day) offset is the exact skew that
+    produced the '12:05 HKT' bug in production.
+    """
+    from scripts.rule_based_market_update import build_cycle_metadata_block
+
+    utc = datetime(2026, 9, 24, 20, 5, 31, tzinfo=timezone.utc)
+    block = build_cycle_metadata_block("20260924_2000_HKT", None, utc)
+
+    # HKT is UTC+8 → 20:05:31 UTC = 04:05:31 HKT on 25 September
+    assert "Cycle ID: 20260924_2000_HKT" in block
+    assert "25 September 2026, 04:05:31 (HKT)" in block
+    assert "12:05" not in block  # the old bug
+
+
+def test_build_cycle_metadata_block_naive_utc():
+    """A naive (tz-unaware) datetime is assumed UTC and localized to HKT."""
+    from scripts.rule_based_market_update import build_cycle_metadata_block
+
+    naive_utc = datetime(2026, 9, 24, 12, 5, 31)  # naive, represents UTC
+    block = build_cycle_metadata_block("C", None, naive_utc)
+
+    # 12:05 UTC → 20:05 HKT
+    assert "24 September 2026, 20:05:31 (HKT)" in block
+
+
+def test_build_cycle_metadata_block_hkt_passthrough():
+    """An already-HKT datetime must be preserved (no double conversion)."""
+    from scripts.rule_based_market_update import build_cycle_metadata_block
+
+    hkt = ZoneInfo("Asia/Hong_Kong")
+    already_hkt = datetime(2026, 9, 24, 20, 5, 31, tzinfo=hkt)
+    block = build_cycle_metadata_block("C", None, already_hkt)
+
+    assert "24 September 2026, 20:05:31 (HKT)" in block
+
+
+def test_build_cycle_metadata_block_source_meta():
+    from scripts.rule_based_market_update import build_cycle_metadata_block
+
+    utc = datetime(2026, 9, 24, 20, 5, 31, tzinfo=timezone.utc)
+    meta = {
+        "data_refresh_completed_at": "2026-09-24T15:00:00+08:00",
+        "sources": {
+            "us_equities": {"observation_date": "2026-09-23"},
+            "news_classify": {"observation_date": None},
+        },
+        "degraded_sources": ["news_classify"],
+    }
+    block = build_cycle_metadata_block("20260924_2000_HKT", meta, utc)
+
+    assert "Data refresh completed at: 2026-09-24T15:00:00+08:00" in block
+    assert "Equity data through: 2026-09-23" in block
+    assert "Degraded sources: news_classify" in block
 
 
 def test_publish_to_dashboard_copies_latest_report(tmp_path: Path):
