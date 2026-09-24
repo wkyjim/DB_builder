@@ -346,6 +346,7 @@ def test_gate_blocks_not_report_ready(tmp_path):
 
 def test_build_cycle_metadata_block():
     import re
+    from datetime import datetime, timezone
 
     src = (PROJECT_ROOT / "scripts" / "rule_based_market_update.py").read_text(encoding="utf-8")
     m = re.search(r"def build_cycle_metadata_block.*?(?=\ndef )", src, re.DOTALL)
@@ -353,7 +354,7 @@ def test_build_cycle_metadata_block():
     exec("from datetime import datetime\n" + m.group(0), ns)
     build = ns["build_cycle_metadata_block"]
 
-    gen = datetime(2026, 9, 23, 8, 13, 40)
+    gen = datetime(2026, 9, 23, 8, 13, 40, tzinfo=timezone.utc)  # == 16:13:40 HKT
     meta = {
         "data_refresh_completed_at": "2026-09-23T08:13:05+08:00",
         "sources": {
@@ -366,7 +367,7 @@ def test_build_cycle_metadata_block():
     block = build("20260923_0800_HKT", meta, gen)
 
     assert "- Cycle ID: 20260923_0800_HKT" in block
-    assert "- Report generated at: 23 September 2026, 08:13:40 (HKT)" in block
+    assert "- Report generated at: 23 September 2026, 16:13:40 (HKT)" in block
     assert "- Data refresh completed at: 2026-09-23T08:13:05+08:00" in block
     assert "- Equity data through: 2026-09-22" in block
     assert "- Rates data through: 2026-09-22" in block
@@ -378,6 +379,38 @@ def test_build_cycle_metadata_block():
     assert "Cycle Metadata" in minimal
     assert "Report generated at" in minimal
     assert "Degraded sources" not in minimal
+
+
+def test_build_cycle_metadata_block_converts_utc_to_hkt():
+    """Regression: generated_at is UTC (from collect_rule_based_inputs) and MUST
+    be rendered as HKT — previously the block printed raw UTC with an HKT
+    label (20:05 HKT header vs 12:05 'HKT' metadata, an 8-hour skew)."""
+    import re
+    from datetime import datetime, timezone
+
+    src = (PROJECT_ROOT / "scripts" / "rule_based_market_update.py").read_text(encoding="utf-8")
+    m = re.search(r"def build_cycle_metadata_block.*?(?=\ndef )", src, re.DOTALL)
+    ns = {}
+    exec("from datetime import datetime\n" + m.group(0), ns)
+    build = ns["build_cycle_metadata_block"]
+
+    # 2026-09-24 12:05:31 UTC == 2026-09-24 20:05:31 HKT
+    gen_utc = datetime(2026, 9, 24, 12, 5, 31, tzinfo=timezone.utc)
+    block = build("20260924_2000_HKT", None, gen_utc)
+    assert "- Report generated at: 24 September 2026, 20:05:31 (HKT)" in block, block
+    assert "12:05:31" not in block  # raw UTC must NOT leak through
+
+    # tz-aware non-UTC input also localizes correctly
+    from zoneinfo import ZoneInfo
+
+    gen_ny = datetime(2026, 9, 24, 8, 5, 31, tzinfo=ZoneInfo("America/New_York"))
+    block_ny = build(None, None, gen_ny)
+    assert "- Report generated at: 24 September 2026, 20:05:31 (HKT)" in block_ny, block_ny
+
+    # naive input is treated as UTC (legacy caller behavior)
+    gen_naive = datetime(2026, 9, 24, 12, 5, 31)
+    block_naive = build(None, None, gen_naive)
+    assert "- Report generated at: 24 September 2026, 20:05:31 (HKT)" in block_naive, block_naive
 
 
 # ---------------------------------------------------------------------------

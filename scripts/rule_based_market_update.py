@@ -63,11 +63,27 @@ def build_cycle_metadata_block(cycle_id: str | None, source_meta: dict | None, g
     Preserves every existing report section — this block is ADDITIVE. All
     execution timestamps are HKT. observation_date (what the data is current
     through) is distinguished from retrieved_at (when we checked it).
+
+    generated_at may be timezone-naive UTC (legacy) or tz-aware; it is
+    localized to Asia/Hong_Kong before formatting so the metadata block
+    matches the report header's HKT timestamp exactly.
     """
+    from datetime import timezone as _timezone
+    from zoneinfo import ZoneInfo
+
+    if generated_at is None:
+        from datetime import datetime as _datetime
+
+        generated_at = _datetime.now(_timezone.utc)
+    if generated_at.tzinfo is None:
+        # Legacy callers pass naive UTC timestamps.
+        generated_at = generated_at.replace(tzinfo=_timezone.utc)
+    generated_at_hkt = generated_at.astimezone(ZoneInfo("Asia/Hong_Kong"))
+
     lines = ["", "## Cycle Metadata", ""]
     if cycle_id:
         lines.append(f"- Cycle ID: {cycle_id}")
-    lines.append(f"- Report generated at: {generated_at:%d %B %Y, %H:%M:%S} (HKT)")
+    lines.append(f"- Report generated at: {generated_at_hkt:%d %B %Y, %H:%M:%S} (HKT)")
     if source_meta:
         refresh_completed = source_meta.get("data_refresh_completed_at")
         if refresh_completed:
