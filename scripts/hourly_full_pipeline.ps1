@@ -42,7 +42,6 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
-call "C:\Users\User\anaconda3\Scripts\activate.bat" 2>$null
 $Root = $PSScriptRoot | Split-Path -Parent
 $Python = 'C:\Users\User\anaconda3\envs\PostgreSQL_db\python.exe'
 $LogDir = Join-Path $Root 'logs'
@@ -139,14 +138,21 @@ try {
     $BranchJobs = @()
 
     # Branch A: equities + indicators (us_equities, us_equities_indicators)
+    # pgSQL_equities_auto has no --local-only flag; Eastmoney flaps, so it gets
+    # 3 attempts with 60s gaps (mirrors the proven host .bat retry pattern).
     $BranchJobs += Start-Job -Name 'BranchA_Equities' -ScriptBlock {
         param($Root, $Python, $Log, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $r1 = & $Python (Join-Path $Root 'scripts\pgSQL_equities_auto.py') --local-only 2>&1
-        $r2 = & $Python (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') --local-only 2>&1
-        $r3 = & $Python (Join-Path $Root 'scripts\indicator_staged_backfill.py') --local-only 2>&1
+        $eqOk = $false
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            & $Python (Join-Path $Root 'scripts\pgSQL_equities_auto.py') 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $eqOk = $true; break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 60 }
+        }
+        $r2 = & $Python (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') 2>&1
+        $r3 = & $Python (Join-Path $Root 'scripts\indicator_staged_backfill.py') --stage all 2>&1
         $sw.Stop()
-        @{ Branch='A_equities'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 + $r3 | Out-String) }
+        @{ Branch='A_equities'; Ok=($eqOk -and $LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r2 + $r3 | Out-String) }
     } -ArgumentList $Root, $Python, $Log, $DryRun
 
     # Branch B: macro markets (macro, macro_live) — includes ETF flow refresh

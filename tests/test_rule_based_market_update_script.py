@@ -102,3 +102,23 @@ def test_publish_to_dashboard_syncs_before_automated_commit(tmp_path: Path, monk
     assert calls[1] == (["git", "-C", str(dashboard), "merge", "--ff-only", "origin/main"], True)
     assert calls[2] == (["git", "-C", str(dashboard), "add", "data/latest-report.md"], True)
     assert calls[3] == (["git", "-C", str(dashboard), "diff", "--cached", "--quiet"], False)
+
+def test_hourly_pipeline_ps1_no_cmd_call_activate():
+    """Regression: the PowerShell orchestrator must never contain CMD-only
+    'call ...activate.bat' syntax. 'call' is a cmd.exe built-in that is
+    invalid in PowerShell and caused a dry-run failure at line 45.
+
+    The fix: replace 'call ...activate.bat' with an explicit $PythonExe
+    variable (C:\\Users\\User\\anaconda3\\envs\\PostgreSQL_db\\python.exe).
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # Must not contain the CMD-only 'call ...activate.bat' construct
+    assert 'call "C:\\Users\\User\\anaconda3\\Scripts\\activate.bat"' not in content
+    # More generally, 'call' as a standalone command should not appear
+    import re
+    # Match 'call' as a word at the start of a line (PowerShell CMD syntax)
+    cmd_call_pattern = re.compile(r'^\s*call\s', re.MULTILINE)
+    assert not cmd_call_pattern.search(content), "CMD-only 'call' command found in .ps1 file"
+
