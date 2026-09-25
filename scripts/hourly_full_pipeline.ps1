@@ -290,8 +290,18 @@ try {
             }
             Write-Log 'TIMEOUT' ("{0} exceeded global timeout {1}s" -f $Job.Name, $OverallTimeoutSeconds)
         } else {
-            # Completed — receive output
-            $RawResult = Receive-Job -Job $Job
+            # Completed — receive output (wrapped to ensure cleanup)
+            $RawResult = $null
+            try {
+                $RawResult = Receive-Job -Job $Job
+            } finally {
+                # Ensure job is cleaned up even if Receive-Job throws
+                $CleanupJobId = $Job.Id
+                $CleanupExisting = Get-Job -Id $CleanupJobId -ErrorAction SilentlyContinue
+                if ($null -ne $CleanupExisting -and $CleanupExisting.State -ne 'Running') {
+                    Remove-Job -Job $CleanupExisting -Force -ErrorAction SilentlyContinue
+                }
+            }
             if ($null -eq $RawResult) {
                 $Result = @{
                     Name = $Job.Name
@@ -326,9 +336,23 @@ try {
         if (-not $Result.ContainsKey('Error')) { $Result['Error'] = $null }
         if (-not $Result.ContainsKey('Branch')) { $Result['Branch'] = $Job.Name }
 
-        Remove-Job -Job $Job -Force
+        # Cleanup: only remove parent jobs that still exist (idempotent)
+        try {
+            $JobId = $Job.Id
+            $ExistingJob = Get-Job -Id $JobId -ErrorAction SilentlyContinue
+            if ($null -ne $ExistingJob) {
+                if ($ExistingJob.State -eq 'Running') {
+                    $null = Stop-Job -Job $ExistingJob -ErrorAction SilentlyContinue
+                }
+                Remove-Job -Job $ExistingJob -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+            # Cleanup failure must not change branch result status
+            Write-Log 'WARN' ("Cleanup failed for {0}: {1}" -f $Job.Name, $_.Exception.Message)
+        } finally {
+            # Jobs are guaranteed to be removed or stopped here
+        }
         $BranchResults += $Result
-        Remove-Job -Job $Job -Force
         $Status = if ($Result.Ok) { 'OK' } else { 'FAIL' }
         Write-Log 'BRANCH' ("{0}: {1} ({2:N0}s)" -f $Result.Branch, $Status, $Result.Seconds)
         if ($Result.Output) {

@@ -244,3 +244,30 @@ def test_hourly_pipeline_ps1_measure_object_defensive():
     assert "Measure-Object -Property Seconds -Maximum" in content, "Measure-Object not found"
     assert "$BranchResults.Count" in content, "Empty collection guard not found"
 
+
+def test_hourly_pipeline_ps1_job_cleanup_idempotent():
+    """Regression: job cleanup must be idempotent and use parent job IDs.
+
+    Root cause: Remove-Job -Job $Job was called twice per iteration,
+    and $Job was sometimes a child job rather than the parent.
+
+    Fix: all cleanup uses Get-Job -Id $Job.Id to get the live parent job,
+    handles already-removed jobs gracefully, and is wrapped in try/catch
+    so cleanup failures do not change branch result status.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # No bare Remove-Job with $Job directly
+    # All cleanup must go through Get-Job -Id
+    assert "Get-Job -Id" in content and "$Job.Id" in content, "Idempotent Get-Job lookup not found"
+    assert "Remove-Job -Job $Job -Force" not in content, "Direct Remove-Job -Job $Job still present"
+
+    # Try/catch around cleanup must exist
+    assert "try {" in content, "try block not found"
+    assert "} catch {" in content, "catch block not found"
+    assert "Cleanup failure must not change branch result status" in content, "Cleanup error handling comment not found"
+
+    # Stop-Job should use -ErrorAction SilentlyContinue for idempotency
+    assert "Stop-Job -Job" in content, "Stop-Job not found"
+    assert "ErrorAction SilentlyContinue" in content, "ErrorAction SilentlyContinue not found"
