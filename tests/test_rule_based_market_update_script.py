@@ -195,3 +195,52 @@ def test_hourly_pipeline_ps1_no_datetime_subtraction_hazard():
     hazards = hazard_pattern.findall(content)
     assert not hazards, f"DateTime subtraction hazard found: {hazards}. Use Stopwatch or (Get-Date) - $var instead."
 
+
+
+def test_hourly_pipeline_ps1_dryrun_result_schema_has_seconds():
+    """Regression: every branch return must have ExitCode and Error so that
+    Measure-Object -Property Seconds -Maximum does not crash on missing
+    properties, and every result has Seconds.
+
+    Root cause: DryRun branches returned @{ Branch, Ok, Seconds, Output }
+    without ExitCode/Error; and Receive-Job could return objects without
+    Seconds if the scriptblock threw an exception.
+
+    Fix: all branch returns now include ExitCode and Error; the join
+    block normalizes every result to have Name, Status, Seconds,
+    ExitCode, Error, Branch, Ok.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # Every branch definition must have ExitCode, Error, and Seconds
+    # Check the file line-by-line for branch result definitions
+    lines = content.split('\n')
+    branch_def_lines = [l.strip() for l in lines if '@{' in l and 'Branch=' in l]
+    assert len(branch_def_lines) >= 5, f"Expected at least 5 branch definitions, found {len(branch_def_lines)}"
+    for line in branch_def_lines:
+        assert 'ExitCode=' in line, f"Branch result missing ExitCode: {line[:120]}"
+        assert 'Error=' in line, f"Branch result missing Error: {line[:120]}"
+        assert 'Seconds=' in line, f"Branch result missing Seconds: {line[:120]}"
+
+    # Normalization block must exist
+    assert "ContainsKey('Seconds')" in content, "Normalization for Seconds not found"
+    assert "ContainsKey('ExitCode')" in content, "Normalization for ExitCode not found"
+    assert "ContainsKey('Error')" in content, "Normalization for Error not found"
+    assert "ContainsKey('Name')" in content, "Normalization for Name not found"
+
+    # Normalization block must exist
+    assert "ContainsKey('Seconds')" in content, "Normalization for Seconds not found"
+    assert "ContainsKey('ExitCode')" in content, "Normalization for ExitCode not found"
+    assert "ContainsKey('Error')" in content, "Normalization for Error not found"
+
+
+def test_hourly_pipeline_ps1_measure_object_defensive():
+    """Regression: Measure-Object must handle empty branch-result collection
+    and missing Seconds fields without crashing."""
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert "Measure-Object -Property Seconds -Maximum" in content, "Measure-Object not found"
+    assert "$BranchResults.Count" in content, "Empty collection guard not found"
+
