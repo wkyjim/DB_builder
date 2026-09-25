@@ -49,6 +49,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $StateDir = Join-Path $Root 'reports\state'
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Log = Join-Path $LogDir ("hourly_pipeline_" + $Stamp + ".log")
 
@@ -454,7 +455,7 @@ try {
     if ($MacroPartial) { $SourceMeta.degraded_sources += 'macro_partial_coverage' }
 
     # Persist source meta for the report generator
-    $SourceMeta | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $SourceMetaFile -Encoding UTF8
+    $SourceMeta | ConvertTo-Json -Depth 5 | ForEach-Object { [System.IO.File]::WriteAllText($SourceMetaFile, $_, $Utf8NoBom) }
     Write-Log 'STATE' "Source metadata written: $SourceMetaFile"
 
     # -----------------------------------------------------------------------
@@ -478,7 +479,7 @@ try {
             latest_report = @{ generated_at = $null; path = $null; sha256 = $null; cycle_id = $CycleId }
             git = @{ commit = $null; pushed = $false; head_equals_origin = $null; error = $null }
         }
-        $FailState | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateJson -Encoding UTF8
+        $FailState | ConvertTo-Json -Depth 5 | ForEach-Object { [System.IO.File]::WriteAllText($StateJson, $_, $Utf8NoBom) }
         exit 1
     }
 
@@ -511,7 +512,7 @@ try {
             latest_report = @{ generated_at = $null; path = $null; sha256 = $null; cycle_id = $CycleId }
             git = @{ commit = $null; pushed = $false; head_equals_origin = $null; error = $null }
         }
-        $FailState | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $StateJson -Encoding UTF8
+        $FailState | ConvertTo-Json -Depth 5 | ForEach-Object { [System.IO.File]::WriteAllText($StateJson, $_, $Utf8NoBom) }
         exit 1
     }
 
@@ -581,7 +582,7 @@ try {
             error = $GitError
         }
     }
-    $FinalState | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StateJson -Encoding UTF8
+    $FinalState | ConvertTo-Json -Depth 6 | ForEach-Object { [System.IO.File]::WriteAllText($StateJson, $_, $Utf8NoBom) }
     Write-Log 'STATE' "Final state written: $StateJson (REPORT_READY / $PubStatus)"
 
     $TotalMin = [math]::Round(((Get-Date) - $CycleStart).TotalMinutes, 1)

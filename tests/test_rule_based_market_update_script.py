@@ -359,3 +359,45 @@ def test_hourly_pipeline_ps1_fail_block_logs_stderr():
     assert "Report generation failed - ExitCode" in content, "ExitCode not logged"
     assert "STDERR" in content and "Python stderr" in content, "Stderr logging not found"
     assert "STDOUT" in content and "Python stdout" in content, "Stdout tail logging not found"
+
+def test_hourly_pipeline_ps1_json_writes_bom_free():
+    """Regression: PowerShell must write JSON files without UTF-8 BOM.
+
+    Windows PowerShell 5.1 Set-Content -Encoding UTF8 emits EF BB BF BOM bytes.
+    Python json.loads() rejects BOM-prefixed files.
+    The orchestrator must use .NET WriteAllText with UTF8Encoding($false).
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # No Set-Content -Encoding UTF8 should remain
+    assert "Set-Content" not in content or "-Encoding UTF8" not in content, \
+        "BOM-producing Set-Content -Encoding UTF8 still present"
+
+    # UTF8NoBom helper must be defined
+    assert "$Utf8NoBom = New-Object System.Text.UTF8Encoding" in content, \
+        "UTF8NoBom definition not found"
+
+    # All JSON writes must use WriteAllText
+    assert "WriteAllText" in content, "WriteAllText not found"
+
+
+def test_python_source_meta_reader_utf8_sig():
+    """Regression: --source-meta-json must be read with utf-8-sig
+    to accept both BOM and non-BOM UTF-8 files safely.
+    """
+    rmp_path = Path(__file__).resolve().parents[1] / "scripts" / "rule_based_market_update.py"
+    content = rmp_path.read_text(encoding="utf-8")
+
+    assert "encoding=\"utf-8-sig\"" in content, "utf-8-sig reader not found"
+
+
+def test_json_file_no_bom_bytes():
+    """Regression: existing state JSON files must not have BOM bytes EF BB BF."""
+    for fname in ["reports/state/cycle_20260926_0130_HKT_sources.json",
+                  "reports/state/latest_report_status.json"]:
+        fpath = Path(__file__).resolve().parents[1] / fname
+        if fpath.exists():
+            with open(fpath, "rb") as f:
+                first3 = f.read(3)
+            assert first3 != b"\\xef\\xbb\\xbf", f"BOM found in {fname}"

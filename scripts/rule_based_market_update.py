@@ -206,12 +206,12 @@ def main() -> None:
     if args.source_meta_json and args.source_meta_json.is_file():
         import json
 
-        source_meta = json.loads(args.source_meta_json.read_text(encoding="utf-8"))
+        source_meta = json.loads(args.source_meta_json.read_text(encoding="utf-8-sig"))
     markdown = markdown + build_cycle_metadata_block(args.cycle_id, source_meta, generated_at)
 
     if args.json_output:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
-        args.json_output.write_text(scores_to_json(scores), encoding="utf-8")
+        args.json_output.write_text(scores_to_json(scores), encoding="utf-8-sig")
     if args.save:
         path = save_rule_based_report(markdown, generated_at=generated_at)
         print(f"Saved rule-based market update report: {path}")
