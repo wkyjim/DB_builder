@@ -274,3 +274,64 @@ def test_hourly_pipeline_ps1_job_cleanup_idempotent():
     # Stop-Job should use -ErrorAction SilentlyContinue for idempotency
     assert "Stop-Job -Job" in content, "Stop-Job not found"
     assert "ErrorAction SilentlyContinue" in content, "ErrorAction SilentlyContinue not found"
+
+def test_hourly_pipeline_ps1_no_inline_if_in_object_literals():
+    """Regression: PowerShell 5.1 does not support inline if expressions
+    inside [pscustomobject] or @{ } literals.
+
+    All conditional values must be computed as standalone statements
+    before the object is constructed.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # Check for [double](if, [int](if, [bool](if, [string](if patterns
+    for pattern in ['[double](if', '[int](if', '[bool](if', '[string](if']:
+        assert pattern not in content, f"Invalid inline-cast-if pattern found: {pattern}"
+
+    # Check no "= if (" inside object literal lines
+    for line in content.split("\n"):
+        stripped = line.strip()
+        # Object literal lines should not have inline if
+        if ('@{' in stripped or 'pscustomobject]@{' in stripped) and '= if (' in stripped:
+            assert False, f"Inline if found in object literal: {stripped[:120]}"
+
+    # Verify pre-computed variable pattern exists
+    assert "$NormalizedSeconds" in content, "Pre-computed $NormalizedSeconds not found"
+    assert "$NormalizedExitCode" in content, "Pre-computed $NormalizedExitCode not found"
+    assert "$NormalizedOk" in content, "Pre-computed $NormalizedOk not found"
+    assert "$NormalizedName" in content, "Pre-computed $NormalizedName not found"
+
+
+def test_hourly_pipeline_ps1_pscustomobject_schema_complete():
+    """Regression: every [pscustomobject] result must have all 7 required properties.
+    After normalization, Measure-Object -Property Seconds -Maximum must succeed."""
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # All [pscustomobject]@{} blocks must have Seconds, ExitCode, Error, Branch, Ok
+    # (Branch returns use "Branch=" not "Name="; normalization block adds Name/Status)
+    pscustom_blocks = [l for l in content.split("\n") if 'pscustomobject]@{' in l]
+    assert len(pscustom_blocks) >= 11, f"Expected >= 11 [pscustomobject]@{{}} definitions, found {len(pscustom_blocks)}"
+
+    # Check normalization block has all 7 property assignments
+    assert "$NormalizedName" in content, "Normalization missing $NormalizedName"
+    assert "$NormalizedStatus" in content, "Normalization missing $NormalizedStatus"
+    assert "$NormalizedSeconds" in content, "Normalization missing $NormalizedSeconds"
+    assert "$NormalizedExitCode" in content, "Normalization missing $NormalizedExitCode"
+    assert "$NormalizedError" in content, "Normalization missing $NormalizedError"
+    assert "$NormalizedBranch" in content, "Normalization missing $NormalizedBranch"
+    assert "$NormalizedOk" in content, "Normalization missing $NormalizedOk"
+    assert "Measure-Object -Property Seconds -Maximum" in content, "Measure-Object not found"
+
+    # Normalization block must have all 7 properties
+    assert "Name     = $NormalizedName" in content, "Normalization block missing Name"
+    assert "Status   = $NormalizedStatus" in content, "Normalization block missing Status"
+    assert "Seconds  = $NormalizedSeconds" in content, "Normalization block missing Seconds"
+    assert "ExitCode = $NormalizedExitCode" in content, "Normalization block missing ExitCode"
+    assert "Error    = $NormalizedError" in content, "Normalization block missing Error"
+    assert "Branch   = $NormalizedBranch" in content, "Normalization block missing Branch"
+    assert "Ok       = $NormalizedOk" in content, "Normalization block missing Ok"
+
+    # Measure-Object must work
+    assert "Measure-Object -Property Seconds -Maximum" in content, "Measure-Object not found"

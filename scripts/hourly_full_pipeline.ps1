@@ -314,20 +314,47 @@ try {
                     Ok = [bool]$false
                 }
             } else {
-                # Normalize: ensure all required fields exist
-                # Cast Receive-Job output to [pscustomobject] if needed
+                # Normalize: compute all values BEFORE constructing [pscustomobject]
+                # PowerShell 5.1 does not support inline if expressions inside object literals
                 if ($RawResult -isnot [pscustomobject]) {
                     $RawResult = [pscustomobject]$RawResult
                 }
+
+                # Pre-compute normalized values
+                $NormalizedName = [string]$RawResult.Branch
+                $NormalizedStatus = if ($RawResult.Ok) { 'OK' } else { 'FAILED' }
+                $NormalizedSeconds = [double]0
+                if ($null -ne $RawResult -and
+                    $RawResult.PSObject.Properties.Name -contains 'Seconds' -and
+                    $null -ne $RawResult.Seconds) {
+                    $NormalizedSeconds = [double]$RawResult.Seconds
+                }
+                $NormalizedExitCode = [int]0
+                if ($null -ne $RawResult -and
+                    $RawResult.PSObject.Properties.Name -contains 'ExitCode' -and
+                    $null -ne $RawResult.ExitCode) {
+                    $NormalizedExitCode = [int]$RawResult.ExitCode
+                }
+                $NormalizedError = if ($JobError) { $JobError } else { $null }
+                if ($null -eq $NormalizedError -and
+                    $RawResult.PSObject.Properties.Name -contains 'Error' -and
+                    $null -ne $RawResult.Error) {
+                    $NormalizedError = $RawResult.Error
+                }
+                $NormalizedBranch = [string]$RawResult.Branch
+                $NormalizedOk = [bool]$false
+                if ($RawResult.PSObject.Properties.Name -contains 'Ok') {
+                    $NormalizedOk = [bool]$RawResult.Ok
+                }
+
                 $Result = [pscustomobject]@{
-                    Name = $RawResult.Branch
-                    Status = if ($RawResult.Ok) { 'OK' } else { 'FAILED' }
-                    Seconds = [double](if ($RawResult.Seconds) { $RawResult.Seconds } else { 0 })
-                    ExitCode = [int](if ($RawResult.ExitCode) { $RawResult.ExitCode } else { 0 })
-                    Error = if ($JobError) { $JobError } elseif ($RawResult.Error) { $RawResult.Error } else { $null }
-                    Output = $RawResult.Output
-                    Branch = [string]$RawResult.Branch
-                    Ok = [bool]$RawResult.Ok
+                    Name     = $NormalizedName
+                    Status   = $NormalizedStatus
+                    Seconds  = $NormalizedSeconds
+                    ExitCode = $NormalizedExitCode
+                    Error    = $NormalizedError
+                    Branch   = $NormalizedBranch
+                    Ok       = $NormalizedOk
                 }
             }
         }
