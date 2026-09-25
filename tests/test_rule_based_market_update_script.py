@@ -122,3 +122,55 @@ def test_hourly_pipeline_ps1_no_cmd_call_activate():
     cmd_call_pattern = re.compile(r'^\s*call\s', re.MULTILINE)
     assert not cmd_call_pattern.search(content), "CMD-only 'call' command found in .ps1 file"
 
+
+def test_hourly_pipeline_ps1_join_uses_global_timeout():
+    """Regression: the join must use a single Wait-Job across ALL branches
+    with one global timeout, NOT sequential per-job Wait-Job calls.
+
+    Old bug: foreach ($Job in $BranchJobs) { Wait-Job -Job $Job -Timeout 2400 }
+    meant 5 jobs × 2400s = 12000s max wall-clock.
+
+    Fixed: Wait-Job -Job $Jobs -Timeout $OverallTimeoutSeconds (600s shared).
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # Must NOT have foreach loop with per-job Wait-Job
+    assert 'foreach ($Job in $BranchJobs)' not in content, "Sequential per-job Wait-Job still present"
+    # Must NOT have pipe from Wait-Job to Receive-Job
+    assert 'Wait-Job -Job $Job -Timeout' not in content, "Per-job Wait-Job still present"
+    # Must have global Wait-Job
+    assert 'Wait-Job -Job $Jobs -Timeout' in content, "Global Wait-Job not found"
+    # Must have $OverallTimeoutSeconds defined
+    assert '$OverallTimeoutSeconds' in content, "$OverallTimeoutSeconds not defined"
+
+
+def test_hourly_pipeline_ps1_join_stops_timed_out_jobs():
+    """Regression: timed-out jobs must be stopped via Stop-Job, not left running."""
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert 'Stop-Job -Job $Job -Force' in content, "Stop-Job not found for timed-out jobs"
+    assert 'JobStateInfo.State' in content, "JobStateInfo.State not checked"
+    assert 'JobStateInfo.BeginTime' in content, "JobStateInfo.BeginTime not used for runtime"
+
+
+def test_hourly_pipeline_ps1_join_captures_errors():
+    """Regression: background-job errors must be captured, not silently ignored."""
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert 'ChildJobs[0].Error' in content, "ChildJobs[0].Error not captured"
+
+
+def test_hourly_pipeline_ps1_all_branches_receive_dryrun():
+    """Regression: every Start-Job must pass $DryRun via -ArgumentList."""
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    import re
+    arg_lines = re.findall(r'-ArgumentList.*', content)
+    # Count 5 branches and all must have $DryRun
+    dryrun_arg_count = sum(1 for l in arg_lines if '$DryRun' in l)
+    assert dryrun_arg_count >= 5, f"Only {dryrun_arg_count}/5 branches pass $DryRun"
+

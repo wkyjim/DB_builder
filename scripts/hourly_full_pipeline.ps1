@@ -143,6 +143,14 @@ try {
     $BranchJobs += Start-Job -Name 'BranchA_Equities' -ScriptBlock {
         param($Root, $Python, $Log, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($DryRun) {
+            $sw.Stop()
+            $s1 = Test-Path (Join-Path $Root 'scripts\pgSQL_equities_auto.py')
+            $s2 = Test-Path (Join-Path $Root 'scripts\repair_historical_equity_gaps.py')
+            $s3 = Test-Path (Join-Path $Root 'scripts\indicator_staged_backfill.py')
+            @{ Branch='A_equities'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; Output=('DRY RUN: equity scripts validated') }
+            return
+        }
         $eqOk = $false
         for ($attempt = 1; $attempt -le 3; $attempt++) {
             & $Python (Join-Path $Root 'scripts\pgSQL_equities_auto.py') 2>&1 | Out-Null
@@ -157,8 +165,14 @@ try {
 
     # Branch B: macro markets (macro, macro_live) — includes ETF flow refresh
     $BranchJobs += Start-Job -Name 'BranchB_Macro' -ScriptBlock {
-        param($Root, $Python, $MacroTimeoutSeconds)
+        param($Root, $Python, $MacroTimeoutSeconds, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($DryRun) {
+            $sw.Stop()
+            $s1 = Test-Path (Join-Path $Root 'scripts\macro_data_fetch.py')
+            @{ Branch='B_macro'; Ok=$s1; Seconds=$sw.Elapsed.TotalSeconds; Output=('DRY RUN: macro script validated'); ExitCode=0 }
+            return
+        }
         $pinfo = New-Object System.Diagnostics.ProcessStartInfo
         $pinfo.FileName = $Python
         $pinfo.Arguments = '"' + (Join-Path $Root 'scripts\macro_data_fetch.py') + '"'
@@ -175,32 +189,54 @@ try {
         }
         $sw.Stop()
         @{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($out + $err); ExitCode=$p.ExitCode }
-    } -ArgumentList $Root, $Python, $MacroTimeoutSeconds
+    } -ArgumentList $Root, $Python, $MacroTimeoutSeconds, $DryRun
 
     # Branch C: economic data (economic_* tables) — natural cadence: check for new releases
     $BranchJobs += Start-Job -Name 'BranchC_Economic' -ScriptBlock {
-        param($Root, $Python)
+        param($Root, $Python, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($DryRun) {
+            $sw.Stop()
+            $s1 = Test-Path (Join-Path $Root 'scripts\economic_data_fetch.py')
+            $s2 = Test-Path (Join-Path $Root 'scripts\global_economic_data_fetch.py')
+            @{ Branch='C_economic'; Ok=($s1 -and $s2); Seconds=$sw.Elapsed.TotalSeconds; Output=('DRY RUN: economic scripts validated') }
+            return
+        }
         $r1 = & $Python (Join-Path $Root 'scripts\economic_data_fetch.py') --upsert-local 2>&1
         $r2 = & $Python (Join-Path $Root 'scripts\global_economic_data_fetch.py') --upsert-local 2>&1
         $sw.Stop()
         @{ Branch='C_economic'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 | Out-String) }
-    } -ArgumentList $Root, $Python
+    } -ArgumentList $Root, $Python, $DryRun
 
     # Branch D: FINRA / short analytics (finra_*, short analytics)
     $BranchJobs += Start-Job -Name 'BranchD_Finra' -ScriptBlock {
-        param($Root, $Python)
+        param($Root, $Python, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($DryRun) {
+            $sw.Stop()
+            $s1 = Test-Path (Join-Path $Root 'scripts\finra_short_incremental.py')
+            $s2 = Test-Path (Join-Path $Root 'scripts\short_analytics_latest_sync.py')
+            @{ Branch='D_finra'; Ok=($s1 -and $s2); Seconds=$sw.Elapsed.TotalSeconds; Output=('DRY RUN: FINRA scripts validated') }
+            return
+        }
         $r1 = & $Python (Join-Path $Root 'scripts\finra_short_incremental.py') 2>&1
         $r2 = & $Python (Join-Path $Root 'scripts\short_analytics_latest_sync.py') 2>&1
         $sw.Stop()
         @{ Branch='D_finra'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 | Out-String) }
-    } -ArgumentList $Root, $Python
+    } -ArgumentList $Root, $Python, $DryRun
 
     # Branch E: news (news_* tables) — classify has Ollama circuit breaker (exit 75 = DEGRADED)
     $BranchJobs += Start-Job -Name 'BranchE_News' -ScriptBlock {
-        param($Root, $Python)
+        param($Root, $Python, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($DryRun) {
+            $sw.Stop()
+            $s1 = Test-Path (Join-Path $Root 'scripts\news_fetch.py')
+            $s2 = Test-Path (Join-Path $Root 'scripts\news_classify.py')
+            $s3 = Test-Path (Join-Path $Root 'scripts\news_signals.py')
+            @{ Branch='E_news'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; Output=('DRY RUN: news scripts validated'); ClassifyDegraded=$false }
+            return
+        }
         $r1 = & $Python (Join-Path $Root 'scripts\news_fetch.py') --upsert-local --limit 200 2>&1
         $newsFetchOk = ($LASTEXITCODE -eq 0)
         $r2 = & $Python (Join-Path $Root 'scripts\news_classify.py') --upsert-local --limit 100 --max-seconds 300 2>&1
@@ -212,27 +248,75 @@ try {
         $classifyDegraded = ($classifyExit -eq 75)
         $ok = $newsFetchOk -and $signalsOk -and ($classifyExit -eq 0 -or $classifyDegraded)
         @{ Branch='E_news'; Ok=$ok; Seconds=$sw.Elapsed.TotalSeconds; Output=($r1 + $r2 + $r3 | Out-String); ClassifyDegraded=$classifyDegraded }
-    } -ArgumentList $Root, $Python
+    } -ArgumentList $Root, $Python, $DryRun
 
     # -----------------------------------------------------------------------
-    # JOIN: wait for all branches (bounded — jobs have their own timeouts)
+    # -----------------------------------------------------------------------
+    # JOIN: global timeout — all branches run concurrently, share one window
     # -----------------------------------------------------------------------
     Write-Log 'JOIN' 'Waiting for all branches to complete...'
+    $Jobs = @($BranchJobs)
+    $OverallTimeoutSeconds = 600
+    $JoinStart = Get-Date
+
+    # Global wait: all jobs share one timeout window
+    $null = Wait-Job -Job $Jobs -Timeout $OverallTimeoutSeconds
+    $JoinElapsed = [math]::Round((Get-Date - $JoinStart).TotalSeconds, 1)
+    Write-Log 'JOIN' "Global wait complete after $JoinElapsed s"
+
     $BranchResults = @()
-    foreach ($Job in $BranchJobs) {
-        $Result = Wait-Job -Job $Job -Timeout 2400 | Receive-Job -Job $Job
-        Remove-Job -Job $Job -Force
-        if ($null -eq $Result) {
-            $Result = @{ Branch = $Job.Name; Ok = $false; Seconds = 0; Output = 'JOB RETURNED NOTHING (timeout or crash)' }
+    foreach ($Job in $Jobs) {
+        $JobState = $Job.JobStateInfo.State
+        $JobRuntime = [math]::Round((Get-Date - $Job.JobStateInfo.BeginTime).TotalSeconds, 1)
+
+        # Capture error stream from background job
+        $JobError = $null
+        if ($Job.ChildJobs.Count -gt 0) {
+            $JobError = $Job.ChildJobs[0].Error | Out-String
         }
+
+        if ($JobState -eq 'Running') {
+            # Timed out — stop the job
+            $null = Stop-Job -Job $Job -Force
+            $Result = @{
+                Branch = $Job.Name
+                Ok = $false
+                Seconds = $JobRuntime
+                Output = "TIMEOUT after ${OverallTimeoutSeconds}s (global)"
+                ExitCode = -1
+                Error = $JobError
+            }
+            Write-Log 'TIMEOUT' ("{0} exceeded global timeout {1}s" -f $Job.Name, $OverallTimeoutSeconds)
+        } else {
+            # Completed — receive output
+            $Result = Receive-Job -Job $Job
+            if ($null -eq $Result) {
+                $Result = @{
+                    Branch = $Job.Name
+                    Ok = $false
+                    Seconds = $JobRuntime
+                    Output = ('JOB RETURNED NOTHING (state: ' + $JobState + ')' + $(if ($JobError) { " | ERROR: " + $JobError } else { '' }))
+                    ExitCode = -1
+                    Error = $JobError
+                }
+            } else {
+                if ($JobError) {
+                    $Result.Error = $JobError
+                }
+            }
+        }
+
+        Remove-Job -Job $Job -Force
         $BranchResults += $Result
         $Status = if ($Result.Ok) { 'OK' } else { 'FAIL' }
         Write-Log 'BRANCH' ("{0}: {1} ({2:N0}s)" -f $Result.Branch, $Status, $Result.Seconds)
         if ($Result.Output) {
             $Result.Output | Out-String -Width 4096 | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ } | Add-Content -LiteralPath $Log
         }
+        if ($Result.Error) {
+            Write-Log 'ERROR' ("{0} error captured" -f $Result.Branch)
+        }
     }
-
     $BranchRuntime = ($BranchResults | Measure-Object -Property Seconds -Maximum).Maximum
     Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $BranchRuntime)
 
