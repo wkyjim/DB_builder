@@ -278,7 +278,7 @@ try {
 
         if ($JobState -eq 'Running') {
             # Timed out — stop the job
-            $null = Stop-Job -Job $Job -Force
+            $null = Stop-Job -Job $Job -ErrorAction SilentlyContinue
             $Result = [pscustomobject]@{
                 Name = $Job.Name
                 Status = 'TIMEOUT'

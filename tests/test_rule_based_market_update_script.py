@@ -150,7 +150,7 @@ def test_hourly_pipeline_ps1_join_stops_timed_out_jobs():
     ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
     content = ps1_path.read_text(encoding="utf-8")
 
-    assert 'Stop-Job -Job $Job -Force' in content, "Stop-Job not found for timed-out jobs"
+    assert 'Stop-Job -Job $Job' in content, "Stop-Job not found for timed-out jobs"
     assert 'JobStateInfo.State' in content, "JobStateInfo.State not checked"
     assert 'Stopwatch' in content and '.Elapsed.TotalSeconds' in content, "Stopwatch not used for timing"
 
@@ -401,3 +401,40 @@ def test_json_file_no_bom_bytes():
             with open(fpath, "rb") as f:
                 first3 = f.read(3)
             assert first3 != b"\\xef\\xbb\\xbf", f"BOM found in {fname}"
+
+
+def test_hourly_pipeline_ps1_no_stop_job_force():
+    """Regression: Stop-Job does not support -Force in PowerShell 5.1.
+
+    Windows PowerShell 5.1 Stop-Job only supports -Job, -ErrorAction,
+    -WarningAction, -Confirm, -WhatIf, and -Verbose.
+    The -Force parameter is PowerShell 7+ only.
+    Using -Force causes:
+    "A parameter cannot be found that matches parameter name 'Force'."
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # No Stop-Job calls should contain -Force
+    import re
+    stop_job_lines = [l for l in content.split("\n") if 'Stop-Job' in l]
+    for line in stop_job_lines:
+        assert '-Force' not in line, f"Stop-Job -Force found (PS 5.1 incompatible): {line.strip()[:120]}"
+
+    # All Stop-Job calls must have -ErrorAction SilentlyContinue
+    for line in stop_job_lines:
+        if 'ErrorAction' not in line:
+            assert False, f"Stop-Job missing -ErrorAction: {line.strip()[:120]}"
+
+
+def test_hourly_pipeline_ps1_timeout_branch_recording():
+    """Regression: after global timeout, branches still Running must be
+    recorded as TIMEOUT with correct status and seconds.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert "Status = 'TIMEOUT'" in content, "TIMEOUT status not found"
+    assert "$JobState -eq 'Running'" in content, "Running check not found"
+    assert "Stop-Job -Job" in content, "Stop-Job not found"
+    assert "-ErrorAction SilentlyContinue" in content, "ErrorAction SilentlyContinue not found"
