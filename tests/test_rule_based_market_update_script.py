@@ -152,7 +152,7 @@ def test_hourly_pipeline_ps1_join_stops_timed_out_jobs():
 
     assert 'Stop-Job -Job $Job -Force' in content, "Stop-Job not found for timed-out jobs"
     assert 'JobStateInfo.State' in content, "JobStateInfo.State not checked"
-    assert 'JobStateInfo.BeginTime' in content, "JobStateInfo.BeginTime not used for runtime"
+    assert 'Stopwatch' in content and '.Elapsed.TotalSeconds' in content, "Stopwatch not used for timing"
 
 
 def test_hourly_pipeline_ps1_join_captures_errors():
@@ -173,4 +173,25 @@ def test_hourly_pipeline_ps1_all_branches_receive_dryrun():
     # Count 5 branches and all must have $DryRun
     dryrun_arg_count = sum(1 for l in arg_lines if '$DryRun' in l)
     assert dryrun_arg_count >= 5, f"Only {dryrun_arg_count}/5 branches pass $DryRun"
+
+
+def test_hourly_pipeline_ps1_no_datetime_subtraction_hazard():
+    """Regression: Get-Date must never be used in arithmetic subtraction.
+
+    PowerShell parses "(Get-Date - $var)" as Get-Date receiving
+    "-$var" as parameters, causing a runtime parse error.
+
+    Safe patterns:
+    - (Get-Date) - $var   (parenthesized command, then subtraction)
+    - [System.Diagnostics.Stopwatch]::StartNew() (preferred)
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    # Must NOT have Get-Date followed by - as arithmetic subtraction
+    import re
+    # Match "(Get-Date -" pattern — the hazardous one
+    hazard_pattern = re.compile(r'\(Get-Date\s+-\s')
+    hazards = hazard_pattern.findall(content)
+    assert not hazards, f"DateTime subtraction hazard found: {hazards}. Use Stopwatch or (Get-Date) - $var instead."
 

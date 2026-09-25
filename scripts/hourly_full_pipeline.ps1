@@ -257,17 +257,17 @@ try {
     Write-Log 'JOIN' 'Waiting for all branches to complete...'
     $Jobs = @($BranchJobs)
     $OverallTimeoutSeconds = 600
-    $JoinStart = Get-Date
+    $JoinStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
     # Global wait: all jobs share one timeout window
     $null = Wait-Job -Job $Jobs -Timeout $OverallTimeoutSeconds
-    $JoinElapsed = [math]::Round((Get-Date - $JoinStart).TotalSeconds, 1)
+    $JoinStopwatch.Stop()
+    $JoinElapsed = [math]::Round($JoinStopwatch.Elapsed.TotalSeconds, 1)
     Write-Log 'JOIN' "Global wait complete after $JoinElapsed s"
 
     $BranchResults = @()
     foreach ($Job in $Jobs) {
         $JobState = $Job.JobStateInfo.State
-        $JobRuntime = [math]::Round((Get-Date - $Job.JobStateInfo.BeginTime).TotalSeconds, 1)
 
         # Capture error stream from background job
         $JobError = $null
@@ -281,7 +281,7 @@ try {
             $Result = @{
                 Branch = $Job.Name
                 Ok = $false
-                Seconds = $JobRuntime
+                Seconds = $OverallTimeoutSeconds
                 Output = "TIMEOUT after ${OverallTimeoutSeconds}s (global)"
                 ExitCode = -1
                 Error = $JobError
@@ -290,11 +290,12 @@ try {
         } else {
             # Completed — receive output
             $Result = Receive-Job -Job $Job
+            $JobRuntime = $Result.Seconds
             if ($null -eq $Result) {
                 $Result = @{
                     Branch = $Job.Name
                     Ok = $false
-                    Seconds = $JobRuntime
+                    Seconds = $OverallTimeoutSeconds
                     Output = ('JOB RETURNED NOTHING (state: ' + $JobState + ')' + $(if ($JobError) { " | ERROR: " + $JobError } else { '' }))
                     ExitCode = -1
                     Error = $JobError
