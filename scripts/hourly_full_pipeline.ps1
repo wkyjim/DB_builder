@@ -90,7 +90,7 @@ function Invoke-PythonStep {
             if (Test-Path $Out) { Get-Content $Out | Add-Content -LiteralPath $Log }
             if (Test-Path $Err) { Get-Content $Err | Add-Content -LiteralPath $Log }
             if ($Attempt -lt $MaxAttempts) { Start-Sleep -Seconds 30; continue }
-            return @{ Ok = $false; ExitCode = -1; Output = 'TIMEOUT' }
+            return @{ Ok = $false; ExitCode = -1; Output = 'TIMEOUT'; Error = $null }
         }
         $P.WaitForExit()
         $ExitCode = $P.ExitCode
@@ -98,11 +98,11 @@ function Invoke-PythonStep {
         if (Test-Path $Err) { Get-Content $Err | Add-Content -LiteralPath $Log }
         if ($ExitCode -eq 0) {
             Write-Log 'SUCCESS' $StepName
-            return @{ Ok = $true; ExitCode = 0; Output = (Get-Content $Out -Raw -ErrorAction SilentlyContinue) }
+            return @{ Ok = $true; ExitCode = 0; Output = (Get-Content $Out -Raw -ErrorAction SilentlyContinue); Error = $null }
         }
         Write-Log 'ERROR' ("$StepName exited with code $ExitCode")
         if ($Attempt -lt $MaxAttempts) { Start-Sleep -Seconds 30; continue }
-        return @{ Ok = $false; ExitCode = $ExitCode; Output = (Get-Content $Out -Raw -ErrorAction SilentlyContinue) }
+        return @{ Ok = $false; ExitCode = $ExitCode; Output = (Get-Content $Out -Raw -ErrorAction SilentlyContinue); Error = (Get-Content $Err -Raw -ErrorAction SilentlyContinue) }
     }
 }
 
@@ -491,7 +491,13 @@ try {
     else { Write-Log 'DRYRUN' 'Push disabled for dry run' }
     $ReportResult = Invoke-PythonStep -Script 'scripts\rule_based_market_update.py' -Arguments $ReportArgs -TimeoutSeconds 900 -StepName 'rule_based_market_update.py'
     if (-not $ReportResult.Ok) {
-        Write-Log 'FAIL' 'Report generation failed'
+        Write-Log 'FAIL' ("Report generation failed - ExitCode: {0}" -f $ReportResult.ExitCode)
+        if ($ReportResult.Error) {
+            Write-Log 'STDERR' ("Python stderr: {0}" -f ($ReportResult.Error -join [Environment]::NewLine))
+        }
+        if ($ReportResult.Output) {
+            Write-Log 'STDOUT' ("Python stdout: {0}" -f ($ReportResult.Output -split [Environment]::NewLine | Select-Object -Last 20))
+        }
         $FailState = @{
             cycle_id = $CycleId
             started_at = $CycleStart.ToString('yyyy-MM-ddTHH:mm:ss+08:00')

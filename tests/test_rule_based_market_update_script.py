@@ -335,3 +335,27 @@ def test_hourly_pipeline_ps1_pscustomobject_schema_complete():
 
     # Measure-Object must work
     assert "Measure-Object -Property Seconds -Maximum" in content, "Measure-Object not found"
+
+
+def test_hourly_pipeline_ps1_invoke_python_step_returns_error():
+    """Regression: Invoke-PythonStep must return Error/Stderr in result.
+
+    Previously, stderr was captured to a temp file but never returned
+    in the result object. When a step failed, the orchestrator could
+    not log the actual Python traceback.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert "Error = (Get-Content $Err" in content, "Error/Stderr not returned from Invoke-PythonStep"
+    assert "Error = $null" in content, "Error = $null not in success return"
+
+
+def test_hourly_pipeline_ps1_fail_block_logs_stderr():
+    """Regression: the fail block must log ExitCode, stderr, and stdout tail."""
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert "Report generation failed - ExitCode" in content, "ExitCode not logged"
+    assert "STDERR" in content and "Python stderr" in content, "Stderr logging not found"
+    assert "STDOUT" in content and "Python stdout" in content, "Stdout tail logging not found"
