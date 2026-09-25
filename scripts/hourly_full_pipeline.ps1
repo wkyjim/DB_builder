@@ -148,7 +148,7 @@ try {
             $s1 = Test-Path (Join-Path $Root 'scripts\pgSQL_equities_auto.py')
             $s2 = Test-Path (Join-Path $Root 'scripts\repair_historical_equity_gaps.py')
             $s3 = Test-Path (Join-Path $Root 'scripts\indicator_staged_backfill.py')
-            @{ Branch='A_equities'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: equity scripts validated') }
+            [pscustomobject]@{ Branch='A_equities'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: equity scripts validated') }
             return
         }
         $eqOk = $false
@@ -160,7 +160,7 @@ try {
         $r2 = & $Python (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') 2>&1
         $r3 = & $Python (Join-Path $Root 'scripts\indicator_staged_backfill.py') --stage all 2>&1
         $sw.Stop()
-        @{ Branch='A_equities'; Ok=($eqOk -and $LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r2 + $r3 | Out-String) }
+        [pscustomobject]@{ Branch='A_equities'; Ok=($eqOk -and $LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r2 + $r3 | Out-String) }
     } -ArgumentList $Root, $Python, $Log, $DryRun
 
     # Branch B: macro markets (macro, macro_live) — includes ETF flow refresh
@@ -170,7 +170,7 @@ try {
         if ($DryRun) {
             $sw.Stop()
             $s1 = Test-Path (Join-Path $Root 'scripts\macro_data_fetch.py')
-            @{ Branch='B_macro'; Ok=$s1; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: macro script validated') }
+            [pscustomobject]@{ Branch='B_macro'; Ok=$s1; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: macro script validated') }
             return
         }
         $pinfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -185,10 +185,10 @@ try {
         $err = $p.StandardError.ReadToEnd()
         if (-not $p.WaitForExit($MacroTimeoutSeconds * 1000)) {
             $p.Kill(); $sw.Stop()
-            return @{ Branch='B_macro'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after ' + $MacroTimeoutSeconds + 's'); ExitCode=-1; Error=$null }
+            return [pscustomobject]@{ Branch='B_macro'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after ' + $MacroTimeoutSeconds + 's'); ExitCode=-1; Error=$null }
         }
         $sw.Stop()
-        @{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($out + $err); ExitCode=$p.ExitCode; Error=$null }
+        [pscustomobject]@{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($out + $err); ExitCode=$p.ExitCode; Error=$null }
     } -ArgumentList $Root, $Python, $MacroTimeoutSeconds, $DryRun
 
     # Branch C: economic data (economic_* tables) — natural cadence: check for new releases
@@ -199,13 +199,13 @@ try {
             $sw.Stop()
             $s1 = Test-Path (Join-Path $Root 'scripts\economic_data_fetch.py')
             $s2 = Test-Path (Join-Path $Root 'scripts\global_economic_data_fetch.py')
-            @{ Branch='C_economic'; Ok=($s1 -and $s2); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: economic scripts validated') }
+            [pscustomobject]@{ Branch='C_economic'; Ok=($s1 -and $s2); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: economic scripts validated') }
             return
         }
         $r1 = & $Python (Join-Path $Root 'scripts\economic_data_fetch.py') --upsert-local 2>&1
         $r2 = & $Python (Join-Path $Root 'scripts\global_economic_data_fetch.py') --upsert-local 2>&1
         $sw.Stop()
-        @{ Branch='C_economic'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r1 + $r2 | Out-String) }
+        [pscustomobject]@{ Branch='C_economic'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r1 + $r2 | Out-String) }
     } -ArgumentList $Root, $Python, $DryRun
 
     # Branch D: FINRA / short analytics (finra_*, short analytics)
@@ -216,13 +216,13 @@ try {
             $sw.Stop()
             $s1 = Test-Path (Join-Path $Root 'scripts\finra_short_incremental.py')
             $s2 = Test-Path (Join-Path $Root 'scripts\short_analytics_latest_sync.py')
-            @{ Branch='D_finra'; Ok=($s1 -and $s2); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: FINRA scripts validated') }
+            [pscustomobject]@{ Branch='D_finra'; Ok=($s1 -and $s2); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: FINRA scripts validated') }
             return
         }
         $r1 = & $Python (Join-Path $Root 'scripts\finra_short_incremental.py') 2>&1
         $r2 = & $Python (Join-Path $Root 'scripts\short_analytics_latest_sync.py') 2>&1
         $sw.Stop()
-        @{ Branch='D_finra'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r1 + $r2 | Out-String) }
+        [pscustomobject]@{ Branch='D_finra'; Ok=($LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r1 + $r2 | Out-String) }
     } -ArgumentList $Root, $Python, $DryRun
 
     # Branch E: news (news_* tables) — classify has Ollama circuit breaker (exit 75 = DEGRADED)
@@ -234,7 +234,7 @@ try {
             $s1 = Test-Path (Join-Path $Root 'scripts\news_fetch.py')
             $s2 = Test-Path (Join-Path $Root 'scripts\news_classify.py')
             $s3 = Test-Path (Join-Path $Root 'scripts\news_signals.py')
-            @{ Branch='E_news'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; ClassifyDegraded=$false; Output=('DRY RUN: news scripts validated') }
+            [pscustomobject]@{ Branch='E_news'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; ClassifyDegraded=$false; Output=('DRY RUN: news scripts validated') }
             return
         }
         $r1 = & $Python (Join-Path $Root 'scripts\news_fetch.py') --upsert-local --limit 200 2>&1
@@ -247,7 +247,7 @@ try {
         # classify exit 75 = Ollama unavailable -> DEGRADED not FAILED
         $classifyDegraded = ($classifyExit -eq 75)
         $ok = $newsFetchOk -and $signalsOk -and ($classifyExit -eq 0 -or $classifyDegraded)
-        @{ Branch='E_news'; Ok=$ok; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; ClassifyDegraded=$classifyDegraded; Output=($r1 + $r2 + $r3 | Out-String) }
+        [pscustomobject]@{ Branch='E_news'; Ok=$ok; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; ClassifyDegraded=$classifyDegraded; Output=($r1 + $r2 + $r3 | Out-String) }
     } -ArgumentList $Root, $Python, $DryRun
 
     # -----------------------------------------------------------------------
@@ -278,15 +278,15 @@ try {
         if ($JobState -eq 'Running') {
             # Timed out — stop the job
             $null = Stop-Job -Job $Job -Force
-            $Result = @{
+            $Result = [pscustomobject]@{
                 Name = $Job.Name
                 Status = 'TIMEOUT'
-                Seconds = $OverallTimeoutSeconds
-                ExitCode = -1
+                Seconds = [double]$OverallTimeoutSeconds
+                ExitCode = [int]-1
                 Error = $JobError
                 Output = "TIMEOUT after ${OverallTimeoutSeconds}s (global)"
                 Branch = $Job.Name
-                Ok = $false
+                Ok = [bool]$false
             }
             Write-Log 'TIMEOUT' ("{0} exceeded global timeout {1}s" -f $Job.Name, $OverallTimeoutSeconds)
         } else {
@@ -303,38 +303,54 @@ try {
                 }
             }
             if ($null -eq $RawResult) {
-                $Result = @{
+                $Result = [pscustomobject]@{
                     Name = $Job.Name
                     Status = 'FAILED'
-                    Seconds = 0
-                    ExitCode = -1
+                    Seconds = [double]0
+                    ExitCode = [int]-1
                     Error = $JobError
                     Output = ('JOB RETURNED NOTHING (state: ' + $JobState + ')' + $(if ($JobError) { " | ERROR: " + $JobError } else { '' }))
                     Branch = $Job.Name
-                    Ok = $false
+                    Ok = [bool]$false
                 }
             } else {
                 # Normalize: ensure all required fields exist
-                $Result = @{
+                # Cast Receive-Job output to [pscustomobject] if needed
+                if ($RawResult -isnot [pscustomobject]) {
+                    $RawResult = [pscustomobject]$RawResult
+                }
+                $Result = [pscustomobject]@{
                     Name = $RawResult.Branch
                     Status = if ($RawResult.Ok) { 'OK' } else { 'FAILED' }
-                    Seconds = if ($RawResult.Seconds) { $RawResult.Seconds } else { 0 }
-                    ExitCode = if ($RawResult.ExitCode) { $RawResult.ExitCode } else { 0 }
+                    Seconds = [double](if ($RawResult.Seconds) { $RawResult.Seconds } else { 0 })
+                    ExitCode = [int](if ($RawResult.ExitCode) { $RawResult.ExitCode } else { 0 })
                     Error = if ($JobError) { $JobError } elseif ($RawResult.Error) { $RawResult.Error } else { $null }
                     Output = $RawResult.Output
-                    Branch = $RawResult.Branch
-                    Ok = $RawResult.Ok
+                    Branch = [string]$RawResult.Branch
+                    Ok = [bool]$RawResult.Ok
                 }
             }
         }
 
-        # Ensure all required schema fields are always present
-        if (-not $Result.ContainsKey('Name')) { $Result['Name'] = $Job.Name }
-        if (-not $Result.ContainsKey('Status')) { $Result['Status'] = 'UNKNOWN' }
-        if (-not $Result.ContainsKey('Seconds')) { $Result['Seconds'] = 0 }
-        if (-not $Result.ContainsKey('ExitCode')) { $Result['ExitCode'] = -1 }
-        if (-not $Result.ContainsKey('Error')) { $Result['Error'] = $null }
-        if (-not $Result.ContainsKey('Branch')) { $Result['Branch'] = $Job.Name }
+        # Ensure all required schema fields are always present (PSCustomObject-compatible)
+        if (-not ($Result.PSObject.Properties.Name -contains 'Name')) {
+            $Result = $Result | Add-Member -NotePropertyName 'Name' -NotePropertyValue $Job.Name -PassThru
+        }
+        if (-not ($Result.PSObject.Properties.Name -contains 'Status')) {
+            $Result = $Result | Add-Member -NotePropertyName 'Status' -NotePropertyValue 'UNKNOWN' -PassThru
+        }
+        if (-not ($Result.PSObject.Properties.Name -contains 'Seconds')) {
+            $Result = $Result | Add-Member -NotePropertyName 'Seconds' -NotePropertyValue ([double]0) -PassThru
+        }
+        if (-not ($Result.PSObject.Properties.Name -contains 'ExitCode')) {
+            $Result = $Result | Add-Member -NotePropertyName 'ExitCode' -NotePropertyValue ([int]-1) -PassThru
+        }
+        if (-not ($Result.PSObject.Properties.Name -contains 'Error')) {
+            $Result = $Result | Add-Member -NotePropertyName 'Error' -NotePropertyValue $null -PassThru
+        }
+        if (-not ($Result.PSObject.Properties.Name -contains 'Branch')) {
+            $Result = $Result | Add-Member -NotePropertyName 'Branch' -NotePropertyValue $Job.Name -PassThru
+        }
 
         # Cleanup: only remove parent jobs that still exist (idempotent)
         try {

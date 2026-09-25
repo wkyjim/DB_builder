@@ -224,15 +224,18 @@ def test_hourly_pipeline_ps1_dryrun_result_schema_has_seconds():
         assert 'Seconds=' in line, f"Branch result missing Seconds: {line[:120]}"
 
     # Normalization block must exist
-    assert "ContainsKey('Seconds')" in content, "Normalization for Seconds not found"
-    assert "ContainsKey('ExitCode')" in content, "Normalization for ExitCode not found"
-    assert "ContainsKey('Error')" in content, "Normalization for Error not found"
-    assert "ContainsKey('Name')" in content, "Normalization for Name not found"
+    assert "PSObject.Properties.Name" in content, "PSCustomObject normalization not found"
+    assert "Add-Member -NotePropertyName" in content, "Add-Member guard not found"
+    assert "[pscustomobject]@{" in content, "pscustomobject result not found"
+    assert "PSObject.Properties.Name -contains 'Name'" in content, "Name guard not found"
+    
+    # Verify all branch results are [pscustomobject]
+    assert content.count("[pscustomobject]@{") >= 11, f"Expected at least 11 [pscustomobject]@{{}} definitions, found {content.count('[pscustomobject]@{')}"
 
     # Normalization block must exist
-    assert "ContainsKey('Seconds')" in content, "Normalization for Seconds not found"
-    assert "ContainsKey('ExitCode')" in content, "Normalization for ExitCode not found"
-    assert "ContainsKey('Error')" in content, "Normalization for Error not found"
+    assert "PSObject.Properties.Name" in content, "PSCustomObject normalization not found"
+    assert "Add-Member -NotePropertyName" in content, "Add-Member guard not found"
+    assert "[pscustomobject]@{" in content, "pscustomobject result not found"
 
 
 def test_hourly_pipeline_ps1_measure_object_defensive():
