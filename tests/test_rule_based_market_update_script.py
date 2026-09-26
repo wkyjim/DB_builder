@@ -438,3 +438,55 @@ def test_hourly_pipeline_ps1_timeout_branch_recording():
     assert "$JobState -eq 'Running'" in content, "Running check not found"
     assert "Stop-Job -Job" in content, "Stop-Job not found"
     assert "-ErrorAction SilentlyContinue" in content, "ErrorAction SilentlyContinue not found"
+
+
+def test_hourly_pipeline_ps1_macro_timeout_leq_overall():
+    """Regression: MacroTimeoutSeconds must not exceed OverallTimeoutSeconds.
+
+    Branch B's per-process WaitForExit timeout must be <= the global
+    Wait-Job timeout, otherwise the global timeout kills Branch B first
+    and the per-process timeout is dead code.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    import re
+    macro_match = re.search(r'\$MacroTimeoutSeconds\s*=\s*(\d+)', content)
+    overall_match = re.search(r'\$OverallTimeoutSeconds\s*=\s*(\d+)', content)
+    assert macro_match, "MacroTimeoutSeconds not found"
+    assert overall_match, "OverallTimeoutSeconds not found"
+    macro_val = int(macro_match.group(1))
+    overall_val = int(overall_match.group(1))
+    assert macro_val <= overall_val, (
+        f"MacroTimeoutSeconds={macro_val} exceeds OverallTimeoutSeconds={overall_val}. "
+        "Branch B's WaitForExit timeout is dead code."
+    )
+
+
+def test_hourly_pipeline_ps1_branch_a_has_process_timeout():
+    """Regression: Branch A must use Process.Start with WaitForExit for per-script timeout.
+
+    Branch A previously used '& $Python script.py 2>&1 | Out-Null' which has no
+    timeout and blocks indefinitely if the process hangs.
+    """
+    ps1_path = Path(__file__).resolve().parents[1] / "scripts" / "hourly_full_pipeline.ps1"
+    content = ps1_path.read_text(encoding="utf-8")
+
+    assert 'WaitForExit(' in content, "WaitForExit not found in PS1"
+    # Branch A should use Process.Start (not & call operator) for pgSQL_equities_auto
+    assert 'Process]::Start($pinfo)' in content or 'Process]::Start($pinfo2)' in content, "Process.Start not used"
+
+
+def test_eastmoney_circuit_breaker_present():
+    """Regression: Eastmoney must have provider-level circuit breaker.
+
+    Without it, persistent no-data responses from Eastmoney can cause
+    unlimited page-by-page retries consuming the entire branch budget.
+    """
+    em_path = Path(__file__).resolve().parents[1] / "src" / "db_builder" / "eastmoney.py"
+    content = em_path.read_text(encoding="utf-8")
+
+    assert 'MAX_NO_DATA_PAGES' in content, "MAX_NO_DATA_PAGES constant not found"
+    assert 'MAX_PAGE_RETRIES' in content, "MAX_PAGE_RETRIES constant not found"
+    assert 'no_data_pages' in content, "no_data_pages counter not found"
+    assert 'Provider circuit breaker' in content or 'circuit breaker tripped' in content, "Circuit breaker logic not found"

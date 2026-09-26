@@ -12,6 +12,11 @@ from sqlalchemy import MetaData, Table, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db_builder.config import RAW_TABLE
+
+# Provider-level circuit breaker
+MAX_NO_DATA_PAGES = 5  # If 5+ consecutive pages return no data, abort the fetch
+MAX_PAGE_RETRIES = 3   # Reduced from 5 to 3 per page
+
 from db_builder.trading_calendar import (
     latest_completed_nyse_session_date,
     reject_non_trading_dates,
@@ -186,11 +191,12 @@ def fetch_and_save_all(
     failed_pages: list[int] = []
     fetched_tickers: set[str] = set()
 
+    no_data_pages = 0
     for pn in range(1, pages_to_fetch + 1):
         success = False
         retries = 0
 
-        while not success and retries < 5:
+        while not success and retries < MAX_PAGE_RETRIES:
             try:
                 resp = requests.get(get_api_url(pn, pz), headers=headers, timeout=20)
                 resp.raise_for_status()
@@ -199,6 +205,10 @@ def fetch_and_save_all(
                 if not stocks:
                     print(f"[page {pn}] no data; retrying")
                     retries += 1
+                    no_data_pages += 1
+                    if no_data_pages >= MAX_NO_DATA_PAGES:
+                        print(f"Provider circuit breaker tripped: {no_data_pages} consecutive no-data pages")
+                        return []
                     time.sleep(3)
                     continue
 

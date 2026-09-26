@@ -34,7 +34,7 @@
 
 param(
     [switch]$DryRun,
-    [int]$MacroTimeoutSeconds = 900
+    [int]$MacroTimeoutSeconds = 540
 )
 
 $ErrorActionPreference = 'Stop'
@@ -154,12 +154,54 @@ try {
         }
         $eqOk = $false
         for ($attempt = 1; $attempt -le 3; $attempt++) {
-            & $Python (Join-Path $Root 'scripts\pgSQL_equities_auto.py') 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { $eqOk = $true; break }
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $Python
+            $pinfo.Arguments = '"' + (Join-Path $Root 'scripts\pgSQL_equities_auto.py') + '"'
+            $pinfo.WorkingDirectory = $Root
+            $pinfo.UseShellExecute = $false
+            $pinfo.RedirectStandardOutput = $true
+            $pinfo.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($pinfo)
+            if (-not $p.WaitForExit(300000)) {
+                $p.Kill()
+                $sw.Stop()
+                return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (pgSQL_equities_auto)'); ExitCode=-1; Error=$null }
+            }
+            if ($p.ExitCode -eq 0) { $eqOk = $true; break }
             if ($attempt -lt 3) { Start-Sleep -Seconds 60 }
         }
-        $r2 = & $Python (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') 2>&1
-        $r3 = & $Python (Join-Path $Root 'scripts\indicator_staged_backfill.py') --stage all 2>&1
+        if (-not $eqOk) {
+            $sw.Stop()
+            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('FAIL: pgSQL_equities_auto failed after 3 attempts'); ExitCode=-1; Error=$null }
+        }
+        $pinfo2 = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo2.FileName = $Python
+        $pinfo2.Arguments = '"' + (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') + '"'
+        $pinfo2.WorkingDirectory = $Root
+        $pinfo2.UseShellExecute = $false
+        $pinfo2.RedirectStandardOutput = $true
+        $pinfo2.RedirectStandardError = $true
+        $p2 = [System.Diagnostics.Process]::Start($pinfo2)
+        if (-not $p2.WaitForExit(300000)) {
+            $p2.Kill()
+            $sw.Stop()
+            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (repair_historical_equity_gaps)'); ExitCode=-1; Error=$null }
+        }
+        $r2 = $p2.StandardOutput.ReadToEnd() + $p2.StandardError.ReadToEnd()
+        $pinfo3 = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo3.FileName = $Python
+        $pinfo3.Arguments = '"' + (Join-Path $Root 'scripts\indicator_staged_backfill.py') + ' --stage all"'
+        $pinfo3.WorkingDirectory = $Root
+        $pinfo3.UseShellExecute = $false
+        $pinfo3.RedirectStandardOutput = $true
+        $pinfo3.RedirectStandardError = $true
+        $p3 = [System.Diagnostics.Process]::Start($pinfo3)
+        if (-not $p3.WaitForExit(300000)) {
+            $p3.Kill()
+            $sw.Stop()
+            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (indicator_staged_backfill)'); ExitCode=-1; Error=$null }
+        }
+        $r3 = $p3.StandardOutput.ReadToEnd() + $p3.StandardError.ReadToEnd()
         $sw.Stop()
         [pscustomobject]@{ Branch='A_equities'; Ok=($eqOk -and $LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r2 + $r3 | Out-String) }
     } -ArgumentList $Root, $Python, $Log, $DryRun
