@@ -333,7 +333,10 @@ try {
         }
 
         if ($JobState -eq 'Running') {
-            # Timed out — stop the job
+            # Timed out — kill child process tree first, then stop job
+            # Get the actual process PID from the child job
+            $JobPid = $Job.ChildJobs[0].Id
+            $null = taskkill.exe /F /T /PID $JobPid 2>&1
             $null = Stop-Job -Job $Job -ErrorAction SilentlyContinue
             $Result = [pscustomobject]@{
                 Name = $Job.Name
@@ -436,21 +439,17 @@ try {
             $Result = $Result | Add-Member -NotePropertyName 'Branch' -NotePropertyValue $Job.Name -PassThru
         }
 
-        # Cleanup: only remove parent jobs that still exist (idempotent)
+        # Cleanup: remove job immediately (already stopped or completed)
         try {
             $JobId = $Job.Id
             $ExistingJob = Get-Job -Id $JobId -ErrorAction SilentlyContinue
             if ($null -ne $ExistingJob) {
-                if ($ExistingJob.State -eq 'Running') {
-                    $null = Stop-Job -Job $ExistingJob -ErrorAction SilentlyContinue
-                }
+                # Remove immediately without re-checking state or re-calling Stop-Job
                 Remove-Job -Job $ExistingJob -Force -ErrorAction SilentlyContinue
             }
         } catch {
             # Cleanup failure must not change branch result status
             Write-Log 'WARN' ("Cleanup failed for {0}: {1}" -f $Job.Name, $_.Exception.Message)
-        } finally {
-            # Jobs are guaranteed to be removed or stopped here
         }
         $BranchResults += $Result
         $Status = if ($Result.Ok) { 'OK' } else { 'FAIL' }
@@ -463,6 +462,12 @@ try {
         }
     }
     $BranchRuntime = if ($BranchResults.Count -gt 0) { ($BranchResults | Measure-Object -Property Seconds -Maximum).Maximum } else { 0 }
+
+# --- Post-loop cleanup: ensure no lingering processes ---
+# Kill any remaining Start-Job processes from this pipeline
+$null = Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
+
+Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $BranchRuntime)
     Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $BranchRuntime)
 
     # -----------------------------------------------------------------------
