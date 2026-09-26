@@ -93,8 +93,8 @@ function New-ProcessInfo {
     # Forward database connection environment variables
     $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
     foreach ($var in $envVars) {
-        $val = $env:$var
-        if ($val) {
+        $val = [System.Environment]::GetEnvironmentVariable($var)
+        if (-not [string]::IsNullOrWhiteSpace($val)) {
             $pinfo.EnvironmentVariables[$var] = $val
         }
     }
@@ -124,8 +124,8 @@ function Invoke-PythonStep {
         $Psi.EnvironmentVariables['PYTHONPATH'] = Join-Path $Root 'src;' + (Join-Path $Root 'scripts')
         $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME')
         foreach ($var in $envVars) {
-            $val = $env:$var
-            if ($val) {
+            $val = [System.Environment]::GetEnvironmentVariable($var)
+            if (-not [string]::IsNullOrWhiteSpace($val)) {
                 $Psi.EnvironmentVariables[$var] = $val
             }
         }
