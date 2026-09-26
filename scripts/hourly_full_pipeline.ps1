@@ -80,13 +80,14 @@ function New-ProcessInfo {
     }
     $branchLog = Join-Path $logDir ($scriptName + '.log')
     # Use cmd.exe to redirect stdout/stderr to file (prevents pipe deadlock)
-    $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
     $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pinfo.FileName = 'cmd.exe'
-    $pinfo.Arguments = $cmdArgs
+    $pinfo.FileName = $Python
+    $pinfo.Arguments = '-u "' + $ScriptPath + '" ' + $ExtraArgs
     $pinfo.WorkingDirectory = $WorkingDirectory
     $pinfo.UseShellExecute = $false
     $pinfo.CreateNoWindow = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
     # Forward critical environment variables explicitly
     $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
     $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
@@ -204,13 +205,14 @@ try {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
             }
             $branchLog = Join-Path $logDir ($scriptName + '.log')
-            $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = 'cmd.exe'
-            $pinfo.Arguments = $cmdArgs
+                    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $Python
+            $pinfo.Arguments = '-u "' + $ScriptPath + '" ' + $ExtraArgs
             $pinfo.WorkingDirectory = $WorkingDirectory
             $pinfo.UseShellExecute = $false
             $pinfo.CreateNoWindow = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
             $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
             $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
             $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
@@ -238,6 +240,9 @@ try {
                 $null = taskkill.exe /F /T /PID $p.Id 2>&1
                 $p.Kill() 2>$null
                 $sw.Stop()
+                $outText = $p.StandardOutput.ReadToEnd()
+                $errText = $p.StandardError.ReadToEnd()
+                "$outText`n$errText" | Out-File -FilePath $branchLog -Encoding utf8 -Force
                 $diagOutput = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { 'No log file' }
                 return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (pgSQL_equities_auto) | Last: ' + $diagOutput); ExitCode=-1; Error=$null }
             }
@@ -270,13 +275,14 @@ try {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
             }
             $branchLog = Join-Path $logDir ($scriptName + '.log')
-            $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = 'cmd.exe'
-            $pinfo.Arguments = $cmdArgs
+                    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $Python
+            $pinfo.Arguments = '-u "' + $ScriptPath + '" ' + $ExtraArgs
             $pinfo.WorkingDirectory = $WorkingDirectory
             $pinfo.UseShellExecute = $false
             $pinfo.CreateNoWindow = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
             $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
             $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
             $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
@@ -300,11 +306,18 @@ try {
         if (-not $p.WaitForExit($MacroTimeoutSeconds * 1000)) {
             # Kill the cmd.exe process tree to terminate the Python child
             $null = taskkill.exe /F /T /PID $p.Id 2>&1
+            $outText = $p.StandardOutput.ReadToEnd()
+            $errText = $p.StandardError.ReadToEnd()
+            "$outText`n$errText" | Out-File -FilePath $branchLog -Encoding utf8 -Force
             $p.Kill() 2>$null; $sw.Stop()
             $diagOutput = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { 'No log file' }
             return [pscustomobject]@{ Branch='B_macro'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after ' + $MacroTimeoutSeconds + 's | Last: ' + $diagOutput); ExitCode=-1; Error=$null }
         }
-        $out = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { '' }
+        # Write process output to log file
+        $outText = $p.StandardOutput.ReadToEnd()
+        $errText = $p.StandardError.ReadToEnd()
+        "$outText`n$errText" | Out-File -FilePath $branchLog -Encoding utf8 -Force
+        $out = $outText
         $sw.Stop()
         [pscustomobject]@{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=$out; ExitCode=$p.ExitCode; Error=$null }
     } -ArgumentList $Root, $Python, $MacroTimeoutSeconds, $DryRun
@@ -325,13 +338,14 @@ try {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
             }
             $branchLog = Join-Path $logDir ($scriptName + '.log')
-            $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = 'cmd.exe'
-            $pinfo.Arguments = $cmdArgs
+                    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $Python
+            $pinfo.Arguments = '-u "' + $ScriptPath + '" ' + $ExtraArgs
             $pinfo.WorkingDirectory = $WorkingDirectory
             $pinfo.UseShellExecute = $false
             $pinfo.CreateNoWindow = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
             $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
             $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
             $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
@@ -373,13 +387,14 @@ try {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
             }
             $branchLog = Join-Path $logDir ($scriptName + '.log')
-            $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = 'cmd.exe'
-            $pinfo.Arguments = $cmdArgs
+                    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $Python
+            $pinfo.Arguments = '-u "' + $ScriptPath + '" ' + $ExtraArgs
             $pinfo.WorkingDirectory = $WorkingDirectory
             $pinfo.UseShellExecute = $false
             $pinfo.CreateNoWindow = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
             $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
             $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
             $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
@@ -421,13 +436,14 @@ try {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
             }
             $branchLog = Join-Path $logDir ($scriptName + '.log')
-            $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = 'cmd.exe'
-            $pinfo.Arguments = $cmdArgs
+                    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $Python
+            $pinfo.Arguments = '-u "' + $ScriptPath + '" ' + $ExtraArgs
             $pinfo.WorkingDirectory = $WorkingDirectory
             $pinfo.UseShellExecute = $false
             $pinfo.CreateNoWindow = $true
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
             $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
             $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
             $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
