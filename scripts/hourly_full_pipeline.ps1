@@ -89,7 +89,7 @@ function New-ProcessInfo {
     $pinfo.CreateNoWindow = $true
     # Forward critical environment variables explicitly
     $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
-    $pinfo.EnvironmentVariables['PYTHONPATH'] = Join-Path $WorkingDirectory 'src;' + (Join-Path $WorkingDirectory 'scripts')
+    $pinfo.EnvironmentVariables['PYTHONPATH'] = (Join-Path $WorkingDirectory 'src') + ';' + (Join-Path $WorkingDirectory 'scripts')
     # Forward database connection environment variables
     $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
     foreach ($var in $envVars) {
@@ -120,7 +120,7 @@ function Invoke-PythonStep {
         $Psi.WorkingDirectory = $Root
         $Psi.UseShellExecute = $false
         $Psi.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
-        $Psi.EnvironmentVariables['PYTHONPATH'] = Join-Path $Root 'src;' + (Join-Path $Root 'scripts')
+        $Psi.EnvironmentVariables['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + (Join-Path $Root 'scripts')
         $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME')
         foreach ($var in $envVars) {
             $val = [System.Environment]::GetEnvironmentVariable($var)
@@ -468,7 +468,6 @@ try {
 $null = Get-Job | Remove-Job -Force -ErrorAction SilentlyContinue
 
 Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $BranchRuntime)
-    Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $BranchRuntime)
 
     # -----------------------------------------------------------------------
     # Map branch results -> source statuses (with DB-derived observation dates)
