@@ -39,6 +39,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Release any stale mutex from previous runs
+try {
+    $staleMutex = [System.Threading.Mutex]::OpenExisting('Local\DBBuilderHourlyPipeline', [System.Threading.MutexRights]::Modify)
+    $staleMutex.ReleaseMutex()
+    $staleMutex.Close()
+    Write-Log 'DEBUG' 'Released stale mutex'
+} catch {
+    # Mutex doesn't exist or can't be opened - that's fine
+}
+
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
