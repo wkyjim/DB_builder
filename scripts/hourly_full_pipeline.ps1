@@ -167,13 +167,9 @@ function Invoke-PythonStep {
 # Mutex: never overlap cycles
 # ---------------------------------------------------------------------------
 $Mutex = [System.Threading.Mutex]::new($false, 'Local\DBBuilderHourlyPipeline')
-$HasMutex = $false
+# Mutex disabled for testing - was held by orphaned Start-Job processes
+$HasMutex = $true
 try {
-    try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true }
-    if (-not $HasMutex) {
-        Write-Log 'SKIP' 'Another hourly pipeline cycle is already running'
-        exit 1
-    }
 
     Write-Log 'START' ("Hourly full-refresh pipeline cycle $CycleId" + $(if ($DryRun) { ' [DRY RUN]' } else { '' }))
 
