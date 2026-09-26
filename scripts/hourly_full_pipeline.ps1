@@ -65,6 +65,43 @@ function Write-Log($Level, $Message) {
     Write-Host $Line
 }
 
+function New-ProcessInfo {
+    param(
+        [string]$Python,
+        [string]$ScriptPath,
+        [string]$WorkingDirectory,
+        [string]$ExtraArgs = ''
+    )
+    # Create per-branch log file for output capture
+    $scriptName = Split-Path $ScriptPath -LeafBase
+    $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    }
+    $branchLog = Join-Path $logDir ($scriptName + '.log')
+    # Use cmd.exe to redirect stdout/stderr to file (prevents pipe deadlock)
+    $cmdArgs = '/c "' + $Python + '" -u "' + $ScriptPath + '" ' + $ExtraArgs + ' > "' + $branchLog + '" 2>&1'
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = 'cmd.exe'
+    $pinfo.Arguments = $cmdArgs
+    $pinfo.WorkingDirectory = $WorkingDirectory
+    $pinfo.UseShellExecute = $false
+    $pinfo.CreateNoWindow = $true
+    # Forward critical environment variables explicitly
+    $pinfo.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
+    $pinfo.EnvironmentVariables['PYTHONPATH'] = Join-Path $WorkingDirectory 'src;' + (Join-Path $WorkingDirectory 'scripts')
+    # Forward database connection environment variables
+    $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','LOCAL_ENV_DIR','DB_BUILDER_ENV_DIR','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME','NEON_DB_USER','NEON_DB_PASSWORD')
+    foreach ($var in $envVars) {
+        $val = $env:$var
+        if ($val) {
+            $pinfo.EnvironmentVariables[$var] = $val
+        }
+    }
+    return $pinfo, $branchLog
+}
+}
+
 function Invoke-PythonStep {
     param(
         [string]$Script,
@@ -83,6 +120,15 @@ function Invoke-PythonStep {
         $Psi.Arguments = $Cmd
         $Psi.WorkingDirectory = $Root
         $Psi.UseShellExecute = $false
+        $Psi.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
+        $Psi.EnvironmentVariables['PYTHONPATH'] = Join-Path $Root 'src;' + (Join-Path $Root 'scripts')
+        $envVars = @('LOCAL_DATABASE_URL','LOCAL_DB_HOST','LOCAL_DB_PORT','LOCAL_DB_NAME','LOCAL_DB_USER','LOCAL_DB_PASSWORD','NEON_DATABASE_URL','NEON_DB_HOST','NEON_DB_NAME')
+        foreach ($var in $envVars) {
+            $val = $env:$var
+            if ($val) {
+                $Psi.EnvironmentVariables[$var] = $val
+            }
+        }
         $P = [System.Diagnostics.Process]::Start($Psi)
         $TimeoutMs = [Math]::Max(1, $TimeoutSeconds) * 1000
         if (-not $P.WaitForExit($TimeoutMs)) {
@@ -139,71 +185,43 @@ try {
     $BranchJobs = @()
 
     # Branch A: equities + indicators (us_equities, us_equities_indicators)
-    # pgSQL_equities_auto has no --local-only flag; Eastmoney flaps, so it gets
-    # 3 attempts with 60s gaps (mirrors the proven host .bat retry pattern).
+    # Session-aware refresh: pgSQL_equities_auto.py checks the trading calendar
+    # and local DB before fetching. If the latest completed NYSE session is already
+    # stored and indicators are current, the script exits in seconds.
+    # Historical gap repair (repair_historical_equity_gaps.py) is moved to a
+    # separate maintenance workflow, not the hourly critical path.
     $BranchJobs += Start-Job -Name 'BranchA_Equities' -ScriptBlock {
         param($Root, $Python, $Log, $DryRun)
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         if ($DryRun) {
             $sw.Stop()
             $s1 = Test-Path (Join-Path $Root 'scripts\pgSQL_equities_auto.py')
-            $s2 = Test-Path (Join-Path $Root 'scripts\repair_historical_equity_gaps.py')
-            $s3 = Test-Path (Join-Path $Root 'scripts\indicator_staged_backfill.py')
-            [pscustomobject]@{ Branch='A_equities'; Ok=($s1 -and $s2 -and $s3); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: equity scripts validated') }
+            [pscustomobject]@{ Branch='A_equities'; Ok=$s1; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: pgSQL_equities_auto.py validated (session-aware)') }
             return
         }
         $eqOk = $false
         for ($attempt = 1; $attempt -le 3; $attempt++) {
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName = $Python
-            $pinfo.Arguments = '"' + (Join-Path $Root 'scripts\pgSQL_equities_auto.py') + '"'
-            $pinfo.WorkingDirectory = $Root
-            $pinfo.UseShellExecute = $false
-            $pinfo.RedirectStandardOutput = $true
-            $pinfo.RedirectStandardError = $true
+            $pinfo, $branchLog = New-ProcessInfo -Python $Python -ScriptPath (Join-Path $Root 'scripts\pgSQL_equities_auto.py') -WorkingDirectory $Root
             $p = [System.Diagnostics.Process]::Start($pinfo)
             if (-not $p.WaitForExit(300000)) {
-                $p.Kill()
+                # Kill the cmd.exe process tree to terminate the Python child
+                $null = taskkill.exe /F /T /PID $p.Id 2>&1
+                $p.Kill() 2>$null
                 $sw.Stop()
-                return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (pgSQL_equities_auto)'); ExitCode=-1; Error=$null }
+                $diagOutput = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { 'No log file' }
+                return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (pgSQL_equities_auto) | Last: ' + $diagOutput); ExitCode=-1; Error=$null }
             }
+            $attemptOutput = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { '' }
             if ($p.ExitCode -eq 0) { $eqOk = $true; break }
             if ($attempt -lt 3) { Start-Sleep -Seconds 60 }
         }
         if (-not $eqOk) {
             $sw.Stop()
-            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('FAIL: pgSQL_equities_auto failed after 3 attempts'); ExitCode=-1; Error=$null }
+            $failOutput = if (Test-Path (Join-Path $Root 'reports\state\logs\pgSQL_equities_auto.log')) { Get-Content (Join-Path $Root 'reports\state\logs\pgSQL_equities_auto.log') -Raw -ErrorAction SilentlyContinue } else { 'No log' }
+            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('FAIL: pgSQL_equities_auto failed after 3 attempts | ' + $failOutput); ExitCode=-1; Error=$null }
         }
-        $pinfo2 = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo2.FileName = $Python
-        $pinfo2.Arguments = '"' + (Join-Path $Root 'scripts\repair_historical_equity_gaps.py') + '"'
-        $pinfo2.WorkingDirectory = $Root
-        $pinfo2.UseShellExecute = $false
-        $pinfo2.RedirectStandardOutput = $true
-        $pinfo2.RedirectStandardError = $true
-        $p2 = [System.Diagnostics.Process]::Start($pinfo2)
-        if (-not $p2.WaitForExit(300000)) {
-            $p2.Kill()
-            $sw.Stop()
-            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (repair_historical_equity_gaps)'); ExitCode=-1; Error=$null }
-        }
-        $r2 = $p2.StandardOutput.ReadToEnd() + $p2.StandardError.ReadToEnd()
-        $pinfo3 = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo3.FileName = $Python
-        $pinfo3.Arguments = '"' + (Join-Path $Root 'scripts\indicator_staged_backfill.py') + ' --stage all"'
-        $pinfo3.WorkingDirectory = $Root
-        $pinfo3.UseShellExecute = $false
-        $pinfo3.RedirectStandardOutput = $true
-        $pinfo3.RedirectStandardError = $true
-        $p3 = [System.Diagnostics.Process]::Start($pinfo3)
-        if (-not $p3.WaitForExit(300000)) {
-            $p3.Kill()
-            $sw.Stop()
-            return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after 300s (indicator_staged_backfill)'); ExitCode=-1; Error=$null }
-        }
-        $r3 = $p3.StandardOutput.ReadToEnd() + $p3.StandardError.ReadToEnd()
         $sw.Stop()
-        [pscustomobject]@{ Branch='A_equities'; Ok=($eqOk -and $LASTEXITCODE -eq 0); Seconds=$sw.Elapsed.TotalSeconds; ExitCode=$LASTEXITCODE; Error=$null; Output=($r2 + $r3 | Out-String) }
+        [pscustomobject]@{ Branch='A_equities'; Ok=$true; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=$attemptOutput }
     } -ArgumentList $Root, $Python, $Log, $DryRun
 
     # Branch B: macro markets (macro, macro_live) — includes ETF flow refresh
@@ -216,22 +234,18 @@ try {
             [pscustomobject]@{ Branch='B_macro'; Ok=$s1; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=('DRY RUN: macro script validated') }
             return
         }
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName = $Python
-        $pinfo.Arguments = '"' + (Join-Path $Root 'scripts\macro_data_fetch.py') + '"'
-        $pinfo.WorkingDirectory = $Root
-        $pinfo.UseShellExecute = $false
-        $pinfo.RedirectStandardOutput = $true
-        $pinfo.RedirectStandardError = $true
+        $pinfo, $branchLog = New-ProcessInfo -Python $Python -ScriptPath (Join-Path $Root 'scripts\macro_data_fetch.py') -WorkingDirectory $Root
         $p = [System.Diagnostics.Process]::Start($pinfo)
-        $out = $p.StandardOutput.ReadToEnd()
-        $err = $p.StandardError.ReadToEnd()
         if (-not $p.WaitForExit($MacroTimeoutSeconds * 1000)) {
-            $p.Kill(); $sw.Stop()
-            return [pscustomobject]@{ Branch='B_macro'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after ' + $MacroTimeoutSeconds + 's'); ExitCode=-1; Error=$null }
+            # Kill the cmd.exe process tree to terminate the Python child
+            $null = taskkill.exe /F /T /PID $p.Id 2>&1
+            $p.Kill() 2>$null; $sw.Stop()
+            $diagOutput = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { 'No log file' }
+            return [pscustomobject]@{ Branch='B_macro'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('TIMEOUT after ' + $MacroTimeoutSeconds + 's | Last: ' + $diagOutput); ExitCode=-1; Error=$null }
         }
+        $out = if (Test-Path $branchLog) { Get-Content $branchLog -Raw -ErrorAction SilentlyContinue } else { '' }
         $sw.Stop()
-        [pscustomobject]@{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=($out + $err); ExitCode=$p.ExitCode; Error=$null }
+        [pscustomobject]@{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=$out; ExitCode=$p.ExitCode; Error=$null }
     } -ArgumentList $Root, $Python, $MacroTimeoutSeconds, $DryRun
 
     # Branch C: economic data (economic_* tables) — natural cadence: check for new releases

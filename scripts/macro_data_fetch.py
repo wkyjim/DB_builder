@@ -795,7 +795,68 @@ def _investiny_date(value):
 # fallback (Treasury.gov XML for UST, yfinance for oil, yfinance index
 # proxies for Asia futures). Symbols with no fallback are recorded as
 # DEGRADED in cycle metadata rather than silently dropped.
-INVESTINY_CIRCUIT_BREAKER_TRIPS = 2
+INVESTINY_CIRCUIT_BREAKER_TRIPS = 1
+
+# Provider-level circuit breaker state (shared across all symbols in a cycle)
+_provider_breaker_open = False
+_provider_breaker_reason = None
+_provider_breaker_tripped_at = None
+_provider_requests_count = 0
+_provider_failure_count = 0
+
+
+def is_investiny_provider_available():
+    """Check if Investing.com provider is available for the current cycle.
+    
+    Returns True if the provider breaker is closed (available).
+    Returns False if the provider breaker is open (unavailable).
+    """
+    return not _provider_breaker_open
+
+
+def get_investiny_provider_state():
+    """Return the current provider breaker state dict for cycle metadata."""
+    return {
+        "provider_available": not _provider_breaker_open,
+        "breaker_tripped": _provider_breaker_open,
+        "reason": _provider_breaker_reason,
+        "tripped_at": _provider_breaker_tripped_at.isoformat() if _provider_breaker_tripped_at else None,
+        "requests_made": _provider_requests_count,
+        "failures": _provider_failure_count,
+    }
+
+
+def record_investiny_provider_failure(reason: str):
+    """Record a provider-level failure and open the breaker if threshold reached.
+    
+    This is called by the run_daily_update loop when a symbol encounter
+    a provider-wide error (403, 429, 5xx, connection failure).
+    """
+    global _provider_breaker_open, _provider_breaker_reason, _provider_breaker_tripped_at, _provider_failure_count
+    _provider_failure_count += 1
+    _provider_requests_count += 1
+    
+    # Check if this is a provider-wide error (403/429/5xx/connection)
+    is_provider_error = any(code in str(reason) for code in ["403", "429", "500", "502", "503", "504", "Connection", "SSL", "DNS", "timeout"])
+    
+    if is_provider_error:
+        _provider_breaker_open = True
+        _provider_breaker_reason = str(reason)
+        _provider_breaker_tripped_at = datetime.now(ZoneInfo("UTC"))
+        print(f"[INVESTINY PROVIDER BREAKER OPEN] {_provider_breaker_reason}")
+        return True  # Breaker opened
+    return False  # Transient error, breaker not opened
+
+
+def reset_investiny_provider_state():
+    """Reset provider breaker state for a new cycle."""
+    global _provider_breaker_open, _provider_breaker_reason, _provider_breaker_tripped_at, _provider_requests_count, _provider_failure_count
+    _provider_breaker_open = False
+    _provider_breaker_reason = None
+    _provider_breaker_tripped_at = None
+    _provider_requests_count = 0
+    _provider_failure_count = 0
+
 
 
 class InvestinyProviderUnavailable(RuntimeError):
@@ -1788,6 +1849,7 @@ def run_daily_update(
 
     all_live_rows = []
     outcomes = {}
+    reset_investiny_provider_state()  # Reset provider breaker state for new cycle
     observed_at = datetime.now(ZoneInfo("UTC"))
 
     for batch in chunk_list(yfinance_symbols, BATCH_SIZE):
@@ -1970,6 +2032,35 @@ def run_daily_update(
                 dry_run=dry_run,
             )
             continue
+
+            # Check provider availability BEFORE attempting any request
+            # If the provider breaker is already open from a previous symbol,
+            # skip immediately — no sleep, no retry, just route to fallback.
+            if not is_investiny_provider_available():
+                print(
+                    f"[INVESTINY PROVIDER UNAVAILABLE] {symbol} | ",
+                    f"skipping Investing.com; routing to fallback | ",
+                    f"reason={_provider_breaker_reason}"
+                )
+                rows = live_row = None
+                rows_fetched = 0
+                latest_observation = None
+                primary_failure_reason = (
+                    f"investing.com provider unavailable (circuit breaker): "
+                    f"{_provider_breaker_reason}"
+                )
+                _process_investiny_fallback_for_symbol(
+                    symbol=symbol,
+                    meta=meta,
+                    primary_failure_reason=primary_failure_reason,
+                    start_date=start_date,
+                    observed_at=observed_at,
+                    outcomes=outcomes,
+                    all_live_rows=all_live_rows,
+                    upsert_neon=upsert_neon,
+                    dry_run=dry_run,
+                )
+                continue
 
         try:
             print(f"[PROCESS INVESTING.COM] {symbol}")

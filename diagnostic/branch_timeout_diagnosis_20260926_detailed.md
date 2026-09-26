@@ -144,3 +144,60 @@ Already applied in commit `8749d46`:
 4. **PostgreSQL lock contention** — must inspect `pg_stat_activity` and `pg_locks` on Windows host
 5. **Exact Eastmoney page count** — depends on total equities in the database
 6. **Exact Investing.com symbol count** — depends on macro config
+
+
+## Session-Aware Equity Refresh Architecture (Post-fix)
+
+### Overview
+After the provider-level circuit breaker and session-aware refresh fixes, the hourly pipeline's Branch A architecture is:
+
+```
+Branch A (hourly):
+  pgSQL_equities_auto.py (single process, 300s timeout)
+    ├── latest_completed_nyse_session_date() from trading_calendar
+    ├── get_latest_stored_equity_session() → MAX(date) from us_equities
+    ├── get_latest_indicator_session() → MAX(date) from us_equities_indicators
+    ├── Decision matrix:
+    │   ├── Case A (both current): SKIP, exit <30s
+    │   ├── Case B (missing): fetch equities + indicators
+    │   ├── Case C (prices current, indicators missing): indicators only
+    │   └── Case D (fetch fails): provider fallback + breaker
+    └── daily_bulk_sync_to_neon()
+
+Removed from hourly Branch A:
+  - repair_historical_equity_gaps.py (moved to maintenance workflow)
+  - indicator_staged_backfill.py (superseded by pgSQL_equities_auto.py)
+
+Historical Gap Repair (separate maintenance):
+  - daily off-hours or weekly deep repair
+  - Identify historical gaps
+  - Repair them
+  - Validate completeness
+  - Update health status
+```
+
+### Branch A Decision Matrix
+
+| Case | Prices | Indicators | Action | Expected Runtime |
+|------|--------|-----------|--------|-----------------|
+| A | Current | Current | Skip everything | <30s |
+| B | Missing | Missing | Fetch + indicators | <300s |
+| C | Current | Missing | Indicators only | <60s |
+| D | Fetch fails | — | Provider fallback + breaker | <300s |
+
+### Trading Calendar Source
+- `latest_completed_nyse_session_date()` from `db_builder.trading_calendar`
+- Uses `pandas_market_calendars` NYSE calendar
+- Handles weekends, holidays, early closes
+- Timezone-aware: HKT/NY difference handled via `astimezone(timezone.utc)`
+
+### Cycle Metadata Fields
+- `latest_completed_equity_session`: NYSE trading calendar's latest session
+- `latest_stored_equity_session`: DB MAX(date) from raw equities table
+- `latest_indicator_session`: DB MAX(date) from indicators table
+- `equity_refresh_status`: `UPDATED` or `SKIPPED_ALREADY_CURRENT`
+- `indicator_refresh_status`: `UPDATED` or `SKIPPED_ALREADY_CURRENT`
+
+### Healthy State Definition
+`SKIPPED_ALREADY_CURRENT` is a **successful** state, NOT degradation.
+It means the data is already current and no work is needed.

@@ -176,6 +176,14 @@ def fetch_and_save_all(
         "Connection": "close",
     }
 
+    # Provider-level state initialization
+    provider_circuit_breaker_open = False
+    provider_breaker_reason: str | None = None
+    provider_403_count = 0
+    provider_429_count = 0
+    provider_5xx_count = 0
+    provider_connection_errors = 0
+
     try:
         init_resp = requests.get(get_api_url(pn=1, pz=1), headers=headers, timeout=15)
         init_resp.raise_for_status()
@@ -184,7 +192,59 @@ def fetch_and_save_all(
         total_pages = ceil(total_count / pz)
         print(f"Total equities: {total_count} | pages: {total_pages} | date: {target_date}")
     except Exception as exc:
-        raise RuntimeError("Initial Eastmoney request failed") from exc
+        # --- Provider breaker opens on initial-request failure ---
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code is not None:
+            if status_code == 403:
+                provider_403_count = 1
+                provider_breaker_reason = f"initial request HTTP 403"
+            elif status_code == 429:
+                provider_429_count = 1
+                provider_breaker_reason = f"initial request HTTP 429"
+            elif status_code >= 500:
+                provider_5xx_count = 1
+                provider_breaker_reason = f"initial request HTTP {status_code}"
+            else:
+                provider_breaker_reason = f"initial request HTTP {status_code}"
+        else:
+            error_str = str(exc)
+            if any(code in error_str for code in ["403", "429", "500", "502", "503", "504"]):
+                provider_5xx_count = 1
+                provider_breaker_reason = f"initial request {error_str[:80]}"
+            else:
+                provider_connection_errors = 1
+                provider_breaker_reason = f"initial request connection/timeout error"
+
+        provider_circuit_breaker_open = True
+        print(f"[EASTMONEY] Initial request {provider_breaker_reason} — provider breaker opened")
+        print(f"[EASTMONEY] Invoking yfinance fallback for latest session {target_date}")
+
+        # --- Invoke configured single-stock fallback path ---
+        try:
+            prior_universe = fetch_prior_session_universe(engine, target_date, table_name)
+            expected_tickers = set(prior_universe["ticker"].astype(str).str.upper())
+            if not expected_tickers:
+                raise RuntimeError("No prior-session universe available for fallback")
+            fallback = fetch_missing_session_rows(
+                prior_universe,
+                expected_tickers,
+                target_date,
+                allow_non_trading_day=allow_non_trading_day,
+            )
+            if not fallback.frame.empty:
+                fallback_frame = replace_ytd_pct_chg_with_local_calculation(
+                    engine, fallback.frame, table_name, target_date=target_date
+                )
+                _upsert_dataframe(engine, target_table, fallback_frame)
+            print(f"[FALLBACK] Latest session {target_date} stored via yfinance fallback")
+            print(f"[FALLBACK] Recovered {len(fallback.found):,} of {len(expected_tickers):,} tickers")
+        except Exception as fallback_exc:
+            print(f"[FALLBACK ERROR] {fallback_exc}")
+            raise RuntimeError(
+                f"Eastmoney unavailable and fallback failed for session {target_date}"
+            ) from fallback_exc
+
+        return  # Branch A continues: pgSQL_equities_auto.py will run indicators
 
     pages_to_fetch = 1 if dry_run else total_pages
     successful_pages = 0
@@ -206,7 +266,7 @@ def fetch_and_save_all(
                     print(f"[page {pn}] no data; retrying")
                     retries += 1
                     no_data_pages += 1
-                    if no_data_pages >= MAX_NO_DATA_PAGES:
+                    if no_data_pages >= MAX_NO_DATA_PAGES or provider_circuit_breaker_open:
                         print(f"Provider circuit breaker tripped: {no_data_pages} consecutive no-data pages")
                         return []
                     time.sleep(3)
@@ -244,15 +304,48 @@ def fetch_and_save_all(
                 success = True
                 time.sleep(random.uniform(0.6, 1.5))
 
-            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError):
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError, requests.exceptions.Timeout):
                 retries += 1
+                provider_connection_errors += 1
                 wait_time = retries * 10
                 print(f"Connection interrupted; waiting {wait_time} seconds before retry")
                 time.sleep(wait_time)
+                # Check if connection errors indicate provider-wide issue
+                if provider_connection_errors >= 3:
+                    provider_circuit_breaker_open = True
+                    provider_breaker_reason = f"{provider_connection_errors} connection errors"
+                    return []
+            except requests.exceptions.HTTPError as exc:
+                retries += 1
+                status_code = getattr(exc, "response", None)
+                if status_code is not None:
+                    status_code = status_code.status_code
+                    if status_code == 403:
+                        provider_403_count += 1
+                    elif status_code == 429:
+                        provider_429_count += 1
+                    elif status_code >= 500:
+                        provider_5xx_count += 1
+                print(f"Eastmoney HTTP error ({exc}): page {pn}")
+                time.sleep(3)
+                # Check if HTTP errors indicate provider-wide issue
+                total_http_failures = provider_403_count + provider_429_count + provider_5xx_count
+                if total_http_failures >= 3:
+                    provider_circuit_breaker_open = True
+                    provider_breaker_reason = f"{total_http_failures} HTTP errors (403:{provider_403_count} 429:{provider_429_count} 5xx:{provider_5xx_count})"
+                    return []
             except Exception as exc:
                 retries += 1
                 print(f"Eastmoney page error: {exc}")
                 time.sleep(3)
+                # Check for provider-wide error indicators in message
+                error_str = str(exc)
+                if any(code in error_str for code in ["403", "429", "500", "502", "503", "504"]):
+                    total_http_failures = provider_403_count + provider_429_count + provider_5xx_count + 1
+                    if total_http_failures >= 3:
+                        provider_circuit_breaker_open = True
+                        provider_breaker_reason = f"HTTP error in exception: {error_str}"
+                        return []
 
         if not success:
             failed_pages.append(pn)
