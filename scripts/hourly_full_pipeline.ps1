@@ -444,7 +444,8 @@ try {
             $JobId = $Job.Id
             $ExistingJob = Get-Job -Id $JobId -ErrorAction SilentlyContinue
             if ($null -ne $ExistingJob) {
-                # Remove immediately without re-checking state or re-calling Stop-Job
+                # Remove immediately without re-checking state
+                $null = Stop-Job -Job $ExistingJob -ErrorAction SilentlyContinue
                 Remove-Job -Job $ExistingJob -Force -ErrorAction SilentlyContinue
             }
         } catch {
