@@ -100,7 +100,6 @@ function New-ProcessInfo {
     }
     return $pinfo, $branchLog
 }
-}
 
 function Invoke-PythonStep {
     param(
