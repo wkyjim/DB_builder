@@ -73,7 +73,7 @@ function New-ProcessInfo {
         [string]$ExtraArgs = ''
     )
     # Create per-branch log file for output capture
-    $scriptName = Split-Path $ScriptPath -LeafBase
+    $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
     $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
     if (-not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -198,7 +198,7 @@ try {
                 [string]$WorkingDirectory,
                 [string]$ExtraArgs = ''
             )
-            $scriptName = Split-Path $ScriptPath -LeafBase
+            $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
             $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
             if (-not (Test-Path $logDir)) {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -264,7 +264,7 @@ try {
                 [string]$WorkingDirectory,
                 [string]$ExtraArgs = ''
             )
-            $scriptName = Split-Path $ScriptPath -LeafBase
+            $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
             $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
             if (-not (Test-Path $logDir)) {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -319,7 +319,7 @@ try {
                 [string]$WorkingDirectory,
                 [string]$ExtraArgs = ''
             )
-            $scriptName = Split-Path $ScriptPath -LeafBase
+            $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
             $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
             if (-not (Test-Path $logDir)) {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -367,7 +367,7 @@ try {
                 [string]$WorkingDirectory,
                 [string]$ExtraArgs = ''
             )
-            $scriptName = Split-Path $ScriptPath -LeafBase
+            $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
             $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
             if (-not (Test-Path $logDir)) {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -415,7 +415,7 @@ try {
                 [string]$WorkingDirectory,
                 [string]$ExtraArgs = ''
             )
-            $scriptName = Split-Path $ScriptPath -LeafBase
+            $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($ScriptPath)
             $logDir = Join-Path $WorkingDirectory 'reports\state\logs'
             if (-not (Test-Path $logDir)) {
                 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
