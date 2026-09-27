@@ -21,7 +21,7 @@ if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 }
 
-$cycle     = Get-Date -Format 'yyyyMMdd_HHmm_HKT'
+$cycle       = (Get-Date -Format 'yyyyMMdd_HHmm') + '_HKT'
 $outLog    = Join-Path $logDir "live_${cycle}.out.log"
 $errLog    = Join-Path $logDir "live_${cycle}.err.log"
 
@@ -43,13 +43,13 @@ $proc = Start-Process `
     -WindowStyle Hidden `
     -PassThru
 
-$pid        = $proc.Id
-$timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+$childPid    = $proc.Id
+$timestamp   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
 $lines = @(
     "Cycle=$cycle",
-    "PID=$pid",
-    "Status=STARTED PID=$pid",
+    "PID=$childPid",
+    "Status=STARTED PID=$childPid",
     "StdOutLog=$outLog",
     "StdErrLog=$errLog",
     "EntryPoint=$entryPoint",
@@ -60,7 +60,7 @@ $lines = @(
 [System.IO.File]::WriteAllLines($resultPath, $lines, [System.Text.Encoding]::UTF8)
 
 Write-Output "Cycle=$cycle"
-Write-Output "PID=$pid"
+Write-Output "PID=$childPid"
 Write-Output "Status=STARTED"
 Write-Output "StdOutLog=$outLog"
 Write-Output "StdErrLog=$errLog"
