@@ -618,7 +618,9 @@ def test_coverage_summary_all_provider_success():
     assert summary.successful_count == len(macro_data_fetch.ASSETS)
     assert summary.failed_count == 0
     assert summary.coverage_pct == 100.0
-    assert summary.provider_failure_counts == (("investing.com", 0), ("yfinance", 0))
+    # Phase A (additive): the official CMT series adds a third provider.
+    assert summary.provider_failure_counts == (
+        ("investing.com", 0), ("treasury.gov", 0), ("yfinance", 0))
     assert summary.exit_code == 0
 
 
@@ -1062,8 +1064,12 @@ def configure_treasury_freshness(monkeypatch, expected=date(2026, 7, 8),
 
 def test_ust_fallback_scope_is_exactly_seven_symbols():
     """All seven maturities are in scope; map covers each canonical symbol."""
-    assert macro_data_fetch.UST_TREASURY_FALLBACK_SYMBOLS == set(UST_SYMBOLS)
-    assert set(macro_data_fetch.TREASURY_XML_ELEMENT_MAP) == set(UST_SYMBOLS)
+    # Phase A (additive): the official CMT series extends the fallback set and
+    # the element map; the legacy seven remain exactly as before.
+    assert set(UST_SYMBOLS) <= macro_data_fetch.UST_TREASURY_FALLBACK_SYMBOLS
+    assert set(UST_SYMBOLS) <= set(macro_data_fetch.TREASURY_XML_ELEMENT_MAP)
+    assert macro_data_fetch.UST_TREASURY_FALLBACK_SYMBOLS - set(UST_SYMBOLS) == \
+        set(macro_data_fetch.CMT_SYMBOLS)
     assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US2YT=X"] == "BC_2YEAR"
     assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US10YT=X"] == "BC_10YEAR"
     assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US30YT=X"] == "BC_30YEAR"
@@ -1408,7 +1414,11 @@ def test_ust_fallback_live_row_source_is_treasury_gov(monkeypatch):
     assert live_row is not None
     assert live_row["source"] == "treasury.gov"
     assert live_row["symbol"] == "US10YT=X"
-    assert live_row["is_market_closed"] is True
+    # Phase A: is_market_closed describes MARKET CLOSURE only. An official
+    # value that is the latest observation is still a servable live snapshot;
+    # protection against unofficial values entering history is provided by the
+    # EOD gate (official value matching), not by this flag.
+    assert live_row["is_market_closed"] is False
     assert live_row["market_date"] == date(2026, 7, 8)
 
 

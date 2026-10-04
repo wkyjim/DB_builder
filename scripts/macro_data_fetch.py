@@ -15,6 +15,26 @@ import _bootstrap  # noqa: F401
 from db_builder.config import MACRO_TABLE, local_engine as make_local_engine
 from db_builder.config import neon_engine as make_neon_engine
 from db_builder.trading_calendar import latest_completed_nyse_session_date
+from db_builder.session_calendar import (
+    CMT_SYMBOLS,
+    MARKET_REFERENCE_SYMBOLS,
+    ROUTE_DEFERRED,
+    ROUTE_HISTORICAL,
+    ROUTE_REJECT,
+    SessionStatus,
+    TENOR_BY_CMT_SYMBOL,
+    TREASURY_PUBLICATION_SYMBOLS,
+    TREASURY_SYMBOLS,
+    historical_eligibility,
+    adapter_for,
+    previous_valid_session,
+    treasury_publication_confirmed,
+)
+from db_builder.deferred_history import (
+    MAX_ATTEMPTS,
+    RECOVERY_BATCH,
+    RECOVERY_DAYS,
+)
 
 # ============================================================
 # CONFIG
@@ -25,6 +45,26 @@ LIVE_TABLE_NAME = "public.macro_live"
 
 BATCH_SIZE = 50
 GLOBAL_BUFFER_MINUTES = 30
+
+# Phase A: official Treasury.gov session dates actually observed in this run.
+# Populated by the Treasury fetch path and consumed by the EOD gate so that
+# USnYT=X requires the *actual* publication for the specific session rather
+# than a time-based assumption.
+_TREASURY_PUBLISHED_DATES: set = set()
+# Phase A: official (symbol, session_date) -> official par-yield value actually
+# observed in the Treasury.gov response. A date-only check must never authorise
+# an unofficial value, so the gate verifies the row's own close against this.
+_TREASURY_PUBLISHED_VALUES: dict = {}
+# Absolute tolerance when matching a stored close to the official par yield.
+# Par yields are published to 2-4 dp; anything coarser than this is a different
+# source, not rounding.
+TREASURY_VALUE_TOLERANCE = 5e-5
+
+# Phase A safety telemetry: populated by the EOD gate and consumed by the
+# exit-code/alert path so a calendar failure raises an explicit alert instead
+# of exiting 0 (coverage measures fetch success, not gate eligibility).
+_PHASE_A_UNAVAILABLE_SYMBOLS: list = []
+_PHASE_A_DEFERRED_COUNT: int = 0
 
 # Target window to insert/update
 LOOKBACK_DAYS = 5
@@ -92,7 +132,7 @@ UST_TREASURY_FALLBACK_SYMBOLS = frozenset(
         "US20YT=X",
         "US30YT=X",
     }
-)
+) | CMT_SYMBOLS
 TREASURY_XML_ELEMENT_MAP = {
     "US2YT=X": "BC_2YEAR",
     "US3YT=X": "BC_3YEAR",
@@ -102,6 +142,16 @@ TREASURY_XML_ELEMENT_MAP = {
     "US20YT=X": "BC_20YEAR",
     "US30YT=X": "BC_30YEAR",
 }
+# Official CMT series: same tenor elements, distinct symbol identity.
+TREASURY_XML_ELEMENT_MAP.update({
+    "US2YT_CMT": "BC_2YEAR",
+    "US3YT_CMT": "BC_3YEAR",
+    "US5YT_CMT": "BC_5YEAR",
+    "US7YT_CMT": "BC_7YEAR",
+    "US10YT_CMT": "BC_10YEAR",
+    "US20YT_CMT": "BC_20YEAR",
+    "US30YT_CMT": "BC_30YEAR",
+})
 TREASURY_XML_URL_TEMPLATE = (
     "https://home.treasury.gov/resource-center/data-chart-center/"
     "interest-rates/pages/xml?data=daily_treasury_yield_curve"
@@ -165,6 +215,16 @@ ASSETS = [
     ("US10YT=X", "United States 10-Year Treasury Yield", "ust_yield"),
     ("US20YT=X", "United States 20-Year Treasury Yield", "ust_yield"),
     ("US30YT=X", "United States 30-Year Treasury Yield", "ust_yield"),
+
+    # Official Treasury.gov constant-maturity par-yield series (additive).
+    # Distinct symbols so legacy USnYT=X rows/metadata are never touched.
+    ("US2YT_CMT", "US Treasury 2-Year CMT Par Yield", "ust_yield_cmt"),
+    ("US3YT_CMT", "US Treasury 3-Year CMT Par Yield", "ust_yield_cmt"),
+    ("US5YT_CMT", "US Treasury 5-Year CMT Par Yield", "ust_yield_cmt"),
+    ("US7YT_CMT", "US Treasury 7-Year CMT Par Yield", "ust_yield_cmt"),
+    ("US10YT_CMT", "US Treasury 10-Year CMT Par Yield", "ust_yield_cmt"),
+    ("US20YT_CMT", "US Treasury 20-Year CMT Par Yield", "ust_yield_cmt"),
+    ("US30YT_CMT", "US Treasury 30-Year CMT Par Yield", "ust_yield_cmt"),
 
     ("EURUSD=X", "EUR/USD", "fx"),
     ("DX-Y.NYB", "US Dollar Index", "fx"),
@@ -301,6 +361,17 @@ SYMBOL_CLOSE_MAP = {
     "US10YT=X": {"tz": "America/New_York", "close_time": "16:00"},
     "US20YT=X": {"tz": "America/New_York", "close_time": "16:00"},
     "US30YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+
+    # Official CMT series: same US business-day/16:00 ET reference as the
+    # legacy symbols. Session confirmation still comes from the actual
+    # Treasury.gov publication for the specific session.
+    "US2YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
+    "US3YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
+    "US5YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
+    "US7YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
+    "US10YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
+    "US20YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
+    "US30YT_CMT": {"tz": "America/New_York", "close_time": "16:00"},
 
     "EURUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
     "DX-Y.NYB": {"tz": "America/New_York", "close_time": "17:00"},
@@ -502,9 +573,357 @@ def fetch_existing_symbol_dates(engine, symbols, min_date, max_date):
     return df
 
 
-def upsert_macro(engine, rows):
+def _existing_historical_dates(engine, symbol, min_date, max_date):
+    """Session dates already confirmed in historical storage for ``symbol``."""
+    sql = text("""
+        SELECT date
+        FROM public.macro
+        WHERE symbol = :symbol
+          AND date BETWEEN :min_date AND :max_date
+    """)
+    try:
+        with engine.begin() as conn:
+            df = pd.read_sql(
+                sql,
+                conn,
+                params={
+                    "symbol": symbol,
+                    "min_date": min_date,
+                    "max_date": max_date,
+                },
+            )
+    except Exception as exc:
+        print(f"[GATE WARN] prior-session lookup failed for {symbol}: {exc}")
+        return None
+
+    if df.empty:
+        return set()
+
+    return {pd.to_datetime(v).date() for v in df["date"]}
+
+
+def official_value_matches(symbol, session_date, value, *, published_values=None):
+    """Phase A: the row's own close must BE the official observed value.
+
+    A publication *date* alone must never authorise a historical write: an
+    Investing.com/Yahoo-derived value for the same symbol/date/tenor must be
+    rejected. When no official value has been recorded the answer is False
+    (fail closed).
+    """
+    if value is None or session_date is None:
+        return False
+    table = _TREASURY_PUBLISHED_VALUES if published_values is None else published_values
+    official = table.get((symbol, session_date))
+    if official is None:
+        return False
+    try:
+        return abs(float(value) - float(official)) <= TREASURY_VALUE_TOLERANCE
+    except (TypeError, ValueError):
+        return False
+
+
+def official_value_recorded(symbol, session_date, *, published_values=None):
+    """Phase A: is the official observation for this session recorded?"""
+    if session_date is None:
+        return False
+    table = _TREASURY_PUBLISHED_VALUES if published_values is None else published_values
+    return (symbol, session_date) in table
+
+
+def official_prior_confirmed(symbol, expected_prior, *, treasury_published_dates=None):
+    """Phase A: official-EOD source consistency for ``prev_close``.
+
+    ``prev_close`` on an official historical row must resolve from the previous
+    *valid* session AND that prior value must be present in the same official
+    source series. Otherwise the official series is incomplete for this symbol
+    and the dependent fields would silently mix sources (e.g. an official close
+    against an Investing.com/Yahoo-derived prior close).
+
+    Symbols without a publication-confirmed source always return True.
+    """
+    if expected_prior is None:
+        return False
+    if symbol not in TREASURY_SYMBOLS:
+        return True
+    return treasury_publication_confirmed(
+        expected_prior, treasury_published_dates)
+
+
+def _eligible_for_historical(row, *, known_prior_sessions=None,
+                             treasury_published_dates=None, now_utc=None,
+                             treasury_published_values=None):
+    """Phase A EOD write gate.
+
+    Returns an ``Eligibility`` decision. Fail-closed: any error yields a
+    non-eligible decision, so an exception can never produce a historical write.
+
+    For publication-confirmed symbols the row's own ``close`` must match the
+    official observed value: a publication date alone never authorises a
+    historical write, so an Investing.com/Yahoo-derived value for the same
+    symbol/date is deferred instead of being stored as official EOD.
+    """
+    try:
+        session_date = pd.to_datetime(row["date"]).date()
+        decision = historical_eligibility(
+            row["symbol"],
+            session_date,
+            known_prior_sessions=known_prior_sessions,
+            now_utc=now_utc,
+            treasury_published_dates=treasury_published_dates,
+        )
+        if decision.routing != ROUTE_HISTORICAL:
+            return decision
+        # Phase A (additive): the legacy ``USnYT=X`` series is frozen for
+        # historical writes until its own EOD definition is resolved. Its live
+        # macro_live reporting is unaffected. Treasury.gov CMT values are never
+        # routed into the legacy symbols.
+        if row["symbol"] in TREASURY_SYMBOLS:
+            from db_builder.session_calendar import Eligibility
+            return Eligibility(
+                symbol=row["symbol"],
+                session_date=session_date,
+                eligible=False,
+                routing=ROUTE_DEFERRED,
+                reason="LEGACY_EOD_DEFINITION_UNRESOLVED",
+                session_status=decision.session_status,
+                calendar=decision.calendar,
+                expected_prior=decision.expected_prior,
+            )
+        if row["symbol"] in CMT_SYMBOLS:
+            if not official_value_matches(
+                    row["symbol"], session_date, row.get("close"),
+                    published_values=treasury_published_values):
+                from db_builder.session_calendar import Eligibility
+                return Eligibility(
+                    symbol=row["symbol"],
+                    session_date=session_date,
+                    eligible=False,
+                    routing=ROUTE_DEFERRED,
+                    reason="CMT_VALUE_NOT_OFFICIAL",
+                    session_status=decision.session_status,
+                    calendar=decision.calendar,
+                    expected_prior=decision.expected_prior,
+                )
+            # The previous close must come from the previous *official* CMT
+            # observation of the same tenor, not merely a prior session date.
+            if not official_value_recorded(
+                    row["symbol"], decision.expected_prior,
+                    published_values=treasury_published_values):
+                from db_builder.session_calendar import Eligibility
+                return Eligibility(
+                    symbol=row["symbol"],
+                    session_date=session_date,
+                    eligible=False,
+                    routing=ROUTE_DEFERRED,
+                    reason="CMT_PREVIOUS_VALUE_NOT_OFFICIAL",
+                    session_status=decision.session_status,
+                    calendar=decision.calendar,
+                    expected_prior=decision.expected_prior,
+                )
+        return decision
+    except Exception as exc:                       # fail closed
+        from db_builder.session_calendar import Eligibility
+        return Eligibility(
+            symbol=str(row.get("symbol")),
+            session_date=pd.to_datetime(row.get("date")).date()
+            if row.get("date") is not None else None,
+            eligible=False,
+            routing=ROUTE_DEFERRED,
+            reason=f"GATE_ERROR:{type(exc).__name__}",
+            session_status=SessionStatus.CLOSED_UNCONFIRMED,
+            calendar="error",
+        )
+
+
+def route_historical_rows(engine, rows, *, mode="INGEST",
+                          treasury_published_dates=None, now_utc=None,
+                          deferred_store=None, prior_lookup=None,
+                          treasury_published_values=None):
+    """Split candidate rows into HISTORICAL / DEFERRED / REJECTED.
+
+    A completed historical bar whose prior session is missing is DEFERRED: it is
+    neither written to ``public.macro`` nor to ``public.macro_live``.
+
+    ``prior_lookup(engine, symbol, min_date, max_date)`` may be injected; it must
+    return the set of confirmed prior session dates, or None on failure
+    (fail-closed). Defaults to the historical-table lookup.
+    """
     if not rows:
-        return
+        return [], [], []
+
+    if mode != "INGEST":
+        return list(rows), [], []
+
+    lookup = prior_lookup or _existing_historical_dates
+
+    if treasury_published_dates is None:
+        treasury_published_dates = _TREASURY_PUBLISHED_DATES or None
+    if treasury_published_values is None:
+        treasury_published_values = _TREASURY_PUBLISHED_VALUES or None
+
+    df = pd.DataFrame(rows)
+    df["_d"] = pd.to_datetime(df["date"]).dt.date
+    min_date = df["_d"].min() - timedelta(days=10)
+    max_date = df["_d"].max()
+
+    accepted, deferred, rejected = [], [], []
+    by_symbol = {}
+    for rec in rows:
+        by_symbol.setdefault(rec["symbol"], []).append(rec)
+
+    for symbol, symbol_rows in by_symbol.items():
+        known = lookup(engine, symbol, min_date, max_date)
+        if known is None:
+            # Lookup failed -> fail closed, defer the whole symbol.
+            for rec in symbol_rows:
+                deferred.append((rec, "PRIOR_SESSION_LOOKUP_FAILED"))
+                continue
+            continue
+        # A prior session present earlier in this same batch also counts.
+        batch_dates = {pd.to_datetime(r["date"]).date() for r in symbol_rows}
+        known_all = set(known) | batch_dates
+
+        for rec in symbol_rows:
+            decision = _eligible_for_historical(
+                rec,
+                known_prior_sessions=known_all,
+                treasury_published_dates=treasury_published_dates,
+                now_utc=now_utc,
+                treasury_published_values=treasury_published_values,
+            )
+            if decision.routing == ROUTE_HISTORICAL:
+                accepted.append(rec)
+            elif decision.routing == ROUTE_REJECT:
+                rejected.append((rec, decision.reason))
+            else:
+                deferred.append((rec, decision.reason))
+
+    if deferred and deferred_store is not None:
+        for rec, reason in deferred:
+            try:
+                deferred_store.record_deferral(
+                    rec["symbol"], pd.to_datetime(rec["date"]).date(), reason,
+                    now=now_utc)
+            except Exception as exc:
+                print(f"[DEFERRED WARN] could not persist deferral "
+                      f"{rec['symbol']} {rec['date']}: {exc}")
+
+    global _PHASE_A_DEFERRED_COUNT
+    _PHASE_A_DEFERRED_COUNT += len(deferred)
+    for rec, reason in deferred:
+        if reason in ("CLOSED_UNCONFIRMED", "SOURCE_DEFINITION_UNRESOLVED") \
+                or reason.startswith("CALENDAR"):
+            _PHASE_A_UNAVAILABLE_SYMBOLS.append(
+                {"symbol": rec.get("symbol"), "reason": reason})
+
+    for rec, reason in deferred:
+        print(f"[DEFERRED_HISTORY] {rec['symbol']} {rec['date']} "
+              f"-> {reason} (not written to macro or macro_live)")
+    for rec, reason in rejected:
+        print(f"[REJECT_NON_SESSION] {rec['symbol']} {rec['date']} -> {reason}")
+
+    return accepted, deferred, rejected
+
+
+def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
+                          limit=RECOVERY_BATCH, recovery_days=RECOVERY_DAYS,
+                          max_attempts=MAX_ATTEMPTS, prior_lookup=None):
+    """Bounded retry of deferred historical sessions.
+
+    ``fetch_symbol_rows(symbol, dates)`` must return historical row dicts for the
+    requested dates (same shape as ``calculate_rows_for_symbol`` output).
+    Rows that are still missing their prior session stay DEFERRED; rows that can
+    now be built are written through the normal gate and marked RESOLVED.
+
+    Bounded by ``limit`` per run so an hourly cycle never becomes a historical
+    backfill. Rows are never deleted: repeated/expired failures escalate to
+    DEFERRED_HISTORY_UNRESOLVED but remain tracked.
+    """
+    now = now_utc or datetime.now(ZoneInfo("UTC"))
+    candidates = store.due_candidates(now=now, limit=limit,
+                                      recovery_days=recovery_days)
+    if not candidates:
+        # Still run escalation: rows past the horizon / attempt limit must be
+        # flagged even when nothing is retried this cycle.
+        escalated = store.escalate_stale(now=now, recovery_days=recovery_days,
+                                         max_attempts=max_attempts)
+        for row in escalated:
+            print(f"[DEFERRED_HISTORY_UNRESOLVED] {row.symbol} "
+                  f"{row.session_date} attempts={row.attempt_count} "
+                  f"(retained in tracking)")
+        return {"retried": 0, "resolved": 0, "still_deferred": 0,
+                "escalated": len(escalated)}
+
+    print(f"[DEFERRED RECOVERY] candidates={len(candidates)} "
+          f"(bounded to {limit} per run)")
+
+    resolved = 0
+    still = 0
+    for cand in candidates:
+        try:
+            rows = fetch_symbol_rows(cand.symbol, [cand.session_date])
+        except Exception as exc:
+            print(f"[DEFERRED RECOVERY] fetch failed {cand.symbol} "
+                  f"{cand.session_date}: {exc}")
+            store.record_deferral(cand.symbol, cand.session_date,
+                                  f"RECOVERY_FETCH_ERROR:{type(exc).__name__}",
+                                  now=now)
+            still += 1
+            continue
+
+        match = [r for r in (rows or [])
+                 if pd.to_datetime(r["date"]).date() == cand.session_date]
+        if not match:
+            store.record_deferral(cand.symbol, cand.session_date,
+                                  "RECOVERY_DATA_STILL_MISSING", now=now)
+            still += 1
+            continue
+
+        written = upsert_macro(engine, match, mode="INGEST",
+                               prior_lookup=prior_lookup)
+        if written:
+            store.record_success(cand.symbol, cand.session_date, now=now)
+            print(f"[DEFERRED RECOVERY] RESOLVED {cand.symbol} "
+                  f"{cand.session_date}")
+            resolved += 1
+        else:
+            store.record_deferral(cand.symbol, cand.session_date,
+                                  "RECOVERY_PRIOR_STILL_UNCONFIRMED", now=now)
+            still += 1
+
+    escalated = store.escalate_stale(now=now, recovery_days=recovery_days,
+                                     max_attempts=max_attempts)
+    for row in escalated:
+        print(f"[DEFERRED_HISTORY_UNRESOLVED] {row.symbol} "
+              f"{row.session_date} attempts={row.attempt_count} "
+              f"(retained in tracking)")
+
+    return {"retried": len(candidates), "resolved": resolved,
+            "still_deferred": still, "escalated": len(escalated)}
+
+
+def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
+                 treasury_published_dates=None):
+    """Write historical rows.
+
+    ``mode="INGEST"`` (default) enforces the Phase A EOD write gate: only rows
+    whose session is CONFIRMED_COMPLETED *and* whose immediately prior valid
+    session is confirmed may be written. Deferred/rejected rows never reach SQL.
+
+    ``mode="RECONCILE"`` is reserved for Phase B reconciliation, which has its
+    own explicit eligibility verdict; it is intentionally not implemented here.
+    """
+    if not rows:
+        return 0
+
+    if mode == "INGEST":
+        rows, _deferred, _rejected = route_historical_rows(
+            engine, rows, prior_lookup=prior_lookup,
+            treasury_published_dates=treasury_published_dates,
+            treasury_published_values=_TREASURY_PUBLISHED_VALUES or None)
+        if not rows:
+            print("[GATE] no eligible historical rows after EOD gate")
+            return 0
 
     df = pd.DataFrame(rows)
     df = df.where(pd.notna(df), None)
@@ -539,6 +958,8 @@ def upsert_macro(engine, rows):
     with engine.begin() as conn:
         conn.execute(sql, df.to_dict(orient="records"))
 
+    return len(df)
+
 
 # ============================================================
 # HELPERS
@@ -563,7 +984,21 @@ def get_close_config(symbol):
 
 
 def symbol_date_has_closed(symbol, bar_date):
+    """Time-based close test for a bar date, plus Phase A trading-day validity.
+
+    H1: the original test was time-only, so a provider row labelled a holiday or
+    weekend passed whenever ``now >= close_time``. A non-session date is now
+    rejected before the time comparison.
+
+    The trading-day test is calendar-aware and fail-closed: an unknown or
+    unavailable calendar returns False (defer), never True. It is deliberately
+    NOT a weekday-only rule, because crypto trades weekends and Globex has a
+    Sunday session.
+    """
     cfg = get_close_config(symbol)
+
+    if not adapter_for(symbol).is_trading_day(bar_date):
+        return False
 
     tz = ZoneInfo(cfg["tz"])
     now_local = datetime.now(tz)
@@ -600,14 +1035,28 @@ def remove_unfinished_bars(df, symbol):
     return df[keep_mask].copy()
 
 
-def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None, source_label=None):
-    """Return the latest incomplete daily bar as a transient live snapshot."""
+def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None, source_label=None,
+                                  allow_closed_session=False):
+    """Return the latest incomplete daily bar as a transient live snapshot.
+
+    Phase A dual-source rule: a *closed* session whose official EOD value is not
+    yet published (e.g. Treasury.gov par yields) must still be observable live.
+    ``allow_closed_session`` admits that case; the row stays labelled
+    ``is_market_closed=False`` so it can never be mistaken for official EOD.
+    """
     if df.empty or len(df) < 2:
         return None
 
     ordered = df.sort_values("Date").copy()
     latest_date = pd.to_datetime(ordered.iloc[-1]["Date"]).date()
-    if symbol_date_has_closed(symbol, latest_date):
+
+    # Phase A: only a genuine trading day may produce a live snapshot. A
+    # provider row labelled a holiday/weekend (e.g. a Saturday FX/futures row)
+    # must not become a live observation either. Calendar-aware and fail-closed.
+    if not adapter_for(symbol).is_trading_day(latest_date):
+        return None
+
+    if symbol_date_has_closed(symbol, latest_date) and not allow_closed_session:
         return None
 
     calculated = calculate_rows_for_symbol(
@@ -615,6 +1064,7 @@ def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None
         symbol=symbol,
         name=name,
         asset_type=asset_type,
+        allow_missing_prior=True,
     )
     if not calculated:
         return None
@@ -630,16 +1080,52 @@ def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None
     return latest
 
 
-def calculate_rows_for_symbol(df, symbol, name, asset_type):
+def calculate_rows_for_symbol(df, symbol, name, asset_type,
+                              *, defer_callback=None,
+                              allow_missing_prior=False):
+    """Build rows for ``symbol``.
+
+    Phase A: ``prev_close`` is resolved from the immediately prior *valid
+    session* for the instrument's own calendar -- never from a positional
+    dataframe predecessor. A frame gap (e.g. D-1 absent) must not silently fall
+    back to D-2. Such a bar is skipped here and reported as
+    PREVIOUS_SESSION_NOT_CONFIRMED; the row is deferred upstream.
+
+    ``allow_missing_prior`` is used only by the transient live-snapshot path:
+    the observation is still emitted (so macro_live freshness is preserved) but
+    with ``prev_close``/``change``/``pct_chg``/``amplitude`` set to NULL rather
+    than a stale positional value. The historical path never sets this flag.
+    """
     if df.empty or len(df) < 2:
         return []
 
     df = df.sort_values("Date").copy()
+    df["_date"] = pd.to_datetime(df["Date"]).dt.date
     rows = []
+
+    # Index closes by their actual session date so we can look up the exact
+    # expected prior session rather than "whatever row came before".
+    close_by_date = {
+        rec_date: rec_close
+        for rec_date, rec_close in zip(df["_date"], df["Close"])
+    }
 
     for i in range(1, len(df)):
         latest = df.iloc[i]
-        previous = df.iloc[i - 1]
+        latest_date = latest["_date"]
+
+        expected_prior = previous_valid_session(symbol, latest_date)
+
+        prev_close = None
+        if expected_prior is not None:
+            prev_close = close_by_date.get(expected_prior)
+
+        if prev_close is None and not allow_missing_prior:
+            # D-1 missing (or calendar unavailable). Never use an older
+            # positional value -- this is the confirmed incident.
+            _report_prev_session_unconfirmed(symbol, latest_date, expected_prior,
+                                             defer_callback)
+            continue
 
         open_price = latest.get("Open")
         high = latest.get("High")
@@ -647,7 +1133,6 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type):
         close = latest.get("Close")
         adj_close = latest.get("Adj Close")
         volume = latest.get("Volume")
-        prev_close = previous.get("Close")
 
         change = None
         pct_chg = None
@@ -661,7 +1146,7 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type):
                 amplitude = ((high - low) / prev_close) * 100
 
         rows.append({
-            "date": pd.to_datetime(latest["Date"]).date(),
+            "date": latest_date,
             "symbol": symbol,
             "name": name,
             "asset_type": asset_type,
@@ -678,6 +1163,20 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type):
         })
 
     return rows
+
+
+def _report_prev_session_unconfirmed(symbol, session_date, expected_prior,
+                                     defer_callback=None):
+    expected = expected_prior.isoformat() if expected_prior else "UNKNOWN"
+    print(f"[PREVIOUS_SESSION_NOT_CONFIRMED] {symbol} {session_date}: "
+          f"expected prior session {expected} not present in provider frame "
+          f"-> deferred (positional fallback prohibited)")
+    if defer_callback is not None:
+        try:
+            defer_callback(symbol, session_date, "PREVIOUS_SESSION_NOT_CONFIRMED")
+        except Exception as exc:
+            print(f"[DEFERRED WARN] callback failed for {symbol} "
+                  f"{session_date}: {exc}")
 
 
 def filter_rows_to_target_window(rows, target_start_date):
@@ -955,12 +1454,16 @@ def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None)
             f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
         )
 
+        # Phase A dual-source: keep serving a live observation for a closed
+        # session whose official EOD value is not yet published. The row remains
+        # is_market_closed=False and is never labelled official EOD.
         live_row = extract_latest_unfinished_row(
             df=symbol_df,
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
             observed_at=observed_at,
+            allow_closed_session=True,
         )
         if live_row:
             live_row["source"] = "investing.com"
@@ -1361,6 +1864,20 @@ def validate_treasury_observations(symbol, yields_df):
             "Volume": None,
         }
     ).reset_index(drop=True)
+
+    # Phase A: record the official publication dates actually observed so the
+    # EOD gate can require confirmation for the *specific* session.
+    try:
+        _TREASURY_PUBLISHED_DATES.update(
+            pd.to_datetime(symbol_df["Date"]).dt.date.tolist())
+        # Phase A: record the official VALUE per session so the EOD gate can
+        # reject a row whose value did not come from the official series.
+        for _d, _v in zip(pd.to_datetime(symbol_df["Date"]).dt.date,
+                          symbol_df["Close"]):
+            _TREASURY_PUBLISHED_VALUES[(symbol, _d)] = float(_v)
+    except Exception as exc:
+        print(f"[UST GATE WARN] could not record publication dates: {exc}")
+
     return symbol_df, len(symbol_df), symbol_df["Date"].max().date()
 
 
@@ -1438,6 +1955,12 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
         # Synthetic single-point rows: Date/Close only; OHLC all equal.
         target_start = start_date or (now.date() - timedelta(days=LOOKBACK_DAYS + CALC_BUFFER_DAYS))
 
+        # H2 fix: this path previously called calculate_rows_for_symbol WITHOUT
+        # remove_unfinished_bars, bypassing the close gate. The published
+        # series is official, but the session must still be a completed,
+        # calendar-valid session and the prior session must be resolvable.
+        symbol_df = remove_unfinished_bars(symbol_df, symbol)
+
         rows = calculate_rows_for_symbol(
             df=symbol_df,
             symbol=symbol,
@@ -1453,13 +1976,18 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
         else:
             print(f"[UST FALLBACK NO VALID ROWS IN TARGET WINDOW] {symbol}")
 
-        # Live snapshot: official publication is final — no unfinished bar.
+        # Live snapshot. ``is_market_closed`` describes MARKET-CLOSURE state
+        # only -- it must not be used to signal "official value published".
+        # Downstream consumers filter on FALSE to serve intraday quotes, so an
+        # official value that is itself the latest observation stays FALSE.
+        # Protection against unofficial values entering historical storage is
+        # provided independently by the EOD gate (official value matching).
         live_row = None
         if rows:
             latest = dict(rows[-1])
             latest["market_date"] = latest.pop("date")
             latest["observed_at"] = observed_at or datetime.now(ZoneInfo("UTC"))
-            latest["is_market_closed"] = True
+            latest["is_market_closed"] = False
             latest["source"] = "treasury.gov"
             live_row = latest
 
@@ -1473,6 +2001,8 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
 
 
 def provider_for_symbol(symbol):
+    if symbol in CMT_SYMBOLS:
+        return "treasury.gov"
     return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
 
 
@@ -1832,8 +2362,17 @@ def run_daily_update(
             raise ValueError(f"Unknown macro symbols requested: {unknown}")
         symbols = [symbol for symbol in symbols if symbol in requested]
 
-    yfinance_symbols = [symbol for symbol in symbols if symbol not in INVESTINY_ASSETS]
-    investiny_symbols = [symbol for symbol in symbols if symbol in INVESTINY_ASSETS]
+    # Phase A (additive): the official CMT series is fetched from Treasury.gov
+    # only, so it is excluded from both the yfinance batch and the
+    # Investing.com loop and handled by its own phase below.
+    yfinance_symbols = [
+        symbol for symbol in symbols
+        if symbol not in INVESTINY_ASSETS and symbol not in CMT_SYMBOLS
+    ]
+    investiny_symbols = [
+        symbol for symbol in symbols
+        if symbol in INVESTINY_ASSETS and symbol not in CMT_SYMBOLS
+    ]
 
     print(
         f"Running macro update for {len(symbols)} symbols "
@@ -2321,6 +2860,69 @@ def run_daily_update(
         # back-to-back, even though each individual instrument is valid.
         time.sleep(random.uniform(3.0, 6.0))
 
+    # ------------------------------------------------------------------
+    # Phase A (additive): official Treasury.gov CMT series.
+    # Fetched directly from the official par-yield publication only; the
+    # Investing.com provider is never consulted for these symbols. Rows pass
+    # the EOD gate like any other historical row.
+    # ------------------------------------------------------------------
+    cmt_symbols = [s for s in symbols if s in CMT_SYMBOLS]
+    if cmt_symbols:
+        print(f"\n[CMT OFFICIAL SERIES] {cmt_symbols}")
+    for symbol in cmt_symbols:
+        meta = asset_map[symbol]
+        try:
+            rows, live_row, rows_fetched, latest_observation = (
+                process_treasury_fallback_symbol(
+                    symbol, meta, start_date=start_date, observed_at=observed_at)
+            )
+            if live_row:
+                all_live_rows.append(live_row)
+                print(
+                    f"[CMT LIVE SNAPSHOT] {symbol} | "
+                    f"market_date={live_row.get('market_date')} "
+                    f"close={live_row.get('close')} source=treasury.gov"
+                )
+            upsert_new_macro_rows(
+                rows,
+                [symbol],
+                upsert_neon=upsert_neon,
+                dry_run=dry_run,
+                provider_label="CMT",
+            )
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="treasury.gov",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=True,
+                rows_fetched=rows_fetched,
+                latest_observation=latest_observation,
+                primary_provider="treasury.gov",
+                fallback_provider=None,
+            )
+            print(f"[CMT OK] {symbol} | latest_observation={latest_observation}")
+        except Exception as cmt_error:
+            rows_fetched = getattr(cmt_error, "rows_fetched", 0)
+            latest_observation = getattr(cmt_error, "latest_observation", None)
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="treasury.gov",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=False,
+                rows_fetched=rows_fetched,
+                latest_observation=latest_observation,
+                failure_reason=(
+                    str(cmt_error)
+                    if isinstance(cmt_error, SymbolProcessingError)
+                    else f"{type(cmt_error).__name__}: {cmt_error}"
+                ),
+                primary_provider="treasury.gov",
+            )
+            print(f"[CMT ERROR] {symbol}: {cmt_error}")
+        time.sleep(random.uniform(0.5, 1.5))
+
     for symbol in symbols:
         if symbol not in outcomes:
             meta = asset_map[symbol]
@@ -2397,6 +2999,44 @@ def run_daily_update(
     return summary
 
 
+def _phase_a_safety_exit_code(summary):
+    """Return a non-zero exit code when a Phase A safety condition is active.
+
+    ``summarize_outcomes`` measures *fetch* success, so a calendar/session
+    validation failure would otherwise exit 0 and raise no alert. Phase A
+    requires an explicit alert when historical writes are fail-closed.
+    """
+    reasons = []
+
+    unavailable = sorted({
+        rec.get("symbol")
+        for rec in _PHASE_A_UNAVAILABLE_SYMBOLS
+        if rec.get("symbol")
+    })
+    if unavailable:
+        reasons.append(
+            f"calendar/session unavailable for {len(unavailable)} symbol(s): "
+            f"{','.join(unavailable[:10])}"
+        )
+
+    if _PHASE_A_DEFERRED_COUNT:
+        reasons.append(
+            f"{_PHASE_A_DEFERRED_COUNT} historical row(s) deferred"
+        )
+
+    if not reasons:
+        return 0
+
+    message = (
+        "[PHASE A ALERT] historical ingestion is fail-closed. "
+        + "; ".join(reasons)
+        + ". Live snapshots (macro_live) continue. No unconfirmed data was written."
+    )
+    print(message)
+    print(f"[PHASE A ALERT] MACRO_PHASE_A_ALERT={'; '.join(reasons)}")
+    return 1
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Fetch macro/index/ETF data into public.macro.")
     parser.add_argument("--symbols", default=None, help="Comma-separated symbol subset.")
@@ -2426,7 +3066,7 @@ def main(argv=None):
         etf_flow_tickers=etf_flow_tickers,
         update_live=not args.skip_live_replace,
     )
-    return summary.exit_code
+    return summary.exit_code or _phase_a_safety_exit_code(summary)
 
 
 if __name__ == "__main__":
