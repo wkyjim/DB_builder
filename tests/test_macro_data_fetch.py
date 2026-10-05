@@ -363,7 +363,7 @@ def test_upsert_new_macro_rows_checks_neon_independently(monkeypatch):
     monkeypatch.setattr(
         macro_data_fetch,
         "upsert_macro",
-        lambda engine, new_rows: writes.append((engine, new_rows)),
+        lambda engine, new_rows, **kwargs: writes.append((engine, new_rows)),
     )
 
     inserted = macro_data_fetch.upsert_new_macro_rows(

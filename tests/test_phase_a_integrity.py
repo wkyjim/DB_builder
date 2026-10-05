@@ -491,6 +491,8 @@ def test_phase_a_safety_alert_fires_on_calendar_failure(monkeypatch):
 
     m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
     m._PHASE_A_DEFERRED_COUNT = 0
+    m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
+    m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
     try:
         # Healthy run: no alert.
         assert m._phase_a_safety_exit_code(None) == 0
@@ -500,13 +502,22 @@ def test_phase_a_safety_alert_fires_on_calendar_failure(monkeypatch):
             {"symbol": "^GSPC", "reason": "CLOSED_UNCONFIRMED"})
         assert m._phase_a_safety_exit_code(None) == 1
 
-        # Deferrals alone also alert.
+        # D1: BENIGN boundary deferrals alone must NOT alert.
         m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
         m._PHASE_A_DEFERRED_COUNT = 3
+        m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 3
+        m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
+        assert m._phase_a_safety_exit_code(None) == 0
+
+        # D1: an ACTIONABLE deferral alerts.
+        m._PHASE_A_ACTIONABLE_DEFERRALS.append(
+            {"symbol": "^GSPC", "reason": "PREVIOUS_SESSION_NOT_CONFIRMED"})
         assert m._phase_a_safety_exit_code(None) == 1
     finally:
         m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
         m._PHASE_A_DEFERRED_COUNT = 0
+        m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
+        m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
 
 
 def test_gate_records_unavailable_symbol_telemetry():
@@ -514,6 +525,8 @@ def test_gate_records_unavailable_symbol_telemetry():
 
     m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
     m._PHASE_A_DEFERRED_COUNT = 0
+    m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
+    m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
     try:
         now = dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc)
         m.route_historical_rows(
@@ -527,6 +540,8 @@ def test_gate_records_unavailable_symbol_telemetry():
     finally:
         m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
         m._PHASE_A_DEFERRED_COUNT = 0
+        m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
+        m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
 
 
 def test_us_session_close_plus_buffer_threshold_hkt():

@@ -34,6 +34,7 @@ from db_builder.deferred_history import (
     MAX_ATTEMPTS,
     RECOVERY_BATCH,
     RECOVERY_DAYS,
+    SqlDeferredStore,
 )
 
 # ============================================================
@@ -65,6 +66,19 @@ TREASURY_VALUE_TOLERANCE = 5e-5
 # of exiting 0 (coverage measures fetch success, not gate eligibility).
 _PHASE_A_UNAVAILABLE_SYMBOLS: list = []
 _PHASE_A_DEFERRED_COUNT: int = 0
+# D1: deferrals are classified by session/window CONTEXT, not by reason string.
+# A boundary deferral is benign (the expected prior session is provably outside
+# the current fetch/lookback candidate window); everything else is actionable
+# and remains an alert/failure candidate.
+_PHASE_A_BOUNDARY_DEFERRED_COUNT: int = 0
+_PHASE_A_ACTIONABLE_DEFERRALS: list = []
+
+# D1: the provider fetch window starts at ``today - (LOOKBACK + CALC_BUFFER)``
+# days (see ``target_start`` in the fetch paths). A prior session strictly
+# before that start was never requested, so it is a benign boundary deferral.
+# A prior session at or after the start is inside the requested range: if the
+# provider did not supply it, that is an actionable data gap.
+_BOUNDARY_WINDOW_TOLERANCE_DAYS = 0
 
 # Target window to insert/update
 LOOKBACK_DAYS = 5
@@ -166,6 +180,20 @@ _treasury_xml_cache: dict[int, "pd.DataFrame"] = {}
 
 local_engine = make_local_engine()
 neon_engine = make_neon_engine()
+
+# D2: the deferred-history queue is persistent in production. Deferrals must
+# not exist only in memory: every historical deferral is recorded in
+# public.macro_deferred_history so bounded recovery can retry it later.
+# Lazily constructed so a dry run / test import never touches the DB.
+_PROD_DEFERRED_STORE = None
+
+
+def production_deferred_store():
+    """Return the shared persistent deferred-history store (lazy)."""
+    global _PROD_DEFERRED_STORE
+    if _PROD_DEFERRED_STORE is None:
+        _PROD_DEFERRED_STORE = SqlDeferredStore(local_engine)
+    return _PROD_DEFERRED_STORE
 
 
 # ============================================================
@@ -738,7 +766,8 @@ def _eligible_for_historical(row, *, known_prior_sessions=None,
 def route_historical_rows(engine, rows, *, mode="INGEST",
                           treasury_published_dates=None, now_utc=None,
                           deferred_store=None, prior_lookup=None,
-                          treasury_published_values=None):
+                          treasury_published_values=None,
+                          batch_start=None, count_telemetry=True):
     """Split candidate rows into HISTORICAL / DEFERRED / REJECTED.
 
     A completed historical bar whose prior session is missing is DEFERRED: it is
@@ -765,8 +794,16 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
     df["_d"] = pd.to_datetime(df["date"]).dt.date
     min_date = df["_d"].min() - timedelta(days=10)
     max_date = df["_d"].max()
+    # D1: bound the fetch window from the cycle reference time. The fetch paths
+    # request ``today - (LOOKBACK_DAYS + CALC_BUFFER_DAYS)`` onwards, so a prior
+    # session strictly before that start was never requested.
+    if batch_start is None:
+        _ref = now_utc or datetime.now(ZoneInfo("UTC"))
+        batch_start = _ref.date() - timedelta(
+            days=LOOKBACK_DAYS + CALC_BUFFER_DAYS)
 
     accepted, deferred, rejected = [], [], []
+    deferral_kinds = {}
     by_symbol = {}
     for rec in rows:
         by_symbol.setdefault(rec["symbol"], []).append(rec)
@@ -797,6 +834,13 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
                 rejected.append((rec, decision.reason))
             else:
                 deferred.append((rec, decision.reason))
+                deferral_kinds[(rec.get("symbol"), rec.get("date"))] = (
+                    _classify_deferral(
+                        decision.reason,
+                        expected_prior=decision.expected_prior,
+                        batch_start=batch_start,
+                    )
+                )
 
     if deferred and deferred_store is not None:
         for rec, reason in deferred:
@@ -809,8 +853,19 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
                       f"{rec['symbol']} {rec['date']}: {exc}")
 
     global _PHASE_A_DEFERRED_COUNT
-    _PHASE_A_DEFERRED_COUNT += len(deferred)
+    global _PHASE_A_BOUNDARY_DEFERRED_COUNT
+    if count_telemetry:
+        _PHASE_A_DEFERRED_COUNT += len(deferred)
     for rec, reason in deferred:
+        if not count_telemetry:
+            break
+        kind = deferral_kinds.get((rec.get("symbol"), rec.get("date")),
+                                  "actionable")
+        if kind == "boundary":
+            _PHASE_A_BOUNDARY_DEFERRED_COUNT += 1
+        else:
+            _PHASE_A_ACTIONABLE_DEFERRALS.append(
+                {"symbol": rec.get("symbol"), "reason": reason})
         if reason in ("CLOSED_UNCONFIRMED", "SOURCE_DEFINITION_UNRESOLVED") \
                 or reason.startswith("CALENDAR"):
             _PHASE_A_UNAVAILABLE_SYMBOLS.append(
@@ -880,7 +935,8 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
             continue
 
         written = upsert_macro(engine, match, mode="INGEST",
-                               prior_lookup=prior_lookup)
+                               prior_lookup=prior_lookup,
+                               deferred_store=store)
         if written:
             store.record_success(cand.symbol, cand.session_date, now=now)
             print(f"[DEFERRED RECOVERY] RESOLVED {cand.symbol} "
@@ -903,7 +959,8 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
 
 
 def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
-                 treasury_published_dates=None):
+                 treasury_published_dates=None, deferred_store=None,
+                 batch_start=None, count_telemetry=True):
     """Write historical rows.
 
     ``mode="INGEST"`` (default) enforces the Phase A EOD write gate: only rows
@@ -920,7 +977,9 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
         rows, _deferred, _rejected = route_historical_rows(
             engine, rows, prior_lookup=prior_lookup,
             treasury_published_dates=treasury_published_dates,
-            treasury_published_values=_TREASURY_PUBLISHED_VALUES or None)
+            treasury_published_values=_TREASURY_PUBLISHED_VALUES or None,
+            deferred_store=deferred_store, batch_start=batch_start,
+            count_telemetry=count_telemetry)
         if not rows:
             print("[GATE] no eligible historical rows after EOD gate")
             return 0
@@ -1210,7 +1269,8 @@ def filter_duplicate_symbol_dates(rows, existing_df):
     return df_missing.to_dict(orient="records")
 
 
-def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False, provider_label="macro"):
+def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False,
+                          provider_label="macro", deferred_store=None):
     if not rows:
         return 0
 
@@ -1241,7 +1301,8 @@ def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False, pro
             print(f"[DRY RUN SKIP LOCAL UPSERT {provider_label}] rows={len(local_missing_rows):,}")
         else:
             print(f"[UPSERT LOCAL {provider_label}] rows={len(local_missing_rows):,}")
-            upsert_macro(local_engine, local_missing_rows)
+            upsert_macro(local_engine, local_missing_rows,
+                         deferred_store=deferred_store)
     else:
         print(f"[{provider_label} LOCAL NO NEW ROWS AFTER DEDUPE]")
 
@@ -1267,7 +1328,8 @@ def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False, pro
                 print(f"[DRY RUN SKIP NEON UPSERT {provider_label}] rows={len(neon_missing_rows):,}")
             else:
                 print(f"[UPSERT NEON {provider_label}] rows={len(neon_missing_rows):,}")
-                upsert_macro(neon_engine, neon_missing_rows)
+                upsert_macro(neon_engine, neon_missing_rows,
+                             count_telemetry=False)
         else:
             print(f"[{provider_label} NEON NO NEW ROWS AFTER DEDUPE]")
 
@@ -2210,6 +2272,7 @@ def _process_investiny_fallback_for_symbol(
     all_live_rows,
     upsert_neon=True,
     dry_run=False,
+    deferred_store=None,
 ):
     """Route one Investing.com-routed symbol to its fallback provider.
 
@@ -2309,6 +2372,7 @@ def _process_investiny_fallback_for_symbol(
         upsert_neon=upsert_neon,
         dry_run=dry_run,
         provider_label=f"{fallback_provider.upper()} FALLBACK",
+        deferred_store=deferred_store,
     )
     outcomes[symbol] = SymbolFetchOutcome(
         symbol=symbol,
@@ -2329,6 +2393,62 @@ def _process_investiny_fallback_for_symbol(
     return True
 
 
+
+def _recovery_fetch_symbol_rows(symbol, dates):
+    """D2: provider fetch used by bounded deferred-history recovery.
+
+    Returns historical row dicts for the requested session dates, in the same
+    shape as ``calculate_rows_for_symbol`` output. Uses the symbol's own
+    provider path so a recovered row is never sourced differently from a
+    normal cycle row.
+    """
+    wanted = {pd.to_datetime(d).date() for d in dates}
+    meta = {
+        "name": dict((s, n) for s, n, _a in ASSETS).get(symbol, symbol),
+        "asset_type": dict((s, a) for s, _n, a in ASSETS).get(
+            symbol, "unknown"),
+    }
+    if symbol in CMT_SYMBOLS or symbol in TREASURY_PUBLICATION_SYMBOLS:
+        rows, _live, _fetched, _latest = process_treasury_fallback_symbol(
+            symbol, meta)
+    elif symbol in INVESTINY_ASSETS:
+        rows, _live, _fetched, _latest = process_investiny_symbol(
+            symbol, meta)
+    else:
+        rows, _live, _fetched, _latest = process_yfinance_fallback_symbol(
+            symbol, meta)
+    return [r for r in (rows or [])
+            if pd.to_datetime(r["date"]).date() in wanted]
+
+
+def run_production_deferred_recovery(now_utc=None):
+    """D2: bounded deferred-history recovery inside the normal cycle.
+
+    Deferred sessions are retried in bounded batches (RECOVERY_BATCH) so an
+    hourly run never becomes a historical backfill. Rows that can now be built
+    are written through the normal EOD gate and marked RESOLVED; rows still
+    missing their prior session stay DEFERRED and escalate after repeated
+    failure without disappearing from tracking.
+    """
+    store = production_deferred_store()
+    try:
+        result = run_deferred_recovery(
+            local_engine, store,
+            fetch_symbol_rows=_recovery_fetch_symbol_rows,
+            now_utc=now_utc,
+        )
+    except Exception as exc:
+        print(f"[DEFERRED RECOVERY] skipped: {type(exc).__name__}: {exc}")
+        return None
+    print(
+        f"[DEFERRED RECOVERY] retried={result['retried']} "
+        f"resolved={result['resolved']} "
+        f"still_deferred={result['still_deferred']} "
+        f"escalated={result['escalated']}"
+    )
+    return result
+
+
 def run_daily_update(
     symbol_filter=None,
     start_date=None,
@@ -2339,6 +2459,11 @@ def run_daily_update(
     etf_flow_tickers=None,
     update_live=True,
 ):
+    # D2: one shared persistent deferred-history store for the whole cycle.
+    # Deferrals are recorded in public.macro_deferred_history, never only in
+    # memory. A dry run performs no writes, so it gets no store.
+    deferred_store = None if dry_run else production_deferred_store()
+
     if not dry_run:
         create_macro_table(local_engine)
         create_macro_live_table(local_engine)
@@ -2527,6 +2652,7 @@ def run_daily_update(
             upsert_neon=upsert_neon,
             dry_run=dry_run,
             provider_label="YF",
+            deferred_store=deferred_store,
         )
 
         print("[BATCH DONE]")
@@ -2569,6 +2695,7 @@ def run_daily_update(
                 all_live_rows=all_live_rows,
                 upsert_neon=upsert_neon,
                 dry_run=dry_run,
+            deferred_store=deferred_store,
             )
             continue
 
@@ -2598,6 +2725,7 @@ def run_daily_update(
                     all_live_rows=all_live_rows,
                     upsert_neon=upsert_neon,
                     dry_run=dry_run,
+                deferred_store=deferred_store,
                 )
                 continue
 
@@ -2642,6 +2770,7 @@ def run_daily_update(
                 all_live_rows=all_live_rows,
                 upsert_neon=upsert_neon,
                 dry_run=dry_run,
+            deferred_store=deferred_store,
             )
             continue
         except Exception as e:
@@ -2714,6 +2843,7 @@ def run_daily_update(
                     upsert_neon=upsert_neon,
                     dry_run=dry_run,
                     provider_label="YF FALLBACK",
+                    deferred_store=deferred_store,
                 )
                 outcomes[symbol] = SymbolFetchOutcome(
                     symbol=symbol,
@@ -2796,6 +2926,7 @@ def run_daily_update(
                     upsert_neon=upsert_neon,
                     dry_run=dry_run,
                     provider_label="UST FALLBACK",
+                    deferred_store=deferred_store,
                 )
                 outcomes[symbol] = SymbolFetchOutcome(
                     symbol=symbol,
@@ -2845,6 +2976,7 @@ def run_daily_update(
             upsert_neon=upsert_neon,
             dry_run=dry_run,
             provider_label="INVESTING.COM",
+            deferred_store=deferred_store,
         )
         outcomes[symbol] = SymbolFetchOutcome(
             symbol=symbol,
@@ -2889,6 +3021,7 @@ def run_daily_update(
                 upsert_neon=upsert_neon,
                 dry_run=dry_run,
                 provider_label="CMT",
+                deferred_store=deferred_store,
             )
             outcomes[symbol] = SymbolFetchOutcome(
                 symbol=symbol,
@@ -2971,6 +3104,11 @@ def run_daily_update(
             )
             merge_macro_live(neon_engine, all_live_rows, successful_symbols)
 
+    # D2: bounded deferred-history recovery. Runs after ingestion so it can
+    # retry sessions deferred by this cycle and by earlier cycles.
+    if not dry_run:
+        run_production_deferred_recovery()
+
     if update_etf_flows:
         try:
             run_etf_flow_update_after_macro(
@@ -2999,12 +3137,42 @@ def run_daily_update(
     return summary
 
 
+def _classify_deferral(reason, *, expected_prior, batch_start):
+    """D1: is a deferral a benign window-boundary deferral?
+
+    A deferral is non-fatal ONLY when the expected prior valid session is
+    demonstrably outside the current fetch/lookback candidate window, i.e.
+    ``expected_prior < batch_start`` (with a small tolerance for
+    weekend/holiday gaps). The decision uses real session/window context,
+    never the reason string alone.
+
+    Everything else stays actionable: a prior session that should be inside
+    the fetch range but is missing, an unavailable calendar, an unresolved
+    source definition, an unexpected Treasury/CMT confirmation failure, an
+    escalated recovery, or any other fail-closed integrity condition.
+    """
+    if reason == "PRIOR_SESSION_LOOKUP_FAILED":
+        # The lookup itself failed, so the window cannot be trusted.
+        return "actionable"
+    if expected_prior is None:
+        return "actionable"
+    if batch_start is None:
+        return "actionable"
+    cutoff = batch_start - timedelta(days=_BOUNDARY_WINDOW_TOLERANCE_DAYS)
+    if expected_prior < cutoff:
+        return "boundary"
+    return "actionable"
+
+
 def _phase_a_safety_exit_code(summary):
     """Return a non-zero exit code when a Phase A safety condition is active.
 
     ``summarize_outcomes`` measures *fetch* success, so a calendar/session
     validation failure would otherwise exit 0 and raise no alert. Phase A
     requires an explicit alert when historical writes are fail-closed.
+
+    D1: only ACTIONABLE deferrals raise the alert. Benign window-boundary
+    deferrals are logged and counted but must not fail the cycle.
     """
     reasons = []
 
@@ -3019,9 +3187,15 @@ def _phase_a_safety_exit_code(summary):
             f"{','.join(unavailable[:10])}"
         )
 
-    if _PHASE_A_DEFERRED_COUNT:
+    actionable = len(_PHASE_A_ACTIONABLE_DEFERRALS)
+    if actionable:
+        sample = sorted({
+            f"{rec.get('symbol')}:{rec.get('reason')}"
+            for rec in _PHASE_A_ACTIONABLE_DEFERRALS
+        })[:8]
         reasons.append(
-            f"{_PHASE_A_DEFERRED_COUNT} historical row(s) deferred"
+            f"{actionable} actionable historical row(s) deferred "
+            f"({', '.join(sample)})"
         )
 
     if not reasons:
