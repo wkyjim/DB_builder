@@ -42,6 +42,7 @@ from db_builder.reconciliation import (
     EXCLUDED_REPORT_ONLY_SYMBOLS,
     LEGACY_TREASURY_SYMBOLS,
     Reason,
+    Row,
     Verdict,
     build_correction_plan,
     check_prior_dependency,
