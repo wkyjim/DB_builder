@@ -186,7 +186,7 @@ class SqlReconciliationStore:
         from sqlalchemy import text
         sql = text("""
             SELECT date, symbol, open, high, low, close, adj_close, volume,
-                   prev_close, change, pct_chg, amplitude, source, asset_type
+                   prev_close, change, pct_chg, amplitude, asset_type
               FROM public.macro
              WHERE symbol = :symbol AND date = :date
              LIMIT 1
@@ -201,7 +201,7 @@ class SqlReconciliationStore:
             close=r["close"], adj_close=r["adj_close"], volume=r["volume"],
             prev_close=r["prev_close"], change=r["change"],
             pct_chg=r["pct_chg"], amplitude=r["amplitude"],
-            source=r["source"], asset_type=r["asset_type"],
+            source=None, asset_type=r["asset_type"],
         )
 
     def lock_rows(self, symbol: str, dates: List[dt.date]) -> Dict[dt.date, Row]:
@@ -210,7 +210,7 @@ class SqlReconciliationStore:
             return {}
         sql = text("""
             SELECT date, symbol, open, high, low, close, adj_close, volume,
-                   prev_close, change, pct_chg, amplitude, source, asset_type
+                   prev_close, change, pct_chg, amplitude, asset_type
               FROM public.macro
              WHERE symbol = :symbol AND date = ANY(:dates)
                FOR UPDATE
@@ -225,7 +225,7 @@ class SqlReconciliationStore:
                 close=r["close"], adj_close=r["adj_close"], volume=r["volume"],
                 prev_close=r["prev_close"], change=r["change"],
                 pct_chg=r["pct_chg"], amplitude=r["amplitude"],
-                source=r["source"], asset_type=r["asset_type"],
+                source=None, asset_type=r["asset_type"],
             )
         return result
 
