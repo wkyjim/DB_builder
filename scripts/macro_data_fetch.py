@@ -2794,14 +2794,19 @@ def _fetch_treasury_confirmation(symbol, session_date, now):
     """Fetch Treasury.gov official CMT value for a specific date."""
     try:
         from db_builder.session_calendar import TENOR_BY_CMT_SYMBOL
-        element = TENOR_BY_CMT_SYMBOL.get(symbol)
-        if element is None:
+        tenor = TENOR_BY_CMT_SYMBOL.get(symbol)
+        if tenor is None:
             return None
+        # Map tenor (e.g. "10Y") to Treasury.gov column (e.g. "BC_10YEAR")
+        element = f"BC_{tenor}YEAR"
         year = session_date.year
         df = fetch_treasury_par_yields(year)
-        if session_date not in [d.date() for d in df.index]:
+        if element not in df.columns:
             return None
-        idx = [d.date() for d in df.index].index(session_date)
+        dates_in_index = [d.date() for d in df.index]
+        if session_date not in dates_in_index:
+            return None
+        idx = dates_in_index.index(session_date)
         val = df[element].iloc[idx]
         if pd.isna(val):
             return None
