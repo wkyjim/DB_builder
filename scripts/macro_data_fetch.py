@@ -2798,7 +2798,7 @@ def _fetch_treasury_confirmation(symbol, session_date, now):
         if tenor is None:
             return None
         # Map tenor (e.g. "10Y") to Treasury.gov column (e.g. "BC_10YEAR")
-        element = f"BC_{tenor}YEAR"
+        element = f"BC_{tenor}EAR"
         year = session_date.year
         df = fetch_treasury_par_yields(year)
         if element not in df.columns:
