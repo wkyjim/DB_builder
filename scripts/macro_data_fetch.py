@@ -36,6 +36,27 @@ from db_builder.deferred_history import (
     RECOVERY_DAYS,
     SqlDeferredStore,
 )
+from db_builder.reconciliation import (
+    AUTO_CORRECT_SYMBOLS,
+    DETECT_ONLY_SYMBOLS,
+    EXCLUDED_REPORT_ONLY_SYMBOLS,
+    LEGACY_TREASURY_SYMBOLS,
+    Reason,
+    Verdict,
+    build_correction_plan,
+    check_prior_dependency,
+    decide,
+    is_auto_correctable,
+    is_detect_only,
+    is_excluded_report_only,
+    is_legacy_treasury,
+)
+from db_builder.reconciliation_store import (
+    AuditEventType,
+    ReconciliationStore,
+    execute_correction_plan,
+    record_detection_event,
+)
 
 # ============================================================
 # CONFIG
@@ -967,11 +988,62 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
     whose session is CONFIRMED_COMPLETED *and* whose immediately prior valid
     session is confirmed may be written. Deferred/rejected rows never reach SQL.
 
-    ``mode="RECONCILE"`` is reserved for Phase B reconciliation, which has its
-    own explicit eligibility verdict; it is intentionally not implemented here.
+    ``mode="RECONCILE"`` dispatches to the Phase B reconciliation store path.
+    It requires a pre-built ``CorrectionPlan`` and never calls normal INGEST
+    duplicate filtering or ``ON CONFLICT DO UPDATE``.
     """
     if not rows:
         return 0
+
+    if mode == "RECONCILE":
+        from db_builder.reconciliation import CorrectionPlan, is_auto_correctable, Verdict, Reason
+        from db_builder.reconciliation_store import (
+            execute_correction_plan,
+            record_detection_event,
+        )
+
+        plan = rows[0].get("_correction_plan") if isinstance(rows[0], dict) else None
+        if plan is None or not isinstance(plan, CorrectionPlan):
+            raise ValueError(
+                "mode=RECONCILE requires a CorrectionPlan in rows[0]['_correction_plan']"
+            )
+
+        # Hard guard: only AUTO_CORRECT symbols may reach UPDATE
+        if not is_auto_correctable(plan.symbol):
+            store = _get_reconciliation_store(engine)
+            record_detection_event(
+                store=store,
+                symbol=plan.symbol,
+                session_date=plan.session_date,
+                verdict=plan.verdict,
+                reason=plan.reason,
+                run_id=plan.evidence.get("run_id", "reconcile"),
+                source_definition=plan.evidence.get("source_definition", ""),
+                confirmation_source=plan.evidence.get("confirmation_source", ""),
+            )
+            return 0
+
+        store = _get_reconciliation_store(engine)
+        success, error = execute_correction_plan(
+            store=store,
+            plan=plan,
+            run_id=plan.evidence.get("run_id", "reconcile"),
+            confirmation_source=plan.evidence.get("confirmation_source", "treasury.gov"),
+            source_definition=plan.evidence.get("source_definition", "treasury_gov_cmt"),
+        )
+        if not success:
+            # Record detection event AFTER the repair transaction has aborted
+            record_detection_event(
+                store=store,
+                symbol=plan.symbol,
+                session_date=plan.session_date,
+                verdict=Verdict.STALE_PLAN if error == "STALE_PLAN" else Verdict.MANUAL_REVIEW_REQUIRED,
+                reason=Reason.STALE_PLAN if error == "STALE_PLAN" else Reason.MANUAL_REVIEW_REQUIRED,
+                run_id=plan.evidence.get("run_id", "reconcile"),
+                source_definition=plan.evidence.get("source_definition", ""),
+                confirmation_source=plan.evidence.get("confirmation_source", ""),
+            )
+        return 1 if success else 0
 
     if mode == "INGEST":
         rows, _deferred, _rejected = route_historical_rows(
@@ -2449,6 +2521,326 @@ def run_production_deferred_recovery(now_utc=None):
     return result
 
 
+
+
+def _get_reconciliation_store(engine):
+    """Return a ReconciliationStore bound to the given engine."""
+    from db_builder.reconciliation_store import SqlReconciliationStore
+    return SqlReconciliationStore(engine)
+
+
+# Phase B bounded limits
+RECONCILIATION_LOOKBACK = 5
+RECONCILIATION_MAX_SYMBOLS = 40
+RECONCILIATION_MAX_ROWS = 200
+RECONCILIATION_RUNTIME_BUDGET = 120  # seconds
+RECONCILIATION_MAX_CORRECTIONS = 25
+
+
+def run_reconciliation_cycle(
+    engine=None,
+    run_id=None,
+    now_utc=None,
+    dry_run=False,
+):
+    """S8: Bounded Phase B reconciliation cycle.
+
+    Builds the candidate universe, distinguishes AUTO_CORRECT vs DETECT_ONLY,
+    fetches confirmation evidence, processes in dependency-safe order, and
+    applies corrections only to Treasury CMT. Detect-only symbols produce
+    DETECTION events only.
+
+    NOT called from run_daily_update. Requires explicit invocation.
+    """
+    import time
+    import uuid
+    from datetime import timezone
+
+    start_time = time.monotonic()
+    run_id = run_id or f"recon_{uuid.uuid4().hex[:8]}"
+    now = now_utc or datetime.now(timezone.utc)
+
+    if engine is None:
+        engine = make_local_engine()
+
+    store = _get_reconciliation_store(engine)
+
+    # 1. Build bounded candidate universe
+    # v1 RUNTIME: only AUTO_CORRECT symbols (CMT) are processed.
+    # DETECT_ONLY and EXCLUDED symbols are DORMANT until a real confirmation
+    # fetcher is implemented. Do not generate CONFIRMATION_UNAVAILABLE events
+    # for symbols that have no fetcher.
+    auto_correct = sorted(AUTO_CORRECT_SYMBOLS)
+    detect_only = []  # DORMANT in v1
+
+    print(f"[RECONCILE] run_id={run_id} | auto_correct={len(auto_correct)} detect_only={len(detect_only)} (dormant)")
+
+    summary = {
+        "run_id": run_id,
+        "candidates_examined": 0,
+        "verdict_counts": {},
+        "detection_events": 0,
+        "correction_plans": 0,
+        "corrections_committed": 0,
+        "stale_plans": 0,
+        "dependency_blocks": 0,
+        "manual_reviews": 0,
+        "confirmation_unavailable": 0,
+        "report_only_mismatches": 0,
+        "runtime_seconds": 0.0,
+        "budget_exhausted": False,
+    }
+
+    corrections_committed = 0
+    rows_examined = 0
+
+    # 3. Process AUTO_CORRECT symbols
+    for symbol in auto_correct:
+        if corrections_committed >= RECONCILIATION_MAX_CORRECTIONS:
+            summary["budget_exhausted"] = True
+            break
+        if rows_examined >= RECONCILIATION_MAX_ROWS:
+            summary["budget_exhausted"] = True
+            break
+        elapsed = time.monotonic() - start_time
+        if elapsed > RECONCILIATION_RUNTIME_BUDGET:
+            summary["budget_exhausted"] = True
+            break
+
+        is_cmt = symbol in AUTO_CORRECT_SYMBOLS
+        stored_rows = _get_stored_rows_for_symbol(engine, symbol, now, RECONCILIATION_LOOKBACK)
+        if not stored_rows:
+            continue
+
+        sessions_to_process = sorted(stored_rows.keys(), reverse=True)
+
+        for session_date in sessions_to_process:
+            if corrections_committed >= RECONCILIATION_MAX_CORRECTIONS:
+                summary["budget_exhausted"] = True
+                break
+            if rows_examined >= RECONCILIATION_MAX_ROWS:
+                summary["budget_exhausted"] = True
+                break
+            elapsed = time.monotonic() - start_time
+            if elapsed > RECONCILIATION_RUNTIME_BUDGET:
+                summary["budget_exhausted"] = True
+                break
+
+            rows_examined += 1
+            summary["candidates_examined"] += 1
+            stored = stored_rows[session_date]
+
+            confirmed = _fetch_confirmation_observation(symbol, session_date, now)
+            if confirmed is None:
+                summary["confirmation_unavailable"] += 1
+                _record_detection(store, symbol, session_date,
+                                  Verdict.CONFIRMATION_UNAVAILABLE,
+                                  Reason.CONFIRMATION_UNAVAILABLE, run_id)
+                continue
+
+            prior_session = previous_valid_session(symbol, session_date)
+            confirmed_prior = None
+            stored_prior = None
+            if prior_session:
+                confirmed_prior = _fetch_confirmation_observation(symbol, prior_session, now)
+                stored_prior = _get_stored_row(engine, symbol, prior_session)
+
+            if prior_session and is_cmt:
+                dep_ok, dep_reason = check_prior_dependency(
+                    symbol, session_date, stored_prior, confirmed_prior, prior_session
+                )
+                if not dep_ok:
+                    summary["dependency_blocks"] += 1
+                    _record_detection(store, symbol, session_date,
+                                      Verdict.DEPENDENCY_RECONCILE_REQUIRED,
+                                      dep_reason, run_id)
+                    continue
+
+            d1_session = _next_valid_session(symbol, session_date)
+            stored_d1 = _get_stored_row(engine, symbol, d1_session) if d1_session else None
+            d2_session = _next_valid_session(symbol, d1_session) if d1_session else None
+            stored_d2 = _get_stored_row(engine, symbol, d2_session) if d2_session else None
+
+            result = decide(symbol, session_date, stored, confirmed,
+                            confirmed_prior, prior_session, is_cmt=is_cmt)
+
+            summary["verdict_counts"][result.verdict.value] = \
+                summary["verdict_counts"].get(result.verdict.value, 0) + 1
+
+            if result.verdict == Verdict.MATCH:
+                continue
+            elif result.verdict == Verdict.ROUNDING_ONLY:
+                continue
+            elif result.verdict == Verdict.CONFIRMATION_UNAVAILABLE:
+                summary["confirmation_unavailable"] += 1
+                _record_detection(store, symbol, session_date,
+                                  result.verdict, result.reason, run_id)
+                continue
+            elif result.verdict == Verdict.SOURCE_DEFINITION_MISMATCH:
+                _record_detection(store, symbol, session_date,
+                                  result.verdict, result.reason, run_id)
+                continue
+            elif result.verdict == Verdict.MANUAL_REVIEW_REQUIRED:
+                summary["manual_reviews"] += 1
+                _record_detection(store, symbol, session_date,
+                                  result.verdict, result.reason, run_id)
+                continue
+            elif result.verdict == Verdict.CORRECTION_REQUIRED:
+                plan = build_correction_plan(
+                    symbol, session_date, stored, confirmed, confirmed_prior,
+                    stored_d1=stored_d1, previous_valid_session_d1=session_date if stored_d1 else None,
+                    stored_d2=stored_d2, is_cmt=is_cmt,
+                )
+                plan.evidence["run_id"] = run_id
+                plan.evidence["source_definition"] = "treasury_gov_cmt" if is_cmt else ""
+                plan.evidence["confirmation_source"] = "treasury.gov" if is_cmt else ""
+
+                summary["correction_plans"] += 1
+
+                if dry_run:
+                    continue
+
+                success, error = execute_correction_plan(
+                    store=store,
+                    plan=plan,
+                    run_id=run_id,
+                    confirmation_source="treasury.gov" if is_cmt else "",
+                    source_definition="treasury_gov_cmt" if is_cmt else "",
+                )
+                if success:
+                    corrections_committed += 1
+                    summary["corrections_committed"] += 1
+                elif error == "STALE_PLAN":
+                    summary["stale_plans"] += 1
+                    _record_detection(store, symbol, session_date,
+                                      Verdict.STALE_PLAN, Reason.STALE_PLAN, run_id)
+                else:
+                    summary["manual_reviews"] += 1
+                    _record_detection(store, symbol, session_date,
+                                      Verdict.MANUAL_REVIEW_REQUIRED,
+                                      Reason.MANUAL_REVIEW_REQUIRED, run_id)
+
+    # 4. DETECT_ONLY and EXCLUDED symbols are DORMANT in v1.
+    # They are not processed until a real confirmation fetcher is implemented.
+    # No CONFIRMATION_UNAVAILABLE events are generated for dormant symbols.
+
+    summary["runtime_seconds"] = round(time.monotonic() - start_time, 2)
+    print(f"[RECONCILE] done | {summary}")
+    return summary
+
+
+def _get_stored_rows_for_symbol(engine, symbol, now, lookback):
+    """Get stored rows for a symbol within the lookback window."""
+    from sqlalchemy import text
+    cutoff = (now.date() - timedelta(days=lookback * 3)).isoformat()
+    sql = text("""
+        SELECT date, symbol, open, high, low, close, adj_close, volume,
+               prev_close, change, pct_chg, amplitude, source, asset_type
+          FROM public.macro
+         WHERE symbol = :symbol AND date >= :cutoff
+         ORDER BY date DESC
+         LIMIT :lookback
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"symbol": symbol, "cutoff": cutoff, "lookback": lookback}).mappings().all()
+    result = {}
+    for r in rows:
+        result[r["date"]] = Row(
+            symbol=r["symbol"], date=r["date"],
+            open=r["open"], high=r["high"], low=r["low"],
+            close=r["close"], adj_close=r["adj_close"], volume=r["volume"],
+            prev_close=r["prev_close"], change=r["change"],
+            pct_chg=r["pct_chg"], amplitude=r["amplitude"],
+            source=r["source"], asset_type=r["asset_type"],
+        )
+    return result
+
+
+def _get_stored_row(engine, symbol, date):
+    """Get a single stored row."""
+    if date is None:
+        return None
+    from sqlalchemy import text
+    sql = text("""
+        SELECT date, symbol, open, high, low, close, adj_close, volume,
+               prev_close, change, pct_chg, amplitude, source, asset_type
+          FROM public.macro
+         WHERE symbol = :symbol AND date = :date
+         LIMIT 1
+    """)
+    with engine.connect() as conn:
+        r = conn.execute(sql, {"symbol": symbol, "date": date}).mappings().first()
+    if r is None:
+        return None
+    return Row(
+        symbol=r["symbol"], date=r["date"],
+        open=r["open"], high=r["high"], low=r["low"],
+        close=r["close"], adj_close=r["adj_close"], volume=r["volume"],
+        prev_close=r["prev_close"], change=r["change"],
+        pct_chg=r["pct_chg"], amplitude=r["amplitude"],
+        source=r["source"], asset_type=r["asset_type"],
+    )
+
+
+def _fetch_confirmation_observation(symbol, session_date, now):
+    """Fetch a confirmed same-definition observation for reconciliation."""
+    if symbol in AUTO_CORRECT_SYMBOLS:
+        return _fetch_treasury_confirmation(symbol, session_date, now)
+    return _fetch_provider_confirmation(symbol, session_date, now)
+
+
+def _fetch_treasury_confirmation(symbol, session_date, now):
+    """Fetch Treasury.gov official CMT value for a specific date."""
+    try:
+        from db_builder.session_calendar import TENOR_BY_CMT_SYMBOL
+        element = TENOR_BY_CMT_SYMBOL.get(symbol)
+        if element is None:
+            return None
+        year = session_date.year
+        df = fetch_treasury_par_yields(year)
+        if session_date not in [d.date() for d in df.index]:
+            return None
+        idx = [d.date() for d in df.index].index(session_date)
+        val = df[element].iloc[idx]
+        if pd.isna(val):
+            return None
+        val = float(val)
+        return Row(
+            symbol=symbol, date=session_date,
+            open=val, high=val, low=val, close=val, adj_close=val,
+            volume=None, source="treasury.gov", asset_type="ust_yield_cmt",
+        )
+    except Exception:
+        return None
+
+
+def _fetch_provider_confirmation(symbol, session_date, now):
+    """Fetch same-provider confirmation for non-CMT symbols."""
+    return None
+
+
+def _next_valid_session(symbol, session_date):
+    """Get the next valid session after session_date."""
+    if session_date is None:
+        return None
+    try:
+        from db_builder.session_calendar import adapter_for
+        cal = adapter_for(symbol)
+        return cal.next_session(session_date)
+    except Exception:
+        return None
+
+
+def _record_detection(store, symbol, session_date, verdict, reason, run_id):
+    """Record a DETECTION event."""
+    record_detection_event(
+        store=store,
+        symbol=symbol,
+        session_date=session_date,
+        verdict=verdict,
+        reason=reason,
+        run_id=run_id,
+    )
 def run_daily_update(
     symbol_filter=None,
     start_date=None,
