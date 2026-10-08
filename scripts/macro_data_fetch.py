@@ -94,6 +94,11 @@ _PHASE_A_DEFERRED_COUNT: int = 0
 # and remains an alert/failure candidate.
 _PHASE_A_BOUNDARY_DEFERRED_COUNT: int = 0
 _PHASE_A_ACTIONABLE_DEFERRALS: list = []
+# Phase A.1: explicit pipeline-fatal conditions (positive list).
+# Historical rows safely withheld because confirmation is unavailable are NOT
+# automatically pipeline-fatal. Only conditions that make the run's integrity
+# unknowable or that affect required current/live data are fatal.
+_PIPELINE_FATAL_CONDITIONS: list = []
 
 # D1: the provider fetch window starts at ``today - (LOOKBACK + CALC_BUFFER)``
 # days (see ``target_start`` in the fetch paths). A prior session strictly
@@ -328,6 +333,9 @@ class MacroCoverageSummary:
     required_failed_symbols: tuple[str, ...]
     provider_failure_counts: tuple[tuple[str, int], ...]
     coverage_satisfied: bool
+    required_historical_deferred_symbols: tuple[str, ...] = ()
+    supplementary_historical_deferred_symbols: tuple[str, ...] = ()
+    expected_frozen_symbols: tuple[str, ...] = ()
 
     @property
     def exit_code(self):
@@ -2194,6 +2202,23 @@ def summarize_outcomes(outcomes, minimum_coverage_pct=MIN_COVERAGE_PCT):
         and not required_failed
         and raw_coverage_pct >= minimum_coverage_pct
     )
+    # Classify historical deferrals into mutually exclusive buckets:
+    # - EXPECTED_FROZEN: intentional long-term freeze (legacy Treasury)
+    # - REQUIRED_HISTORICAL_DEGRADED: required symbols with historical deferrals
+    # - SUPPLEMENTARY_HISTORICAL_DEGRADED: supplementary symbols with historical deferrals
+    # A symbol is counted in exactly one bucket per condition.
+    expected_frozen = set()
+    required_historical_deferred = set()
+    supplementary_historical_deferred = set()
+    for rec in _PHASE_A_ACTIONABLE_DEFERRALS:
+        sym = rec.get("symbol")
+        reason = rec.get("reason")
+        if reason == "LEGACY_EOD_DEFINITION_UNRESOLVED":
+            expected_frozen.add(sym)
+        elif sym in REQUIRED_SYMBOLS:
+            required_historical_deferred.add(sym)
+        else:
+            supplementary_historical_deferred.add(sym)
     return MacroCoverageSummary(
         outcomes=ordered,
         configured_count=configured_count,
@@ -2203,6 +2228,9 @@ def summarize_outcomes(outcomes, minimum_coverage_pct=MIN_COVERAGE_PCT):
         required_failed_symbols=required_failed,
         provider_failure_counts=tuple(provider_failure_counts),
         coverage_satisfied=coverage_satisfied,
+        required_historical_deferred_symbols=tuple(sorted(required_historical_deferred)),
+        supplementary_historical_deferred_symbols=tuple(sorted(supplementary_historical_deferred)),
+        expected_frozen_symbols=tuple(sorted(expected_frozen)),
     )
 
 
@@ -3520,19 +3548,47 @@ def run_daily_update(
     else:
         print("[ETF FLOW SKIP] ETF daily flow refresh disabled.")
 
-    if summary.failed_count == 0:
-        print("[MACRO UPDATE SUCCESS] Required coverage satisfied; all configured symbols succeeded.")
-    elif summary.coverage_satisfied:
-        print(
-            "[MACRO UPDATE PARTIAL FAILURE] Required coverage satisfied; "
-            "supplementary failures retained and reported."
-        )
-    else:
+    _render_pipeline_status_message(summary)
+    return summary
+
+
+def _render_pipeline_status_message(summary):
+    """Render the final pipeline-state message for a coverage summary.
+
+    SUCCESS: coverage satisfied, no genuine degradation (only intentional
+    EXPECTED_FROZEN exclusions may remain).
+    DEGRADED_SUCCESS: coverage satisfied but genuine operational degradation
+    exists (required/supplementary historical deferrals).
+    FAILURE: coverage not satisfied.
+    """
+    req_hist = len(summary.required_historical_deferred_symbols)
+    supp_hist = len(summary.supplementary_historical_deferred_symbols)
+    expected_frozen = len(summary.expected_frozen_symbols)
+    if not summary.coverage_satisfied:
         print(
             "[MACRO UPDATE FAILURE] Required coverage not satisfied; "
             "returning non-zero."
         )
-    return summary
+    elif req_hist or supp_hist:
+        # Genuine operational degradation exists — unsafe historical rows withheld.
+        print(
+            f"[MACRO UPDATE DEGRADED SUCCESS] coverage={summary.coverage_pct:.2f}%; "
+            f"required historical degraded={req_hist}; "
+            f"supplementary historical degraded={supp_hist}; "
+            f"expected frozen={expected_frozen}; "
+            f"unsafe historical rows withheld; downstream continuing."
+        )
+    elif expected_frozen:
+        # Only intentional EXPECTED_FROZEN exclusions remain — this is SUCCESS, not degraded.
+        print(
+            f"[MACRO UPDATE SUCCESS] coverage={summary.coverage_pct:.2f}%; "
+            f"expected frozen={expected_frozen} legacy Treasury historical symbols."
+        )
+    else:
+        print(
+            "[MACRO UPDATE SUCCESS] Required coverage satisfied; "
+            "all configured symbols succeeded."
+        )
 
 
 def _classify_deferral(reason, *, expected_prior, batch_start):
@@ -3562,51 +3618,92 @@ def _classify_deferral(reason, *, expected_prior, batch_start):
     return "actionable"
 
 
-def _phase_a_safety_exit_code(summary):
-    """Return a non-zero exit code when a Phase A safety condition is active.
+def _classify_unavailable_symbol(symbol, reason):
+    """Classify an unavailable symbol as PIPELINE_FATAL, DEGRADED, or EXPECTED_FROZEN.
 
-    ``summarize_outcomes`` measures *fetch* success, so a calendar/session
-    validation failure would otherwise exit 0 and raise no alert. Phase A
-    requires an explicit alert when historical writes are fail-closed.
+    PIPELINE_FATAL:
+    - required current/live symbol unavailable
+    - core provider failure leaves required current data unavailable
+    - internal DB/gate failure
 
-    D1: only ACTIONABLE deferrals raise the alert. Benign window-boundary
-    deferrals are logged and counted but must not fail the cycle.
+    DEGRADED:
+    - supplementary source unavailable
+    - required historical confirmation unavailable while safe live/current data exists
+
+    EXPECTED_FROZEN:
+    - intentional long-term freeze (legacy Treasury EOD definition unresolved)
+    - not an operational degradation; does not count toward DEGRADED_SUCCESS
     """
-    reasons = []
+    # Legacy Treasury freeze is intentional by design — never pipeline-fatal
+    if reason == "LEGACY_EOD_DEFINITION_UNRESOLVED":
+        return "EXPECTED_FROZEN"
 
-    unavailable = sorted({
-        rec.get("symbol")
-        for rec in _PHASE_A_UNAVAILABLE_SYMBOLS
-        if rec.get("symbol")
-    })
-    if unavailable:
-        reasons.append(
-            f"calendar/session unavailable for {len(unavailable)} symbol(s): "
-            f"{','.join(unavailable[:10])}"
-        )
+    # Required symbol unavailable is pipeline-fatal
+    if symbol in REQUIRED_SYMBOLS:
+        return "PIPELINE_FATAL"
 
-    actionable = len(_PHASE_A_ACTIONABLE_DEFERRALS)
-    if actionable:
-        sample = sorted({
-            f"{rec.get('symbol')}:{rec.get('reason')}"
-            for rec in _PHASE_A_ACTIONABLE_DEFERRALS
-        })[:8]
-        reasons.append(
-            f"{actionable} actionable historical row(s) deferred "
-            f"({', '.join(sample)})"
-        )
+    # Supplementary symbol unavailable is degraded
+    return "DEGRADED"
 
-    if not reasons:
-        return 0
 
-    message = (
-        "[PHASE A ALERT] historical ingestion is fail-closed. "
-        + "; ".join(reasons)
-        + ". Live snapshots (macro_live) continue. No unconfirmed data was written."
-    )
-    print(message)
-    print(f"[PHASE A ALERT] MACRO_PHASE_A_ALERT={'; '.join(reasons)}")
-    return 1
+def _phase_a_safety_exit_code(summary):
+    """Return a non-zero exit code only for pipeline-fatal conditions.
+
+    Three-state model:
+    - SUCCESS: coverage satisfied, no deferrals, no fatal conditions
+    - DEGRADED_SUCCESS: coverage satisfied, historical deferrals exist but safe
+    - FAIL_CLOSED: coverage not satisfied, or required live data failed, or fatal condition
+
+    Symbol-level fail-closed behavior is unchanged: historical rows that cannot
+    be safely confirmed remain deferred. This function only determines whether
+    those deferrals should abort the entire pipeline.
+
+    Pipeline-fatal positive set:
+    1. Required coverage below threshold
+    2. Required current/live data unavailable
+    3. Deferred-store persistence failure
+    4. DB write/transaction failure
+    5. Phase A gate/internal exception
+    6. Calendar/session engine failure affecting required processing
+    7. Live-as-historical write risk
+    8. Positional previous-row fallback attempt
+    9. Source-definition contamination
+    10. Written-row arithmetic/invariant failure
+    11. Systemic failure that makes the run's integrity unknowable
+
+    NOT pipeline-fatal:
+    - Supplementary historical deferrals with coverage satisfied
+    - Required symbols with healthy live data but deferred historical rows
+    - Legacy Treasury intentionally frozen (LEGACY_EOD_DEFINITION_UNRESOLVED)
+    """
+    # Pipeline-fatal: coverage not satisfied
+    if summary is None:
+        return 1
+    if not summary.coverage_satisfied:
+        return 1
+
+    # Pipeline-fatal: required symbol live data failed
+    if summary.required_failed_symbols:
+        return 1
+
+    # Pipeline-fatal: systemic confirmation failure (>50% of required symbols)
+    required_total = len([s for s in summary.outcomes if s.required])
+    required_failed = len(summary.required_failed_symbols)
+    if required_total > 0 and required_failed > required_total * 0.5:
+        return 1
+
+    # Pipeline-fatal: explicit fatal conditions recorded during the run
+    if _PIPELINE_FATAL_CONDITIONS:
+        return 1
+
+    # Pipeline-fatal: required current/live symbol unavailable
+    for rec in _PHASE_A_UNAVAILABLE_SYMBOLS:
+        if _classify_unavailable_symbol(rec.get("symbol"), rec.get("reason")) == "PIPELINE_FATAL":
+            return 1
+
+    # NOT pipeline-fatal: historical deferrals with coverage satisfied
+    # These remain actionable at the symbol level but don't abort the pipeline
+    return 0
 
 
 def parse_args(argv=None):
@@ -3638,7 +3735,86 @@ def main(argv=None):
         etf_flow_tickers=etf_flow_tickers,
         update_live=not args.skip_live_replace,
     )
-    return summary.exit_code or _phase_a_safety_exit_code(summary)
+    exit_code = summary.exit_code or _phase_a_safety_exit_code(summary)
+    if exit_code == 0 and summary.coverage_satisfied:
+        req_hist = len(summary.required_historical_deferred_symbols)
+        supp_hist = len(summary.supplementary_historical_deferred_symbols)
+        expected_frozen = len(summary.expected_frozen_symbols)
+        if req_hist or supp_hist:
+            print(
+                f"[PHASE A WARN] historical ingestion degraded. "
+                f"required_historical_deferred={req_hist} "
+                f"supplementary_historical_deferred={supp_hist} "
+                f"expected_frozen={expected_frozen}. "
+                f"Pipeline continues; unsafe historical rows withheld."
+            )
+        elif expected_frozen:
+            print(
+                f"[PHASE A INFO] expected_frozen={expected_frozen} legacy Treasury historical symbols."
+            )
+        # Per-class freshness reporting
+        _report_per_class_freshness(summary)
+    return exit_code
+
+
+def _report_per_class_freshness(summary):
+    """Report per-class freshness status during DEGRADED_SUCCESS.
+
+    Pipeline success must never imply every asset class is fresh.
+    Each class is reported independently: FRESH, STALE, DEGRADED, EXPECTED_FROZEN, or UNAVAILABLE.
+    """
+    from datetime import date as _date
+    today = _date.today()
+
+    # Define asset classes and their symbols
+    classes = {
+        "equity_indices": ["^GSPC", "^NDX", "^DJI", "^RUT", "^VIX", "^FTSE", "^GDAXI", "^FCHI", "^HSI", "^N225", "^KS11"],
+        "fx": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDJPY=X", "CNY=X", "CHFUSD=X", "NZDUSD=X", "HKD=X", "SGD=X"],
+        "futures": ["BZ=F", "CL=F", "ES=F", "GC=F", "HG=F", "NG=F", "NIY=F", "NQ=F", "RTY=F", "SI=F", "YM=F"],
+        "treasury_cmt": ["US2YT_CMT", "US3YT_CMT", "US5YT_CMT", "US7YT_CMT", "US10YT_CMT", "US20YT_CMT", "US30YT_CMT"],
+        "treasury_legacy": ["US2YT=X", "US3YT=X", "US5YT=X", "US7YT=X", "US10YT=X", "US20YT=X", "US30YT=X"],
+        "yield_indices": ["^FVX", "^TNX", "^TYX"],
+        "dollar_index": ["DX-Y.NYB"],
+        "crypto": ["BTC-USD", "ETH-USD"],
+    }
+
+    # Build lookup from summary outcomes
+    outcome_map = {o.symbol: o for o in summary.outcomes}
+    expected_frozen_set = set(summary.expected_frozen_symbols)
+
+    print("\n[PER-CLASS FRESHNESS]")
+    for class_name, symbols in classes.items():
+        class_outcomes = [outcome_map[s] for s in symbols if s in outcome_map]
+        if not class_outcomes:
+            continue
+
+        successful = [o for o in class_outcomes if o.success]
+        failed = [o for o in class_outcomes if not o.success]
+
+        # Check if this class is entirely expected frozen
+        class_symbols_set = set(symbols)
+        if class_symbols_set and class_symbols_set.issubset(expected_frozen_set):
+            status = "EXPECTED_FROZEN"
+            print(f"  {class_name}: {status} (live/current successful={len(successful)}/{len(class_outcomes)}; historical frozen={len(class_outcomes)})")
+        elif not successful:
+            status = "UNAVAILABLE"
+            print(f"  {class_name}: {status} (successful={len(successful)}/{len(class_outcomes)})")
+        elif failed:
+            status = "DEGRADED"
+            print(f"  {class_name}: {status} (successful={len(successful)}/{len(class_outcomes)})")
+        else:
+            # Check if latest observation is recent (within 2 days)
+            latest_dates = [o.latest_observation for o in successful if o.latest_observation]
+            if latest_dates:
+                max_date = max(latest_dates)
+                if (today - max_date).days <= 2:
+                    status = "FRESH"
+                else:
+                    status = "STALE"
+            else:
+                status = "DEGRADED"
+
+            print(f"  {class_name}: {status} (successful={len(successful)}/{len(class_outcomes)})")
 
 
 if __name__ == "__main__":

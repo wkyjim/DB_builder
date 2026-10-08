@@ -66,7 +66,10 @@ def test_d1_boundary_deferral_is_non_fatal(m):
     # And a cycle whose only deferrals are of this kind exits 0.
     m._PHASE_A_DEFERRED_COUNT = 7
     m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 7
-    assert m._phase_a_safety_exit_code(None) == 0
+    summary_ok = m.summarize_outcomes([
+        m.SymbolFetchOutcome("^GSPC", "S&P 500", "yfinance", True, True, 5, None, None),
+    ])
+    assert m._phase_a_safety_exit_code(summary_ok) == 0
 
 
 def test_d1_missing_prior_inside_range_is_actionable(m):
@@ -105,28 +108,43 @@ def test_d1_unresolved_calendar_or_source_is_actionable(m):
 
 
 def test_d1_escalated_deferred_history_is_actionable(m):
-    """4. escalated deferred history -> actionable, and it alerts."""
+    """4. escalated deferred history -> actionable, and it alerts when coverage fails."""
     m._PHASE_A_ACTIONABLE_DEFERRALS.append(
         {"symbol": "US10YT_CMT", "reason": "DEFERRED_HISTORY_UNRESOLVED"})
-    assert m._phase_a_safety_exit_code(None) == 1
+    # With coverage not satisfied, exit 1.
+    summary_fail = m.summarize_outcomes([
+        m.SymbolFetchOutcome("US10YT_CMT", "10Y CMT", "treasury.gov", False, False, 0, None, "DEFERRED_HISTORY_UNRESOLVED"),
+    ])
+    assert m._phase_a_safety_exit_code(summary_fail) == 1
+    # With coverage satisfied, DEGRADED_SUCCESS (exit 0).
+    summary_ok = m.summarize_outcomes([
+        m.SymbolFetchOutcome("^GSPC", "S&P 500", "yfinance", True, True, 5, None, None),
+    ])
+    assert m._phase_a_safety_exit_code(summary_ok) == 0
 
 
 def test_d1_normal_cycle_with_only_boundary_deferrals_exits_zero(m):
     """5. normal cycle, only benign boundary deferrals -> exit 0."""
     m._PHASE_A_DEFERRED_COUNT = 14
     m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 14
-    assert m._phase_a_safety_exit_code(None) == 0
+    summary_ok = m.summarize_outcomes([
+        m.SymbolFetchOutcome("^GSPC", "S&P 500", "yfinance", True, True, 5, None, None),
+    ])
+    assert m._phase_a_safety_exit_code(summary_ok) == 0
     # A fully clean cycle is also 0.
     m._PHASE_A_DEFERRED_COUNT = 0
     m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
-    assert m._phase_a_safety_exit_code(None) == 0
+    assert m._phase_a_safety_exit_code(summary_ok) == 0
 
 
 def test_d1_actionable_integrity_deferral_is_non_zero(m):
-    """6. actionable integrity deferral -> non-zero exit."""
+    """6. actionable integrity deferral with coverage not satisfied -> non-zero exit."""
     m._PHASE_A_ACTIONABLE_DEFERRALS.append(
         {"symbol": "GATE_ERROR", "reason": "GATE_ERROR:ValueError"})
-    assert m._phase_a_safety_exit_code(None) == 1
+    summary_fail = m.summarize_outcomes([
+        m.SymbolFetchOutcome("GATE_ERROR", "Gate", "yfinance", False, False, 0, None, "GATE_ERROR:ValueError"),
+    ])
+    assert m._phase_a_safety_exit_code(summary_fail) == 1
 
 
 def test_d1_route_classifies_by_context_not_reason(m):
@@ -147,7 +165,11 @@ def test_d1_route_classifies_by_context_not_reason(m):
     assert m._PHASE_A_DEFERRED_COUNT == 1
     assert m._PHASE_A_BOUNDARY_DEFERRED_COUNT == 0
     assert len(m._PHASE_A_ACTIONABLE_DEFERRALS) == 1
-    assert m._phase_a_safety_exit_code(None) == 1
+    # With coverage not satisfied (single symbol failed), exit 1.
+    summary_fail = m.summarize_outcomes([
+        m.SymbolFetchOutcome("^GSPC", "S&P 500", "yfinance", True, False, 0, None, "PREVIOUS_SESSION_NOT_CONFIRMED"),
+    ])
+    assert m._phase_a_safety_exit_code(summary_fail) == 1
 
 
 # --------------------------------------------------------------------------

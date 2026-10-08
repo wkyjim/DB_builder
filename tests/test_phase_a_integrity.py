@@ -494,25 +494,31 @@ def test_phase_a_safety_alert_fires_on_calendar_failure(monkeypatch):
     m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
     m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
     try:
-        # Healthy run: no alert.
-        assert m._phase_a_safety_exit_code(None) == 0
+        # No summary available -> fail-closed (return 1).
+        assert m._phase_a_safety_exit_code(None) == 1
 
-        # Calendar unavailable -> explicit alert, non-zero.
+        # Calendar unavailable with coverage not satisfied -> non-zero.
         m._PHASE_A_UNAVAILABLE_SYMBOLS.append(
             {"symbol": "^GSPC", "reason": "CLOSED_UNCONFIRMED"})
-        assert m._phase_a_safety_exit_code(None) == 1
+        summary = m.summarize_outcomes([
+            m.SymbolFetchOutcome("^GSPC", "S&P 500", "yfinance", True, False, 0, None, "CLOSED_UNCONFIRMED"),
+        ])
+        assert m._phase_a_safety_exit_code(summary) == 1
 
         # D1: BENIGN boundary deferrals alone must NOT alert.
         m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
         m._PHASE_A_DEFERRED_COUNT = 3
         m._PHASE_A_BOUNDARY_DEFERRED_COUNT = 3
         m._PHASE_A_ACTIONABLE_DEFERRALS.clear()
-        assert m._phase_a_safety_exit_code(None) == 0
+        summary_ok = m.summarize_outcomes([
+            m.SymbolFetchOutcome("^GSPC", "S&P 500", "yfinance", True, True, 5, None, None),
+        ])
+        assert m._phase_a_safety_exit_code(summary_ok) == 0
 
-        # D1: an ACTIONABLE deferral alerts.
+        # D1: an ACTIONABLE deferral with coverage satisfied -> DEGRADED_SUCCESS (0).
         m._PHASE_A_ACTIONABLE_DEFERRALS.append(
             {"symbol": "^GSPC", "reason": "PREVIOUS_SESSION_NOT_CONFIRMED"})
-        assert m._phase_a_safety_exit_code(None) == 1
+        assert m._phase_a_safety_exit_code(summary_ok) == 0
     finally:
         m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
         m._PHASE_A_DEFERRED_COUNT = 0
@@ -536,7 +542,11 @@ def test_gate_records_unavailable_symbol_telemetry():
         assert m._PHASE_A_DEFERRED_COUNT == 1
         assert any(r["symbol"] == "HK50"
                    for r in m._PHASE_A_UNAVAILABLE_SYMBOLS)
-        assert m._phase_a_safety_exit_code(None) == 1
+        # With coverage not satisfied (single symbol failed), exit 1.
+        summary = m.summarize_outcomes([
+            m.SymbolFetchOutcome("HK50", "Hang Seng", "investing.com", False, False, 0, None, "CLOSED_UNCONFIRMED"),
+        ])
+        assert m._phase_a_safety_exit_code(summary) == 1
     finally:
         m._PHASE_A_UNAVAILABLE_SYMBOLS.clear()
         m._PHASE_A_DEFERRED_COUNT = 0

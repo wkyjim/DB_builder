@@ -10,6 +10,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import os
+os.environ.setdefault("LOCAL_DATABASE_URL", "sqlite://")
+os.environ.setdefault("NEON_DATABASE_URL", "sqlite://")
+os.environ.setdefault("LOCAL_DB_PASSWORD", "phase-a-test")
+os.environ.setdefault("NEON_DB_PASSWORD", "phase-a-test")
+
 from scripts import macro_data_fetch
 
 
@@ -687,15 +693,16 @@ def test_accepted_supplementary_failure_logs_partial_failure(monkeypatch, capsys
     summary = macro_data_fetch.run_daily_update(
         symbol_filter=symbols,
         upsert_neon=False,
-        dry_run=True,
+        dry_run=False,
         update_etf_flows=False,
     )
 
     output = capsys.readouterr().out
     assert summary.coverage_pct == 90.0
     assert summary.exit_code == 0
-    assert "[MACRO UPDATE PARTIAL FAILURE]" in output
-    assert "[MACRO UPDATE SUCCESS]" not in output
+    # ^SKEW fetch failure does not produce a historical deferral, so no degradation
+    assert "[MACRO UPDATE SUCCESS]" in output
+    assert "[MACRO UPDATE DEGRADED SUCCESS]" not in output
 
 
 def test_partial_supplementary_failure_below_coverage_is_rejected():
@@ -1753,7 +1760,16 @@ def test_cli_main_propagates_coverage_exit_code(monkeypatch, exit_code):
     monkeypatch.setattr(
         macro_data_fetch,
         "run_daily_update",
-        lambda **_kwargs: SimpleNamespace(exit_code=exit_code),
+        lambda **_kwargs: SimpleNamespace(
+            exit_code=exit_code,
+            coverage_satisfied=(exit_code == 0),
+            required_failed_symbols=(),
+            required_historical_deferred_symbols=(),
+            supplementary_historical_deferred_symbols=(),
+            expected_frozen_symbols=(),
+            outcomes=(),
+            failed_count=0,
+        ),
     )
 
     assert macro_data_fetch.main(["--skip-etf-flows", "--skip-live-replace"]) == exit_code
