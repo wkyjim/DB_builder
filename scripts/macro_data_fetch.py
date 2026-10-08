@@ -28,6 +28,12 @@ from db_builder.session_calendar import (
     historical_eligibility,
     adapter_for,
     previous_valid_session,
+    previous_valid_observation_date,
+    SOURCE_DEFINITION_BY_SYMBOL,
+    SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
+    SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
     treasury_publication_confirmed,
 )
 from db_builder.deferred_history import (
@@ -709,7 +715,8 @@ def official_prior_confirmed(symbol, expected_prior, *, treasury_published_dates
 
 def _eligible_for_historical(row, *, known_prior_sessions=None,
                              treasury_published_dates=None, now_utc=None,
-                             treasury_published_values=None):
+                             treasury_published_values=None,
+                             source_definition=None):
     """Phase A EOD write gate.
 
     Returns an ``Eligibility`` decision. Fail-closed: any error yields a
@@ -719,6 +726,10 @@ def _eligible_for_historical(row, *, known_prior_sessions=None,
     official observed value: a publication date alone never authorises a
     historical write, so an Investing.com/Yahoo-derived value for the same
     symbol/date is deferred instead of being stored as official EOD.
+
+    ``source_definition`` is the approved historical source definition the
+    candidate row belongs to. The previous *observation date* is resolved from
+    it; an unknown or unestablished definition fails closed.
     """
     try:
         session_date = pd.to_datetime(row["date"]).date()
@@ -728,6 +739,9 @@ def _eligible_for_historical(row, *, known_prior_sessions=None,
             known_prior_sessions=known_prior_sessions,
             now_utc=now_utc,
             treasury_published_dates=treasury_published_dates,
+            source_definition=source_definition
+            if source_definition is not None
+            else row.get("source_definition"),
         )
         if decision.routing != ROUTE_HISTORICAL:
             return decision
@@ -846,9 +860,18 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
                 deferred.append((rec, "PRIOR_SESSION_LOOKUP_FAILED"))
                 continue
             continue
-        # A prior session present earlier in this same batch also counts.
-        batch_dates = {pd.to_datetime(r["date"]).date() for r in symbol_rows}
-        known_all = set(known) | batch_dates
+        # Phase A.2A: only a prior session already confirmed in historical
+        # storage may satisfy D's prior dependency. A date that merely appears
+        # as a *candidate* in this batch is NOT confirmed: it may itself be
+        # deferred or rejected, so admitting it would let D be written with a
+        # prev_close anchored to a row that was never persisted.
+        #
+        # Invariant: a historical row D may only be written when its previous
+        # valid session P is itself confirmed under the same approved source
+        # definition and is already stored. If P is missing or deferred, D
+        # must also defer; the next cycle reconsiders D once P is stored.
+        # Positional D-2 fallback remains prohibited.
+        known_all = set(known)
 
         for rec in symbol_rows:
             decision = _eligible_for_historical(
@@ -1222,7 +1245,8 @@ def extract_latest_unfinished_row(df, symbol, name, asset_type, observed_at=None
 
 def calculate_rows_for_symbol(df, symbol, name, asset_type,
                               *, defer_callback=None,
-                              allow_missing_prior=False):
+                              allow_missing_prior=False,
+                              source_definition=None):
     """Build rows for ``symbol``.
 
     Phase A: ``prev_close`` is resolved from the immediately prior *valid
@@ -1254,7 +1278,15 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
         latest = df.iloc[i]
         latest_date = latest["_date"]
 
-        expected_prior = previous_valid_session(symbol, latest_date)
+        # Phase A.2A: prev_close is resolved against the *previous daily
+        # observation date* for the candidate's approved source definition,
+        # not the raw session date and not the symbol alone. For a Mon-Fri
+        # labelled Globex source Monday's previous observation is Friday,
+        # because no Sunday-labelled bar is published. An unknown or
+        # unestablished definition fails closed (expected_prior is None ->
+        # deferred).
+        expected_prior = previous_valid_observation_date(
+            symbol, latest_date, source_definition)
 
         prev_close = None
         if expected_prior is not None:
@@ -1290,6 +1322,8 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
             "symbol": symbol,
             "name": name,
             "asset_type": asset_type,
+            "source_definition": source_definition
+            or SOURCE_DEFINITION_BY_SYMBOL.get(symbol),
             "open": round_4(open_price),
             "high": round_4(high),
             "low": round_4(low),
@@ -1621,6 +1655,7 @@ def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None)
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
+            source_definition=SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
         )
         rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start_date)
         if rows:
@@ -1797,6 +1832,7 @@ def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
+            source_definition=SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
         )
         rows = filter_rows_to_target_window(
             rows=rows,
@@ -1892,6 +1928,7 @@ def process_asia_index_yfinance_fallback_symbol(symbol, meta, *, start_date=None
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
+            source_definition=SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
         )
         rows = filter_rows_to_target_window(
             rows=rows,
@@ -2109,6 +2146,7 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
+            source_definition=SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
         )
         rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start)
         if rows:

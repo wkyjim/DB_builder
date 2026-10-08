@@ -579,7 +579,7 @@ def configure_macro_run(monkeypatch, *, yf_failures=None, investiny_failures=Non
     monkeypatch.setattr(
         macro_data_fetch,
         "calculate_rows_for_symbol",
-        lambda df, symbol, name, asset_type: [
+        lambda df, symbol, name, asset_type, **kwargs: [
             {"date": date(2026, 7, 8), "symbol": symbol}
         ],
     )

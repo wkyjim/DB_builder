@@ -111,6 +111,137 @@ GLOBEX_SYMBOLS: Set[str] = {
     "GC=F", "SI=F", "HG=F", "CL=F", "BZ=F", "NG=F",
 }
 
+# ---------------------------------------------------------------------------
+# Daily observation-date conventions (Phase A.2A)
+#
+# A *session* calendar and a *daily-bar observation-date* convention are two
+# different things and must not be conflated:
+#
+#   * the session calendar answers "is the market trading, and when does the
+#     session close?" -- used for live market-state, session open/closed and
+#     Sunday-evening trading;
+#   * the observation-date convention answers "which daily bar does this
+#     source publish before D?" -- used for the historical prev_close chain.
+#
+# Globex is the motivating case: Sunday 17:00 ET *is* a real trading session,
+# but a source that publishes Mon-Fri daily bars does not publish a
+# Sunday-labelled daily bar. The daily observation before Monday is therefore
+# Friday, not Sunday.
+#
+# The convention is keyed by the EXACT approved *historical source definition*,
+# never by symbol alone: the same symbol can be served by different sources
+# (e.g. an Investing.com continuous futures series vs. a yfinance fallback),
+# and those sources may label daily bars differently. Provider date-label
+# behaviour is NOT transferable between source definitions, and symbol identity
+# alone does not establish a convention.
+#
+# ``None`` / absent means "not established for that source definition" and
+# fails closed (the historical gate defers). The convention is never inferred
+# from fallback-provider success.
+# ---------------------------------------------------------------------------
+
+# Source-definition identifiers. A source definition is the tuple
+# (provider, instrument definition, daily-bar convention, continuous-contract
+# construction) -- not a vague provider name. A single provider may legitimately
+# carry more than one definition.
+SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY = "INVESTING_CONTINUOUS_FUTURES_DAILY"
+SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY = "YFINANCE_CONTINUOUS_FUTURES_DAILY"
+SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY = "YFINANCE_CASH_INDEX_DAILY"
+SOURCE_DEF_TREASURY_GOV_PAR_YIELD = "TREASURY_GOV_PAR_YIELD_DAILY"
+SOURCE_DEF_CRYPTO_24_7_DAILY = "CRYPTO_24_7_DAILY"
+SOURCE_DEF_YFINANCE_FX_DAILY = "YFINANCE_FX_DAILY"
+SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY = "YFINANCE_CASH_EQUITY_DAILY"
+
+# Per-symbol *primary* historical source definition. This records which source
+# definition the stored series belongs to; it is not itself the convention.
+# Populated for every class so an unresolvable definition fails closed rather
+# than silently defaulting.
+SOURCE_DEFINITION_BY_SYMBOL: Dict[str, str] = {
+    # Investing.com continuous front-contract futures (ids 8833/8849).
+    "BZ=F": SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    "CL=F": SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    # yfinance continuous futures.
+    **{s: SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY
+       for s in ("ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F",
+                 "GC=F", "SI=F", "HG=F", "NG=F")},
+    # Daily bars labelled by session date for these classes.
+    **{s: SOURCE_DEF_TREASURY_GOV_PAR_YIELD
+       for s in TREASURY_SYMBOLS | CMT_SYMBOLS},
+    **{s: SOURCE_DEF_CRYPTO_24_7_DAILY for s in CRYPTO_SYMBOLS},
+    **{s: SOURCE_DEF_YFINANCE_FX_DAILY for s in FX_SYMBOLS},
+    **{s: SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY
+       for s in CBOE_ICE_SYMBOLS | set(EXCHANGE_BY_SYMBOL)},
+}
+
+# Every source definition this build recognises. A candidate carrying an
+# identifier outside this set is rejected (fail closed) -- an unknown
+# definition must never inherit another definition's convention.
+KNOWN_SOURCE_DEFINITIONS: Set[str] = {
+    SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
+    SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
+    SOURCE_DEF_CRYPTO_24_7_DAILY,
+    SOURCE_DEF_YFINANCE_FX_DAILY,
+    SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY,
+}
+
+# Definitions whose daily bars are explicitly known to be labelled by session
+# date: for these the previous *session* IS the previous observation.
+#
+# This list is deliberately an allow-list. Any recognised definition NOT listed
+# here requires an independently established daily-observation convention, and
+# its absence fails closed. A newly added source definition therefore cannot
+# silently inherit another definition's convention -- the safe default is
+# always "defer until the convention is established".
+SESSION_DATE_LABELLED_DEFINITIONS: Set[str] = {
+    SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
+    SOURCE_DEF_CRYPTO_24_7_DAILY,
+    SOURCE_DEF_YFINANCE_FX_DAILY,
+    SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY,
+    SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
+}
+
+# An *explicitly established* observation convention, keyed by source
+# definition. Only entries present here are authoritative.
+#
+# NOTE (Phase A.2A): for the Investing.com continuous futures definition the
+# provider's daily date-label convention has NOT been independently
+# established, so it is deliberately absent -> the historical gate fails
+# closed for that definition. This is intentional: yfinance's Mon-Fri label
+# behaviour must not be assumed to hold for Investing.com's continuous series,
+# and the investigation already showed the two are not source-equivalent.
+OBSERVATION_CONVENTION_BY_SOURCE_DEFINITION: Dict[str, Optional[str]] = {
+    SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY: "us_futures",
+    SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY: "XNYS",
+}
+
+# Human-readable record of what was established, for diagnostics/audit.
+OBSERVATION_CONVENTION_EVIDENCE: Dict[str, Dict[str, str]] = {
+    SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY: {
+        "provider": "yfinance",
+        "instrument_definition": "continuous front-month futures",
+        "daily_bar_convention": "Mon-Fri labelled; no Sunday-labelled bar",
+        "continuous_construction": "provider default (front contract)",
+        "sunday_daily_bar_produced": "no",
+        "monday_bar_includes_sunday_evening": "known",
+        "approved_convention": "CME us_futures session calendar "
+                               "(previous daily observation; Sunday excluded)",
+    },
+    SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY: {
+        "provider": "investing.com (investiny)",
+        "instrument_definition": "continuous front-contract futures "
+                                  "(Brent LCOV6 / WTI OIL)",
+        "daily_bar_convention": "NOT ESTABLISHED",
+        "continuous_construction": "provider continuous front contract",
+        "sunday_daily_bar_produced": "unknown",
+        "monday_bar_includes_sunday_evening": "unknown",
+        "approved_convention": "NONE -- fails closed pending independent "
+                               "establishment for this exact definition",
+    },
+}
+
+
 # Investing.com continuous futures whose identity/source definition is
 # unresolved. Historical writes for these symbols are deferred; the EOD gate
 # is never bypassed for them.
@@ -191,11 +322,57 @@ class UnknownCalendarAdapter(CalendarAdapter):
     def previous_valid_session(self, d: dt.date) -> Optional[dt.date]:
         return None
 
+    def previous_valid_observation_date(self, d: dt.date) -> Optional[dt.date]:
+        return None
+
     def session_close_utc(self, d: dt.date) -> Optional[dt.datetime]:
         return None
 
     def session_status(self, d: dt.date, now_utc: dt.datetime) -> SessionStatus:
         return SessionStatus.CLOSED_UNCONFIRMED
+
+
+class DailyObservationAdapter:
+    """Resolve the previous *daily observation date* for a source series.
+
+    Distinct from ``CalendarAdapter``: this answers which daily bar the source
+    publishes before ``D``, not whether the market is trading. Backed by an
+    ``exchange_calendars`` exchange (``us_futures`` for Globex daily bars),
+    which is holiday-aware and excludes the Sunday session.
+    """
+
+    def __init__(self, exchange: str):
+        if _xc is None:
+            raise CalendarUnavailable(
+                f"exchange_calendars unavailable: {_XC_IMPORT_ERROR!r}")
+        try:
+            self._cal = _xc.get_calendar(exchange)
+        except Exception as exc:
+            raise CalendarUnavailable(f"{exchange}: {exc}") from exc
+        self.name = exchange
+
+    def is_observation_day(self, d: dt.date) -> bool:
+        try:
+            return bool(self._cal.is_session(d))
+        except Exception:
+            return False
+
+    def previous_valid_observation_date(self, d: dt.date) -> Optional[dt.date]:
+        """Previous published daily observation strictly before ``d``.
+
+        Fails closed (``None``) when the backend cannot answer, so an
+        unestablished convention can never authorise a historical write.
+        """
+        try:
+            return _as_date(self._cal.previous_session(d))
+        except Exception:
+            pass
+        try:
+            anchor = _pd.Timestamp(d) - _pd.Timedelta(days=1)
+            return _as_date(
+                self._cal.date_to_session(anchor, direction="previous"))
+        except Exception:
+            return None
 
 
 class ExchangeCalendarAdapter(CalendarAdapter):
@@ -416,6 +593,140 @@ def adapter_for(symbol: str) -> CalendarAdapter:
 def reset_adapter_cache() -> None:
     """Test hook: drop cached adapters (e.g. after toggling the backend)."""
     _ADAPTER_CACHE.clear()
+    _OBSERVATION_ADAPTER_CACHE.clear()
+
+
+# ------------------------------------------------- observation-date convention
+
+_OBSERVATION_ADAPTER_CACHE: Dict[str, Optional[DailyObservationAdapter]] = {}
+
+
+def source_definition_for(symbol: str,
+                          source_definition: Optional[str] = None) -> Optional[str]:
+    """Return the approved historical source definition for a candidate row.
+
+    ``source_definition`` is carried by the candidate row when known (it is the
+    definition the row's provider actually produced). When absent, fall back to
+    the symbol's registered primary definition. ``None`` means the definition
+    could not be resolved -> the gate must fail closed.
+    """
+    if source_definition:
+        return source_definition
+    return SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+
+
+def observation_adapter_for(
+        symbol: str,
+        source_definition: Optional[str] = None,
+) -> Optional[DailyObservationAdapter]:
+    """Return the daily observation-date adapter for a *source definition*.
+
+    The convention is resolved from the approved historical source definition,
+    never from the symbol alone: the same symbol may be served by different
+    sources with different daily-bar labelling, and provider label behaviour is
+    not transferable between them.
+
+    ``None`` means the convention is not established for that exact source
+    definition -> the historical gate must defer (fail closed). Never infer a
+    convention from provider success, from another source definition, or from
+    the symbol's identity.
+    """
+    definition = source_definition_for(symbol, source_definition)
+    if definition is None:
+        return None
+
+    cache_key = (symbol, definition)
+    if cache_key in _OBSERVATION_ADAPTER_CACHE:
+        return _OBSERVATION_ADAPTER_CACHE[cache_key]
+
+    exchange = OBSERVATION_CONVENTION_BY_SOURCE_DEFINITION.get(definition)
+    adapter: Optional[DailyObservationAdapter]
+    if exchange is None:
+        adapter = None
+    else:
+        try:
+            adapter = DailyObservationAdapter(exchange)
+        except CalendarUnavailable:
+            adapter = None
+        except Exception:
+            adapter = None
+
+    _OBSERVATION_ADAPTER_CACHE[cache_key] = adapter
+    return adapter
+
+
+def previous_valid_observation_date(
+        symbol: str,
+        d: dt.date,
+        source_definition: Optional[str] = None,
+) -> Optional[dt.date]:
+    """Previous daily observation date strictly before ``d``.
+
+    Resolved from the *source definition* of the candidate row. Distinct from
+    ``previous_valid_session``: a Globex Sunday is a real trading session but a
+    Mon-Fri source publishes no Sunday-labelled daily bar, so Monday's previous
+    observation is Friday.
+
+    Resolution order (fail closed):
+      1. unknown / unresolved source definition            -> None
+      2. definition whose bars are session-date-labelled    -> previous session
+      3. otherwise an independently established convention is REQUIRED:
+           established      -> that convention's previous observation
+           not established  -> None (never inherit another definition's)
+
+    A fallback provider succeeding does not change this: the convention belongs
+    to the candidate row's historical source definition.
+    """
+    definition = source_definition_for(symbol, source_definition)
+    if definition is None or definition not in KNOWN_SOURCE_DEFINITIONS:
+        return None
+
+    if definition in SESSION_DATE_LABELLED_DEFINITIONS:
+        return previous_valid_session(symbol, d)
+
+    # A non-session-date-labelled definition must have an established
+    # convention; absence fails closed.
+    adapter = observation_adapter_for(symbol, definition)
+    if adapter is None:
+        return None
+    return adapter.previous_valid_observation_date(d)
+
+
+def observation_convention_established(
+        symbol: str,
+        source_definition: Optional[str] = None,
+) -> bool:
+    return observation_adapter_for(symbol, source_definition) is not None
+
+
+def register_observation_convention(source_definition: str,
+                                    exchange: Optional[str]) -> None:
+    """Attach (or clear) the approved daily observation convention for a
+    *source definition*.
+
+    Called only when an approved source definition's daily date labels have
+    been independently established. ``None`` clears the entry so the gate fails
+    closed again. Never infer a convention from provider success, from another
+    source definition, or from symbol identity.
+    """
+    OBSERVATION_CONVENTION_BY_SOURCE_DEFINITION[source_definition] = exchange
+    for key in [k for k in _OBSERVATION_ADAPTER_CACHE
+                if k[1] == source_definition]:
+        _OBSERVATION_ADAPTER_CACHE.pop(key, None)
+
+
+def register_symbol_source_definition(symbol: str,
+                                      source_definition: Optional[str]) -> None:
+    """Attach (or clear) the approved historical source definition for a symbol.
+
+    Test/operational hook for source definitions established after import.
+    """
+    if source_definition is None:
+        SOURCE_DEFINITION_BY_SYMBOL.pop(symbol, None)
+    else:
+        SOURCE_DEFINITION_BY_SYMBOL[symbol] = source_definition
+    for key in [k for k in _OBSERVATION_ADAPTER_CACHE if k[0] == symbol]:
+        _OBSERVATION_ADAPTER_CACHE.pop(key, None)
 
 
 # ---------------------------------------------------------------- helpers
@@ -476,6 +787,7 @@ def historical_eligibility(
     known_prior_sessions: Optional[Set[dt.date]] = None,
     now_utc: Optional[dt.datetime] = None,
     treasury_published_dates: Optional[Iterable] = None,
+    source_definition: Optional[str] = None,
 ) -> Eligibility:
     """Decide whether session ``d`` for ``symbol`` may enter historical EOD.
 
@@ -483,11 +795,20 @@ def historical_eligibility(
     historical storage for this symbol. A completed bar whose prior session is
     missing is DEFERRED -- it is never routed to the live table and never
     written historically with an older positional value.
+
+    ``source_definition`` is the approved historical source definition of the
+    candidate row. The previous *observation date* is resolved from that
+    definition; an unestablished definition fails closed.
     """
     now = now_utc or dt.datetime.now(_UTC)
     adapter = adapter_for(symbol)
     status = adapter.session_status(d, now)
-    prior = adapter.previous_valid_session(d)
+    # Phase A.2A: the *session* calendar answers "is the market trading and is
+    # the session complete?". The *observation-date* convention answers "which
+    # daily bar does this source publish before D?" -- they are different
+    # questions, and the latter is keyed by the exact approved source
+    # definition, not by the symbol.
+    prior = previous_valid_observation_date(symbol, d, source_definition)
 
     def _result(eligible, routing, reason, prior_=prior):
         return Eligibility(symbol=symbol, session_date=d, eligible=eligible,

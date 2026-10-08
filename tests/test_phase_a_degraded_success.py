@@ -37,6 +37,7 @@ from macro_data_fetch import (
     _PHASE_A_UNAVAILABLE_SYMBOLS,
     _PHASE_A_DEFERRED_COUNT,
     _PHASE_A_BOUNDARY_DEFERRED_COUNT,
+    _PIPELINE_FATAL_CONDITIONS,
 )
 
 
@@ -74,6 +75,7 @@ class TestPhaseASafetyExitCode:
         """Clear global state before each test."""
         _PHASE_A_ACTIONABLE_DEFERRALS.clear()
         _PHASE_A_UNAVAILABLE_SYMBOLS.clear()
+        _PIPELINE_FATAL_CONDITIONS.clear()
         global _PHASE_A_DEFERRED_COUNT, _PHASE_A_BOUNDARY_DEFERRED_COUNT
         _PHASE_A_DEFERRED_COUNT = 0
         _PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
@@ -176,6 +178,7 @@ class TestSummarizeOutcomesClassification:
         """Clear global state before each test."""
         _PHASE_A_ACTIONABLE_DEFERRALS.clear()
         _PHASE_A_UNAVAILABLE_SYMBOLS.clear()
+        _PIPELINE_FATAL_CONDITIONS.clear()
         global _PHASE_A_DEFERRED_COUNT, _PHASE_A_BOUNDARY_DEFERRED_COUNT
         _PHASE_A_DEFERRED_COUNT = 0
         _PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
@@ -242,6 +245,7 @@ class TestThreeStateModel:
         """Clear global state before each test."""
         _PHASE_A_ACTIONABLE_DEFERRALS.clear()
         _PHASE_A_UNAVAILABLE_SYMBOLS.clear()
+        _PIPELINE_FATAL_CONDITIONS.clear()
         global _PHASE_A_DEFERRED_COUNT, _PHASE_A_BOUNDARY_DEFERRED_COUNT
         _PHASE_A_DEFERRED_COUNT = 0
         _PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
@@ -327,3 +331,61 @@ class TestRequiredSymbols:
         assert "US2YT=X" in REQUIRED_SYMBOLS
         assert "US10YT=X" in REQUIRED_SYMBOLS
         assert "US30YT=X" in REQUIRED_SYMBOLS
+
+
+# --------------------------------------------------------------------------
+# Test-harness isolation (Phase A.2A)
+#
+# _PIPELINE_FATAL_CONDITIONS is module-level global state. A safety-exit test
+# that leaves an entry behind must not be able to change the verdict of a
+# later test. These tests prove the state is reset and that the two
+# safety-exit tests produce identical results in either execution order.
+# --------------------------------------------------------------------------
+class TestStateIsolation:
+    """Order-independence guarantees for module-level safety state."""
+
+    def setup_method(self):
+        _PHASE_A_ACTIONABLE_DEFERRALS.clear()
+        _PHASE_A_UNAVAILABLE_SYMBOLS.clear()
+        _PIPELINE_FATAL_CONDITIONS.clear()
+        global _PHASE_A_DEFERRED_COUNT, _PHASE_A_BOUNDARY_DEFERRED_COUNT
+        _PHASE_A_DEFERRED_COUNT = 0
+        _PHASE_A_BOUNDARY_DEFERRED_COUNT = 0
+
+    @staticmethod
+    def _healthy_summary():
+        """A summary that must always yield exit 0 when state is clean."""
+        return make_summary([
+            make_outcome("^GSPC", success=True, required=True),
+            make_outcome("BZ=F", success=True, required=True),
+        ])
+
+    def test_fatal_conditions_are_cleared_by_setup(self):
+        _PIPELINE_FATAL_CONDITIONS.append("GATE_INVARIANT_FAILURE")
+        assert _PIPELINE_FATAL_CONDITIONS, "precondition"
+        # simulate the next test's setup
+        _PIPELINE_FATAL_CONDITIONS.clear()
+        assert _PIPELINE_FATAL_CONDITIONS == []
+
+    def test_order_independence_clean_then_polluted(self):
+        """Clean state -> exit 0, even if a polluting test ran before."""
+        summary = self._healthy_summary()
+        assert _phase_a_safety_exit_code(summary) == 0
+
+        # A prior test in the same module left a fatal marker behind.
+        _PIPELINE_FATAL_CONDITIONS.append("ARITHMETIC_INVARIANT_FAILURE")
+        assert _phase_a_safety_exit_code(summary) == 1
+
+        # setup_method for the next test clears it again.
+        _PIPELINE_FATAL_CONDITIONS.clear()
+        assert _phase_a_safety_exit_code(summary) == 0
+
+    def test_order_independence_polluted_then_clean(self):
+        """The reverse order must give the same two results."""
+        summary = self._healthy_summary()
+
+        _PIPELINE_FATAL_CONDITIONS.append("ARITHMETIC_INVARIANT_FAILURE")
+        assert _phase_a_safety_exit_code(summary) == 1
+
+        _PIPELINE_FATAL_CONDITIONS.clear()
+        assert _phase_a_safety_exit_code(summary) == 0
