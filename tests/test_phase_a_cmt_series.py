@@ -35,6 +35,22 @@ def _seed(cmt_symbol="US10YT_CMT", prior_val=5.05, cur_val=5.11):
     m._TREASURY_PUBLISHED_VALUES[(cmt_symbol, D)] = cur_val
 
 
+def _value_lookup(prior_val=5.05):
+    """Return a prior_value_lookup that supplies the stored prior close."""
+    def lookup(_engine, _symbol, _min_date, _max_date):
+        return {D1: prior_val}
+    return lookup
+
+
+def _provenance_lookup_fn(prior_dates=None):
+    """Return a provenance_lookup that verifies the given dates."""
+    if prior_dates is None:
+        prior_dates = {D0, D1}
+    def lookup(_engine, _symbol, _min_date, _max_date):
+        return set(prior_dates)
+    return lookup
+
+
 # ------------------------------------------------------- 1. symbols/tenors
 def test_seven_cmt_symbols_exist():
     assert len(sc.CMT_SYMBOLS) == 7
@@ -84,7 +100,7 @@ def test_cmt_official_row_accepted():
     _seed()
     acc, dfr, rej = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 5.11}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(acc) == 1 and not dfr and not rej
 
 
@@ -93,7 +109,7 @@ def test_cmt_unpublished_session_defers():
     m._TREASURY_PUBLISHED_DATES.discard(D)
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 5.11}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not acc and len(dfr) == 1
     assert dfr[0][1] == "TREASURY_PUBLICATION_NOT_CONFIRMED"
 
@@ -103,7 +119,7 @@ def test_cmt_non_official_value_deferred():
     _seed()
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 4.7230}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not acc and len(dfr) == 1
     assert dfr[0][1] == "CMT_VALUE_NOT_OFFICIAL"
 
@@ -116,7 +132,7 @@ def test_cmt_prior_session_must_be_official():
     m._TREASURY_PUBLISHED_VALUES[("US10YT_CMT", D)] = 5.11   # prior NOT published
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 5.11}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not acc and len(dfr) == 1
     # The prior session's official value is missing -> prev_close cannot be
     # sourced from the same definition, so the row defers.
@@ -131,7 +147,7 @@ def test_cmt_previous_close_chain_is_cmt_only():
     cmt_prior = {"US10YT_CMT": {D0, D1}, "US10YT=X": {D0}}
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 5.11}],
-        now_utc=NOW, prior_lookup=lambda e, s, a, b: cmt_prior.get(s, set()))
+        now_utc=NOW, prior_lookup=lambda e, s, a, b: cmt_prior.get(s, set()), prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(acc) == 1, "CMT prior present (date + official value) -> accepted"
 
 
@@ -140,7 +156,7 @@ def test_legacy_prior_does_not_satisfy_cmt():
     only_legacy = lambda e, s, a, b: {D0, D1} if s == "US10YT=X" else set()
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 5.11}],
-        now_utc=NOW, prior_lookup=only_legacy)
+        now_utc=NOW, prior_lookup=only_legacy, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not acc, "legacy prior must not authorise a CMT write"
     assert len(dfr) == 1
 
@@ -172,7 +188,7 @@ def test_investing_recovery_does_not_contaminate_cmt():
     _seed()
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT_CMT", "close": 4.7230}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not acc
     assert dfr[0][1] == "CMT_VALUE_NOT_OFFICIAL"
 
@@ -189,7 +205,7 @@ def test_legacy_historical_write_is_frozen():
     _seed("US10YT=X", 5.05, 5.11)
     acc, dfr, rej = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT=X", "close": 5.11}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not acc, "legacy historical writes must be frozen"
     assert len(dfr) == 1
     assert dfr[0][1] == "LEGACY_EOD_DEFINITION_UNRESOLVED"
@@ -215,7 +231,7 @@ def test_legacy_live_row_still_served():
 def test_non_treasury_gate_unchanged():
     acc, dfr, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": "^GSPC", "close": 5700.0}],
-        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1})
+        now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(acc) == 1 and not dfr
 
 
@@ -234,14 +250,14 @@ def test_deferred_recovery_still_works_for_cmt():
 
     _, dfr, _ = m.route_historical_rows(
         None, [row], treasury_published_dates=set(), now_utc=NOW,
-        deferred_store=store, prior_lookup=lambda *a, **k: {D0, D1})
+        deferred_store=store, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(dfr) == 1 and len(store.all_rows()) == 1
 
     acc, dfr2, _ = m.route_historical_rows(
         None, [row], now_utc=NOW, deferred_store=store,
         treasury_published_values={("US10YT_CMT", D1): 5.05,
                                    ("US10YT_CMT", D): 5.11},
-        prior_lookup=lambda *a, **k: {D0, D1})
+        prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(acc) == 1 and not dfr2
 
 
@@ -260,5 +276,5 @@ def test_market_reference_symbols_do_not_create_queue_entries():
     store = MemoryDeferredStore()
     m.route_historical_rows(
         None, [], now_utc=NOW, deferred_store=store,
-        prior_lookup=lambda *a, **k: set())
+        prior_lookup=lambda *a, **k: set(), prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(store.all_rows()) == 0

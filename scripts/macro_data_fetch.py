@@ -31,9 +31,6 @@ from db_builder.session_calendar import (
     previous_valid_observation_date,
     SOURCE_DEFINITION_BY_SYMBOL,
     SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
-    SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
-    SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
-    SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
     treasury_publication_confirmed,
 )
 from db_builder.deferred_history import (
@@ -666,6 +663,91 @@ def _existing_historical_dates(engine, symbol, min_date, max_date):
     return {pd.to_datetime(v).date() for v in df["date"]}
 
 
+def _existing_historical_values(engine, symbol, min_date, max_date):
+    """Stored closes for confirmed historical sessions of ``symbol``.
+
+    Returns ``{date: close}``, or ``None`` on failure (fail closed).
+
+    Same-definition identity: ``public.macro`` is keyed by ``(symbol, date)``
+    and carries no per-row source-definition column. Identity is established
+    safely by construction instead:
+
+      * ``SOURCE_DEFINITION_BY_SYMBOL`` is single-valued per symbol, so a
+        symbol has exactly one *approved historical* source definition;
+      * the historical gate only admits a row when that approved definition
+        resolves to an established observation convention. A symbol whose
+        approved definition is unestablished (e.g. BZ=F/CL=F under
+        INVESTING_CONTINUOUS_FUTURES_DAILY) can therefore never extend its
+        stored series, so no cross-definition prior can be created.
+
+    Consequently every stored row for a symbol was admitted under that
+    symbol's approved definition, and its stored close is a valid
+    same-definition prior value. If a class ever gains multiple approved
+    definitions, this must be revisited and fail closed.
+    """
+    sql = text("""
+        SELECT date, close
+        FROM public.macro
+        WHERE symbol = :symbol
+          AND date BETWEEN :min_date AND :max_date
+    """)
+    try:
+        with engine.begin() as conn:
+            df = pd.read_sql(
+                sql,
+                conn,
+                params={
+                    "symbol": symbol,
+                    "min_date": min_date,
+                    "max_date": max_date,
+                },
+            )
+    except Exception as exc:
+        print(f"[GATE WARN] prior-value lookup failed for {symbol}: {exc}")
+        return None
+
+    if df.empty:
+        return {}
+
+    return {
+        pd.to_datetime(row["date"]).date(): row["close"]
+        for _, row in df.iterrows()
+    }
+
+
+def _apply_confirmed_prior(rec, confirmed_prior_close):
+    """Rewrite ``rec``'s prior-dependent fields from the stored prior close.
+
+    The provider frame's own previous value is never authoritative once the
+    gate depends on a stored-confirmed prior: ``prev_close`` and the derived
+    ``change`` / ``pct_chg`` / ``amplitude`` are recomputed deterministically
+    from the trusted stored ``P.close``, using production rounding semantics.
+
+    Current-observation fields (open/high/low/close/adj_close/volume) are left
+    to the provider candidate.
+    """
+    close = rec.get("close")
+    high = rec.get("high")
+    low = rec.get("low")
+
+    change = None
+    pct_chg = None
+    amplitude = None
+    if close is not None and confirmed_prior_close not in (None, 0):
+        change = round_4(close - confirmed_prior_close)
+        pct_chg = round_4(
+            (close - confirmed_prior_close) / confirmed_prior_close * 100)
+        if high is not None and low is not None:
+            amplitude = round_4(
+                (high - low) / confirmed_prior_close * 100)
+
+    rec["prev_close"] = round_4(confirmed_prior_close)
+    rec["change"] = change
+    rec["pct_chg"] = pct_chg
+    rec["amplitude"] = amplitude
+    return rec
+
+
 def official_value_matches(symbol, session_date, value, *, published_values=None):
     """Phase A: the row's own close must BE the official observed value.
 
@@ -810,6 +892,8 @@ def _eligible_for_historical(row, *, known_prior_sessions=None,
 def route_historical_rows(engine, rows, *, mode="INGEST",
                           treasury_published_dates=None, now_utc=None,
                           deferred_store=None, prior_lookup=None,
+                          prior_value_lookup=None,
+                          provenance_lookup=None, trust_start=None,
                           treasury_published_values=None,
                           batch_start=None, count_telemetry=True):
     """Split candidate rows into HISTORICAL / DEFERRED / REJECTED.
@@ -820,6 +904,19 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
     ``prior_lookup(engine, symbol, min_date, max_date)`` may be injected; it must
     return the set of confirmed prior session dates, or None on failure
     (fail-closed). Defaults to the historical-table lookup.
+
+    ``prior_value_lookup(engine, symbol, min_date, max_date)`` returns the
+    stored closes ``{date: close}`` for those confirmed sessions, or None on
+    failure. When supplied, an admitted row's ``prev_close`` and derived fields
+    are recomputed from the *stored* prior close -- the provider frame's own
+    previous value is never authoritative.
+
+    ``provenance_lookup(engine, symbol, min_date, max_date)`` returns the set of
+    dates with verified same-definition provenance. When None, provenance is
+    unknown and all rows fail closed.
+
+    ``trust_start`` is the earliest trusted date for the source definition.
+    P must be >= trust_start to be eligible.
     """
     if not rows:
         return [], [], []
@@ -828,6 +925,7 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
         return list(rows), [], []
 
     lookup = prior_lookup or _existing_historical_dates
+    value_lookup = prior_value_lookup or _existing_historical_values
 
     if treasury_published_dates is None:
         treasury_published_dates = _TREASURY_PUBLISHED_DATES or None
@@ -872,6 +970,22 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
         # must also defer; the next cycle reconsiders D once P is stored.
         # Positional D-2 fallback remains prohibited.
         known_all = set(known)
+        stored_closes = value_lookup(engine, symbol, min_date, max_date)
+        if stored_closes is None:
+            # Value lookup failed -> fail closed, defer the whole symbol:
+            # without the stored prior value the value dependency cannot be
+            # proven, and the provider frame is not authoritative for it.
+            for rec in symbol_rows:
+                deferred.append((rec, "PRIOR_VALUE_LOOKUP_FAILED"))
+                continue
+            continue
+
+        # Provenance: stored P must be verified as same-definition.
+        # If provenance_lookup is None, provenance is unknown -> fail closed.
+        if provenance_lookup is not None:
+            provenance_dates = provenance_lookup(engine, symbol, min_date, max_date)
+        else:
+            provenance_dates = set()  # unknown -> fail closed
 
         for rec in symbol_rows:
             decision = _eligible_for_historical(
@@ -882,6 +996,24 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
                 treasury_published_values=treasury_published_values,
             )
             if decision.routing == ROUTE_HISTORICAL:
+                # Provenance check: P must be verified same-definition
+                if decision.expected_prior not in provenance_dates:
+                    deferred.append((rec, "PRIOR_PROVENANCE_UNVERIFIED"))
+                    continue
+                # Trust-start boundary: P must be >= trust_start
+                if trust_start is not None and decision.expected_prior < trust_start:
+                    deferred.append((rec, "PRIOR_BEFORE_TRUST_START"))
+                    continue
+                # Value dependency: D.prev_close must equal the *stored* P
+                # close under the same approved source definition. The
+                # provider frame's own previous value is not authoritative
+                # once eligibility rests on a stored-confirmed prior, so the
+                # prior-dependent fields are recomputed from stored P.
+                prior_close = stored_closes.get(decision.expected_prior)
+                if prior_close is None:
+                    deferred.append((rec, "PREVIOUS_VALUE_NOT_CONFIRMED"))
+                    continue
+                _apply_confirmed_prior(rec, prior_close)
                 accepted.append(rec)
             elif decision.routing == ROUTE_REJECT:
                 rejected.append((rec, decision.reason))
@@ -919,7 +1051,9 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
         else:
             _PHASE_A_ACTIONABLE_DEFERRALS.append(
                 {"symbol": rec.get("symbol"), "reason": reason})
-        if reason in ("CLOSED_UNCONFIRMED", "SOURCE_DEFINITION_UNRESOLVED") \
+        if reason in ("CLOSED_UNCONFIRMED", "SOURCE_DEFINITION_UNRESOLVED",
+                      "PRIOR_VALUE_LOOKUP_FAILED",
+                      "PREVIOUS_VALUE_NOT_CONFIRMED") \
                 or reason.startswith("CALENDAR"):
             _PHASE_A_UNAVAILABLE_SYMBOLS.append(
                 {"symbol": rec.get("symbol"), "reason": reason})
@@ -935,7 +1069,9 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
 
 def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
                           limit=RECOVERY_BATCH, recovery_days=RECOVERY_DAYS,
-                          max_attempts=MAX_ATTEMPTS, prior_lookup=None):
+                          max_attempts=MAX_ATTEMPTS, prior_lookup=None,
+                          prior_value_lookup=None, provenance_lookup=None,
+                          trust_start=None):
     """Bounded retry of deferred historical sessions.
 
     ``fetch_symbol_rows(symbol, dates)`` must return historical row dicts for the
@@ -989,6 +1125,9 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
 
         written = upsert_macro(engine, match, mode="INGEST",
                                prior_lookup=prior_lookup,
+                               prior_value_lookup=prior_value_lookup,
+                               provenance_lookup=provenance_lookup,
+                               trust_start=trust_start,
                                deferred_store=store)
         if written:
             store.record_success(cand.symbol, cand.session_date, now=now)
@@ -1012,6 +1151,8 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
 
 
 def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
+                 prior_value_lookup=None, provenance_lookup=None,
+                 trust_start=None,
                  treasury_published_dates=None, deferred_store=None,
                  batch_start=None, count_telemetry=True):
     """Write historical rows.
@@ -1080,6 +1221,9 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
     if mode == "INGEST":
         rows, _deferred, _rejected = route_historical_rows(
             engine, rows, prior_lookup=prior_lookup,
+            prior_value_lookup=prior_value_lookup,
+            provenance_lookup=provenance_lookup,
+            trust_start=trust_start,
             treasury_published_dates=treasury_published_dates,
             treasury_published_values=_TREASURY_PUBLISHED_VALUES or None,
             deferred_store=deferred_store, batch_start=batch_start,
@@ -1827,12 +1971,17 @@ def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_
             print(f"[YF FALLBACK NO FINISHED BARS] {symbol}")
             return [], live_row, rows_fetched, latest_observation
 
+        # The candidate's HISTORICAL source definition is the symbol's approved
+        # definition (e.g. BZ=F/CL=F -> INVESTING_CONTINUOUS_FUTURES_DAILY),
+        # NOT this fallback provider. A successful fallback must never change
+        # the observation-date convention used for the historical dependency;
+        # passing the symbol lets the registry supply the approved definition,
+        # so an unestablished definition still fails closed.
         rows = calculate_rows_for_symbol(
             df=finished_df,
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
-            source_definition=SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
         )
         rows = filter_rows_to_target_window(
             rows=rows,
@@ -1923,12 +2072,15 @@ def process_asia_index_yfinance_fallback_symbol(symbol, meta, *, start_date=None
             print(f"[ASIA PROXY NO FINISHED BARS] {symbol}")
             return [], live_row, rows_fetched, latest_observation
 
+        # The candidate's HISTORICAL source definition is the symbol's approved
+        # definition, not this fallback provider. Passing the symbol lets the
+        # registry supply it, so an unresolved definition still fails closed
+        # instead of inheriting the proxy provider's convention.
         rows = calculate_rows_for_symbol(
             df=finished_df,
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
-            source_definition=SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
         )
         rows = filter_rows_to_target_window(
             rows=rows,
@@ -2141,12 +2293,14 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
         # calendar-valid session and the prior session must be resolvable.
         symbol_df = remove_unfinished_bars(symbol_df, symbol)
 
+        # The candidate's HISTORICAL source definition is the symbol's approved
+        # definition, not this fallback provider (for the legacy UST symbols
+        # they coincide; passing the symbol keeps the rule uniform).
         rows = calculate_rows_for_symbol(
             df=symbol_df,
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
-            source_definition=SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
         )
         rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start)
         if rows:

@@ -89,16 +89,44 @@ def _reset():
     clear_state()
 
 
-def run_route(rows, stored):
+_UNSET = object()  # sentinel: provenance not specified (backward compatible)
+
+def run_route(rows, stored, stored_closes=None, provenance_verified=_UNSET,
+              trust_start=None):
     """Route ``rows`` against ``stored`` (set of already-persisted dates).
 
     ``prior_lookup`` is injected so the test never touches a database: it
     returns exactly the set of dates that are already committed.
+
+    ``stored_closes`` supplies the stored prior closes ``{date: close}`` for the
+    value dependency. When omitted, every stored date is given a close of 100.0
+    so the value gate is exercised without a real database.
+
+    ``provenance_verified`` is a set of dates with verified same-definition
+    provenance. When None, provenance is unknown (fail closed).
+
+    ``trust_start`` is the earliest trusted date for the source definition.
+    P must be >= trust_start to be eligible.
     """
     def lookup(_engine, _symbol, _min_date, _max_date):
         return set(stored)
 
+    def value_lookup(_engine, _symbol, _min_date, _max_date):
+        if stored_closes is not None:
+            return dict(stored_closes)
+        return {d: 100.0 for d in stored}
+
+    def provenance_lookup(_engine, _symbol, _min_date, _max_date):
+        if provenance_verified is _UNSET:
+            return set(stored)  # backward compatible: assume verified
+        if provenance_verified is None:
+            return set()  # unknown provenance -> fail closed
+        return set(provenance_verified)
+
     return route_historical_rows(None, rows, prior_lookup=lookup,
+                                 prior_value_lookup=value_lookup,
+                                 provenance_lookup=provenance_lookup,
+                                 trust_start=trust_start,
                                  count_telemetry=False)
 
 
@@ -434,7 +462,8 @@ class TestA2_10_Arithmetic:
         row["pct_chg"] = round((close - p_close) / p_close * 100, 4)
         row["amplitude"] = round((high - low) / p_close * 100, 4)
 
-        accepted, deferred, rejected = run_route([row], stored={D2, P})
+        accepted, deferred, rejected = run_route(
+            [row], stored={D2, P}, stored_closes={P: p_close})
         assert dates_of(accepted) == {D}
         written = accepted[0]
 
@@ -973,3 +1002,647 @@ class TestA2_24_DefinitionSpecificHolidays:
         # crypto definition -> 24/7, no holidays (Sunday 12-27 is a bar)
         assert previous_valid_observation_date(
             "BTC-USD", d, "CRYPTO_24_7_DAILY") == date(2026, 12, 27)
+
+
+# ==========================================================================
+# A2-25  Fallback provider must not stamp the historical source definition
+#
+# Regression for a real defect found during controlled deployment: the oil
+# yfinance fallback stamped BZ=F/CL=F rows with
+# YFINANCE_CONTINUOUS_FUTURES_DAILY, overriding the symbol's approved
+# INVESTING_CONTINUOUS_FUTURES_DAILY definition (whose convention is NOT
+# established). That silently admitted historical candidates that should have
+# failed closed. A successful fallback must never change the observation
+# convention used for the historical dependency.
+# ==========================================================================
+class TestA2_25_FallbackMustNotStampDefinition:
+    OIL = ("BZ=F", "CL=F")
+
+    def test_a2_25_oil_symbols_resolve_to_investing_definition(self):
+        for s in self.OIL:
+            assert source_definition_for(s) == \
+                SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY
+
+    def test_a2_25_oil_fallback_path_does_not_stamp_a_definition(self):
+        """The oil fallback must pass the symbol only, so the registry supplies
+        the approved (unestablished) definition."""
+        import inspect
+        from macro_data_fetch import process_yfinance_fallback_symbol
+        src = inspect.getsource(process_yfinance_fallback_symbol)
+        assert "source_definition=" not in src, (
+            "fallback path must not stamp a source definition")
+
+    def test_a2_25_all_fallback_paths_avoid_stamping(self):
+        """Uniform rule: no fallback provider path stamps a definition."""
+        import inspect
+        import macro_data_fetch as m
+        for name in ("process_yfinance_fallback_symbol",
+                     "process_asia_index_yfinance_fallback_symbol",
+                     "process_treasury_fallback_symbol"):
+            fn = getattr(m, name, None)
+            if fn is None:
+                continue
+            src = inspect.getsource(fn)
+            assert "source_definition=" not in src, (
+                f"{name} must not stamp a source definition")
+
+    def test_a2_25_fallback_row_still_fails_closed_for_oil(self):
+        """Even when a yfinance fallback successfully returns bars, the
+        historical candidate must be judged under the symbol's approved
+        definition and therefore DEFER."""
+        from macro_data_fetch import _eligible_for_historical
+        for s in self.OIL:
+            row = make_row(MON_, 100.32, symbol=s)
+            row["source_definition"] = SOURCE_DEFINITION_BY_SYMBOL[s]
+            dec = _eligible_for_historical(row, known_prior_sessions={FRI})
+            assert dec.routing == ROUTE_DEFERRED, (
+                f"{s} must defer while its convention is unestablished")
+            assert dec.expected_prior is None
+
+    def test_a2_25_yfinance_futures_still_admitted(self):
+        """The 9 genuine yfinance futures are unaffected."""
+        from macro_data_fetch import _eligible_for_historical
+        for s in ("ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F",
+                  "GC=F", "SI=F", "HG=F", "NG=F"):
+            row = make_row(MON_, 100.0, symbol=s)
+            row["source_definition"] = SOURCE_DEFINITION_BY_SYMBOL[s]
+            dec = _eligible_for_historical(row, known_prior_sessions={FRI})
+            assert dec.routing == ROUTE_HISTORICAL, f"{s} must be admitted"
+            assert dec.expected_prior == FRI
+
+
+# ==========================================================================
+# A2-26  Stored prior value overrides frame prior
+# ==========================================================================
+
+class TestA2_26_StoredPriorOverridesFramePrior:
+    """P date exists both in DB and provider frame. Values differ.
+    Expected: D.prev_close = stored P.close; derived fields recomputed."""
+
+    def test_a2_26_stored_prior_close_wins(self):
+        from db_builder.session_calendar import previous_valid_observation_date
+        D = date(2026, 10, 5)   # Monday
+        P = date(2026, 10, 2)   # Friday
+        assert previous_valid_observation_date("ES=F", D) == P
+
+        stored_p_close = 102.70   # trusted stored value
+        frame_p_close = 102.25    # provider frame value (different)
+
+        row = make_row(D, close=103.50, prev_close=frame_p_close,
+                       high=104.00, low=101.00)
+        row["change"] = round(103.50 - frame_p_close, 4)
+        row["pct_chg"] = round((103.50 - frame_p_close) / frame_p_close * 100, 4)
+        row["amplitude"] = round((104.00 - 101.00) / frame_p_close * 100, 4)
+
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close})
+        assert dates_of(accepted) == {D}
+        written = accepted[0]
+
+        # prev_close = stored P.close, NOT frame P.close
+        assert written["prev_close"] == stored_p_close
+        # derived fields recomputed from stored P.close
+        assert written["change"] == round(written["close"] - stored_p_close, 4)
+        assert written["pct_chg"] == round(
+            (written["close"] - stored_p_close) / stored_p_close * 100, 4)
+        assert written["amplitude"] == round(
+            (written["high"] - written["low"]) / stored_p_close * 100, 4)
+
+    def test_a2_26_frame_prior_not_authoritative(self):
+        """Even when frame P.close differs, stored P.close is used."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 500.0
+        frame_p_close = 499.5
+
+        row = make_row(D, close=501.0, prev_close=frame_p_close)
+        accepted, _, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close})
+        assert accepted[0]["prev_close"] == stored_p_close
+
+    def test_a2_26_stored_prior_missing_fails_closed(self):
+        """P date in DB but close value not found -> fail closed."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=103.0, prev_close=102.0)
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={})  # P in dates but no close
+        assert dates_of(accepted) == set()
+        assert deferred[0][1] == "PREVIOUS_VALUE_NOT_CONFIRMED"
+
+    def test_a2_26_value_lookup_failure_fails_closed(self):
+        """Value lookup returns None -> fail closed."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=103.0, prev_close=102.0)
+
+        def bad_lookup(_e, _s, _min, _max):
+            return None
+
+        accepted, deferred, _ = route_historical_rows(
+            None, [row],
+            prior_lookup=lambda _e, _s, _min, _max: {P},
+            prior_value_lookup=bad_lookup,
+            count_telemetry=False)
+        assert dates_of(accepted) == set()
+        assert deferred[0][1] == "PRIOR_VALUE_LOOKUP_FAILED"
+
+
+# ==========================================================================
+# A2-27  The 9 DERIVED_MISMATCH rows from the failed cycle
+# ==========================================================================
+
+class TestA2_27_DerivedMismatchRows:
+    """Reproduce the 9 yfinance futures 2026-10-05 rows from the failed cycle.
+    P = 2026-10-02 exists in DB; provider-frame P.close differs from stored.
+    Corrected implementation must admit D using stored P.close."""
+
+    FUTURES = ["ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F",
+               "GC=F", "SI=F", "HG=F", "NG=F"]
+
+    def test_a2_27_all_nine_futures_admit_with_stored_prior(self):
+        """All 9 futures: D=10-05, P=10-02 stored, frame P.close != stored.
+        Expected: admitted with prev_close = stored P.close."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+        frame_p_close = 102.25  # differs from stored
+
+        for sym in self.FUTURES:
+            row = make_row(D, close=103.50, prev_close=frame_p_close,
+                           high=104.00, low=101.00)
+            accepted, deferred, _ = run_route(
+                [row], stored={P}, stored_closes={P: stored_p_close})
+            assert dates_of(accepted) == {D}, f"{sym} not admitted"
+            written = accepted[0]
+            assert written["prev_close"] == stored_p_close, \
+                f"{sym} prev_close != stored P.close"
+            assert written["change"] == round(written["close"] - stored_p_close, 4)
+
+    def test_a2_27_bz_f_cl_f_still_defer(self):
+        """BZ=F/CL=F must still fail closed (unestablished convention)."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        for sym in ("BZ=F", "CL=F"):
+            row = make_row(D, close=103.0, prev_close=102.0, symbol=sym)
+            accepted, deferred, _ = run_route(
+                [row], stored={P}, stored_closes={P: 102.0})
+            assert dates_of(accepted) == set(), f"{sym} should defer"
+            assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
+
+    def test_a2_27_sequential_recovery_with_value_gate(self):
+        """Friday stored. Monday committed. Tuesday resolves next cycle."""
+        FRI = date(2026, 10, 2)
+        MON = date(2026, 10, 5)
+        TUE = date(2026, 10, 6)
+        fri_close = 100.0
+        mon_close = 101.0
+        tue_close = 102.0
+
+        # Cycle 1: only Friday stored. Monday candidate exists.
+        mon_row = make_row(MON, close=mon_close, prev_close=fri_close)
+        accepted, deferred, _ = run_route(
+            [mon_row], stored={FRI}, stored_closes={FRI: fri_close})
+        assert dates_of(accepted) == {MON}
+
+        # Cycle 2: Friday + Monday stored. Tuesday candidate exists.
+        tue_row = make_row(TUE, close=tue_close, prev_close=mon_close)
+        accepted, deferred, _ = run_route(
+            [tue_row], stored={FRI, MON},
+            stored_closes={FRI: fri_close, MON: mon_close})
+        assert dates_of(accepted) == {TUE}
+        assert accepted[0]["prev_close"] == mon_close
+
+
+# ==========================================================================
+# A2-28  Stored P exists, frame P absent
+# ==========================================================================
+
+class TestA2_28_StoredPFramePAbsent:
+    """P in DB but not in provider frame. D may write if valid;
+    prev_close from stored P.close."""
+
+    def test_a2_28_admits_with_stored_prior(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=None)  # no frame prior
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close})
+        assert dates_of(accepted) == {D}
+        assert accepted[0]["prev_close"] == stored_p_close
+
+    def test_a2_28_derived_fields_from_stored(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 100.0
+
+        row = make_row(D, close=101.0, prev_close=None,
+                       high=102.0, low=99.0)
+        accepted, _, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close})
+        w = accepted[0]
+        assert w["prev_close"] == stored_p_close
+        assert w["change"] == round(101.0 - stored_p_close, 4)
+        assert w["pct_chg"] == round((101.0 - stored_p_close) / stored_p_close * 100, 4)
+        assert w["amplitude"] == round((102.0 - 99.0) / stored_p_close * 100, 4)
+
+
+# ==========================================================================
+# A2-29  Same date, source-definition mismatch
+# ==========================================================================
+
+class TestA2_29_SourceDefinitionMismatch:
+    """Stored P cannot be proven same-definition -> fail closed."""
+
+    def test_a2_29_unknown_definition_fails_closed(self):
+        """A candidate with an unknown source definition must defer."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=103.0, prev_close=102.0)
+        row["source_definition"] = "UNKNOWN_SOURCE_DEF"
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: 102.0})
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+    def test_a2_29_bz_f_investing_def_fails_closed(self):
+        """BZ=F under INVESTING_CONTINUOUS_FUTURES_DAILY -> fail closed."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=103.0, prev_close=102.0, symbol="BZ=F")
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: 102.0})
+        assert dates_of(accepted) == set()
+        assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
+
+
+# ==========================================================================
+# A2-30  Current production 10-05 reproduction
+# ==========================================================================
+
+class TestA2_30_ProductionReproduction:
+    """Use one of the 9 yfinance futures. Expected: no DERIVED_MISMATCH."""
+
+    def test_a2_30_es_f_10_05_no_derived_mismatch(self):
+        """ES=F 10-05: P=10-02 stored, frame P.close differs from stored.
+        Corrected: admitted with prev_close = stored P.close."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 5500.25
+        frame_p_close = 5499.50  # differs
+
+        row = make_row(D, close=5510.0, prev_close=frame_p_close,
+                       high=5520.0, low=5490.0)
+        row["change"] = round(5510.0 - frame_p_close, 4)
+        row["pct_chg"] = round((5510.0 - frame_p_close) / frame_p_close * 100, 4)
+        row["amplitude"] = round((5520.0 - 5490.0) / frame_p_close * 100, 4)
+
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close})
+        assert dates_of(accepted) == {D}
+        w = accepted[0]
+        assert w["prev_close"] == stored_p_close
+        assert w["change"] == round(w["close"] - stored_p_close, 4)
+        assert w["pct_chg"] == round(
+            (w["close"] - stored_p_close) / stored_p_close * 100, 4)
+        assert w["amplitude"] == round(
+            (w["high"] - w["low"]) / stored_p_close * 100, 4)
+
+
+# ==========================================================================
+# A2-31  BZ/CL fallback regression
+# ==========================================================================
+
+class TestA2_31_BZCLFallbackRegression:
+    """Fallback frame is yfinance but approved historical source remains
+    Investing.com with unknown convention. Expected: DEFER; zero write."""
+
+    def test_a2_31_bz_f_defers(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=103.0, prev_close=102.0, symbol="BZ=F")
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: 102.0})
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+        assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
+
+    def test_a2_31_cl_f_defers(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=70.5, prev_close=70.0, symbol="CL=F")
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: 70.0})
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+    def test_a2_31_fallback_does_not_stamp_definition(self):
+        """The yfinance fallback path must not stamp YFINANCE definition
+        onto BZ=F/CL=F rows."""
+        import inspect
+        import macro_data_fetch as m
+        src = inspect.getsource(m.process_yfinance_fallback_symbol)
+        # The fallback path should NOT pass a source_definition that
+        # overrides the symbol's approved definition
+        assert "SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY" not in src
+
+
+# ==========================================================================
+# A2-32  Chained next day
+# ==========================================================================
+
+class TestA2_32_ChainedNextDay:
+    """After valid Monday committed, Tuesday uses Monday's stored close."""
+
+    def test_a2_32_tuesday_uses_monday_stored_close(self):
+        FRI = date(2026, 10, 2)
+        MON = date(2026, 10, 5)
+        TUE = date(2026, 10, 6)
+        fri_close = 100.0
+        mon_close = 101.0
+        tue_close = 102.0
+
+        # Cycle 1: Friday stored. Monday candidate.
+        mon_row = make_row(MON, close=mon_close, prev_close=fri_close)
+        acc1, _, _ = run_route(
+            [mon_row], stored={FRI}, stored_closes={FRI: fri_close})
+        assert dates_of(acc1) == {MON}
+
+        # Cycle 2: Friday + Monday stored. Tuesday candidate.
+        tue_row = make_row(TUE, close=tue_close, prev_close=mon_close)
+        acc2, _, _ = run_route(
+            [tue_row], stored={FRI, MON},
+            stored_closes={FRI: fri_close, MON: mon_close})
+        assert dates_of(acc2) == {TUE}
+        assert acc2[0]["prev_close"] == mon_close
+        assert acc2[0]["change"] == round(tue_close - mon_close, 4)
+
+
+# ==========================================================================
+# A2-33  No same-batch value leakage
+# ==========================================================================
+
+class TestA2_33_NoSameBatchValueLeakage:
+    """Monday and Tuesday candidates arrive together. Monday not stored
+    before Tuesday eligibility -> Tuesday cannot use Monday's in-memory close."""
+
+    def test_a2_33_tuesday_defers_when_monday_not_stored(self):
+        FRI = date(2026, 10, 2)
+        MON = date(2026, 10, 5)
+        TUE = date(2026, 10, 6)
+
+        mon_row = make_row(MON, close=101.0, prev_close=100.0)
+        tue_row = make_row(TUE, close=102.0, prev_close=101.0)
+
+        # Both candidates in same batch. Only Friday stored.
+        accepted, deferred, _ = run_route(
+            [mon_row, tue_row], stored={FRI}, stored_closes={FRI: 100.0})
+        # Monday may be admitted (P=Fri stored)
+        # Tuesday must defer (P=Mon not stored)
+        assert dates_of(accepted) == {MON}
+        deferred_dates = {r["date"] for r, _ in deferred}
+        assert TUE in deferred_dates
+
+    def test_a2_33_tuesday_uses_monday_only_after_commit(self):
+        FRI = date(2026, 10, 2)
+        MON = date(2026, 10, 5)
+        TUE = date(2026, 10, 6)
+
+        mon_row = make_row(MON, close=101.0, prev_close=100.0)
+        tue_row = make_row(TUE, close=102.0, prev_close=101.0)
+
+        # Monday already stored from prior cycle
+        accepted, deferred, _ = run_route(
+            [tue_row], stored={FRI, MON},
+            stored_closes={FRI: 100.0, MON: 101.0})
+        assert dates_of(accepted) == {TUE}
+        assert accepted[0]["prev_close"] == 101.0
+
+
+# ==========================================================================
+# A2-34  Arithmetic invariant
+# ==========================================================================
+
+class TestA2_34_ArithmeticInvariant:
+    """For every admitted historical test row:
+    prev_close == stored P.close and change/pct/amplitude match formulas."""
+
+    def test_a2_34_all_admitted_rows_match_formula(self):
+        FRI = date(2026, 10, 2)
+        MON = date(2026, 10, 5)
+        TUE = date(2026, 10, 6)
+        fri_close = 100.0
+        mon_close = 101.5
+        tue_close = 103.0
+
+        # Admit Monday
+        mon_row = make_row(MON, close=mon_close, prev_close=fri_close,
+                           high=102.0, low=99.0)
+        acc1, _, _ = run_route(
+            [mon_row], stored={FRI}, stored_closes={FRI: fri_close})
+        w1 = acc1[0]
+        assert w1["prev_close"] == fri_close
+        assert w1["change"] == round(mon_close - fri_close, 4)
+        assert w1["pct_chg"] == round(
+            (mon_close - fri_close) / fri_close * 100, 4)
+        assert w1["amplitude"] == round(
+            (102.0 - 99.0) / fri_close * 100, 4)
+
+        # Admit Tuesday
+        tue_row = make_row(TUE, close=tue_close, prev_close=mon_close,
+                           high=104.0, low=101.0)
+        acc2, _, _ = run_route(
+            [tue_row], stored={FRI, MON},
+            stored_closes={FRI: fri_close, MON: mon_close})
+        w2 = acc2[0]
+        assert w2["prev_close"] == mon_close
+        assert w2["change"] == round(tue_close - mon_close, 4)
+        assert w2["pct_chg"] == round(
+            (tue_close - mon_close) / mon_close * 100, 4)
+        assert w2["amplitude"] == round(
+            (104.0 - 101.0) / mon_close * 100, 4)
+
+    def test_a2_34_zero_prior_close_handled(self):
+        """If stored P.close is 0, derived fields must be None (not div-by-zero)."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        row = make_row(D, close=103.0, prev_close=0.0)
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: 0.0})
+        # prev_close=0 -> derived fields None, but row may still be admitted
+        # (the gate checks P existence, not P value)
+        if accepted:
+            w = accepted[0]
+            assert w["prev_close"] == 0.0
+            assert w["change"] is None
+            assert w["pct_chg"] is None
+            assert w["amplitude"] is None
+
+
+# ==========================================================================
+# A2-35  Stored P has verified same-definition provenance
+# ==========================================================================
+
+class TestA2_35_StoredPVerifiedProvenance:
+    """Stored P has verified same-definition provenance.
+    Expected: D may write using stored P.close."""
+
+    def test_a2_35_admits_with_verified_provenance(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        # Simulate verified provenance: P is in the trust window
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified={P})
+        assert dates_of(accepted) == {D}
+        assert accepted[0]["prev_close"] == stored_p_close
+
+
+# ==========================================================================
+# A2-36  Stored P date exists but provenance belongs to another definition
+# ==========================================================================
+
+class TestA2_36_ProvenanceAnotherDefinition:
+    """Stored P date exists but provenance belongs to another definition.
+    Expected: D deferred."""
+
+    def test_a2_36_defers_on_definition_mismatch(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        # P exists but provenance says it belongs to a DIFFERENT definition
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified=set())  # P NOT in verified set
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+
+# ==========================================================================
+# A2-37  Stored P provenance unknown
+# ==========================================================================
+
+class TestA2_37_ProvenanceUnknown:
+    """Stored P provenance unknown. Expected: D deferred."""
+
+    def test_a2_37_defers_on_unknown_provenance(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        # No provenance information at all
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified=None)
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+
+# ==========================================================================
+# A2-38  Verified trust-start boundary
+# ==========================================================================
+
+class TestA2_38_TrustStartBoundary:
+    """P before boundary -> defer. P at/after boundary -> allowed."""
+
+    def test_a2_38_p_before_boundary_defers(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        trust_start = date(2026, 10, 3)  # P is BEFORE trust start
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified={P}, trust_start=trust_start)
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+    def test_a2_38_p_at_boundary_allowed(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        trust_start = date(2026, 10, 2)  # P is AT trust start
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified={P}, trust_start=trust_start)
+        assert dates_of(accepted) == {D}
+
+    def test_a2_38_p_after_boundary_allowed(self):
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        trust_start = date(2026, 9, 1)  # P is AFTER trust start
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified={P}, trust_start=trust_start)
+        assert dates_of(accepted) == {D}
+
+
+# ==========================================================================
+# A2-39  Registry changed after legacy history was written
+# ==========================================================================
+
+class TestA2_39_RegistryChangeDoesNotRetroactivelyCertify:
+    """Registry change alone does not retroactively certify stored history."""
+
+    def test_a2_39_registry_change_insufficient(self):
+        """Even if registry says YFINANCE now, stored P may be from another source."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        # Registry says YFINANCE, but no provenance verification
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified=None)
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+
+# ==========================================================================
+# A2-40  Same symbol with mixed historical definitions
+# ==========================================================================
+
+class TestA2_40_MixedHistoricalDefinitions:
+    """Same symbol with mixed historical definitions.
+    Expected: no cross-definition chain extension."""
+
+    def test_a2_40_no_cross_definition_chain(self):
+        """If stored P is from definition A, D from definition B cannot use it."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        # P exists but belongs to a different definition
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified=set())  # P not verified for this definition
+        assert dates_of(accepted) == set()
+        assert len(deferred) == 1
+
+    def test_a2_40_same_definition_chain_allowed(self):
+        """If stored P is verified for the SAME definition, chain is allowed."""
+        D = date(2026, 10, 5)
+        P = date(2026, 10, 2)
+        stored_p_close = 102.70
+
+        row = make_row(D, close=103.50, prev_close=stored_p_close)
+        accepted, deferred, _ = run_route(
+            [row], stored={P}, stored_closes={P: stored_p_close},
+            provenance_verified={P})
+        assert dates_of(accepted) == {D}

@@ -137,6 +137,15 @@ def _no_prior(_engine, _symbol, _min_date, _max_date):
     return {dt.date(2026, 9, 22)}
 
 
+def _provenance_lookup_fn(prior_dates=None):
+    """Return a provenance_lookup that verifies the given dates."""
+    if prior_dates is None:
+        prior_dates = {dt.date(2026, 9, 21), dt.date(2026, 9, 22)}
+    def lookup(_engine, _symbol, _min_date, _max_date):
+        return set(prior_dates)
+    return lookup
+
+
 def _prior_excludes_d_minus_1(_engine, _symbol, _min_date, _max_date):
     """09-22 is NOT confirmed -> 09-23 must defer."""
     return {dt.date(2026, 9, 21)}
@@ -152,7 +161,9 @@ def test_a3_us_premarket_is_live_not_historical():
 
     accepted, deferred, rejected = m.route_historical_rows(
         eng, [{"date": d, "symbol": "^GSPC", "close": 7706.0}],
-        now_utc=premarket, prior_lookup=_no_prior)
+        now_utc=premarket, prior_lookup=_no_prior,
+        prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
+        provenance_lookup=_provenance_lookup_fn())
 
     assert accepted == []
     assert not eng.executed, "no SQL may run for a pre-market observation"
@@ -320,7 +331,9 @@ def test_a10_deferred_never_routed_to_live_or_historical():
     accepted, deferred, rejected = m.route_historical_rows(
         eng, [{"date": d, "symbol": "^GSPC", "close": 7706.0}],
         now_utc=now, deferred_store=store,
-        prior_lookup=_prior_excludes_d_minus_1)
+        prior_lookup=_prior_excludes_d_minus_1,
+        prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
+        provenance_lookup=_provenance_lookup_fn())
 
     assert accepted == []
     assert len(deferred) == 1
@@ -382,13 +395,17 @@ def test_t_rec_1_successful_recovery_and_idempotency():
     # Batch too small to matter here; force small window so the row is due.
     result = m.run_deferred_recovery(eng, store, fetch_symbol_rows=fetch,
                                      now_utc=now, recovery_days=RECOVERY_DAYS,
-                                     prior_lookup=_no_prior)
+                                     prior_lookup=_no_prior,
+                                     prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
+        provenance_lookup=_provenance_lookup_fn())
     assert result["resolved"] == 1
     assert store.all_rows()[0].status == RESOLVED
 
     # Idempotent retry: a resolved row is no longer a candidate.
     result2 = m.run_deferred_recovery(eng, store, fetch_symbol_rows=fetch,
-                                      now_utc=now, prior_lookup=_no_prior)
+                                      now_utc=now, prior_lookup=_no_prior,
+                                      prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
+        provenance_lookup=_provenance_lookup_fn())
     assert result2["retried"] == 0
 
 
@@ -408,7 +425,9 @@ def test_t_rec_2_permanently_missing_data_escalates_and_is_retained():
         store.record_deferral("^GSPC", d, "PREVIOUS_SESSION_NOT_CONFIRMED",
                               now=now)
         m.run_deferred_recovery(eng, store, fetch_symbol_rows=fetch, now_utc=now,
-                                prior_lookup=_no_prior)
+                                prior_lookup=_no_prior,
+                                prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
+        provenance_lookup=_provenance_lookup_fn())
 
     rows = store.all_rows()
     assert len(rows) == 1, "the row must never disappear from tracking"
@@ -469,7 +488,9 @@ def test_treasury_published_dates_wired_from_fetch_path():
         now = dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc)
         accepted, deferred, rejected = m.route_historical_rows(
             FakeEngine(), [{"date": d, "symbol": "US10YT_CMT", "close": 5.11}],
-            now_utc=now, prior_lookup=_no_prior)
+            now_utc=now, prior_lookup=_no_prior,
+            prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 5.05},
+            provenance_lookup=_provenance_lookup_fn())
         assert len(accepted) == 1, "observed publication must make it eligible"
         assert deferred == []
 
@@ -477,7 +498,9 @@ def test_treasury_published_dates_wired_from_fetch_path():
         m._TREASURY_PUBLISHED_DATES.discard(dt.date(2026, 9, 23))
         accepted2, deferred2, _ = m.route_historical_rows(
             FakeEngine(), [{"date": d, "symbol": "US10YT_CMT", "close": 5.11}],
-            now_utc=now, prior_lookup=_no_prior)
+            now_utc=now, prior_lookup=_no_prior,
+            prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 5.05},
+            provenance_lookup=_provenance_lookup_fn())
         assert accepted2 == []
         assert len(deferred2) == 1
     finally:
@@ -538,7 +561,9 @@ def test_gate_records_unavailable_symbol_telemetry():
         m.route_historical_rows(
             FakeEngine(), [{"date": dt.date(2026, 9, 23), "symbol": "HK50",
                             "close": 24678.5}],
-            now_utc=now, prior_lookup=_no_prior)
+            now_utc=now, prior_lookup=_no_prior,
+            prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 24000.0},
+            provenance_lookup=_provenance_lookup_fn())
         assert m._PHASE_A_DEFERRED_COUNT == 1
         assert any(r["symbol"] == "HK50"
                    for r in m._PHASE_A_UNAVAILABLE_SYMBOLS)

@@ -36,6 +36,22 @@ def _now_after_close():
     return dt.datetime(2026, 9, 24, 6, 0, tzinfo=UTC)
 
 
+def _provenance_lookup_fn(prior_dates=None):
+    """Return a provenance_lookup that verifies the given dates."""
+    if prior_dates is None:
+        prior_dates = {dt.date(2026, 9, 21), dt.date(2026, 9, 22)}
+    def lookup(_engine, _symbol, _min_date, _max_date):
+        return set(prior_dates)
+    return lookup
+
+
+def _value_lookup(prior_val=5.05):
+    """Return a prior_value_lookup that supplies the stored prior close."""
+    def lookup(_engine, _symbol, _min_date, _max_date):
+        return {dt.date(2026, 9, 21): 4.7600, D1: prior_val}
+    return lookup
+
+
 # --------------------------------------------------------------- T1
 def test_t1_investing_live_available_while_treasury_delayed():
     """Investing.com supplies a live observation while the official value lags."""
@@ -136,16 +152,14 @@ def test_t5_missing_publication_defers_then_recovers():
 
     _, deferred, rejected = m.route_historical_rows(
         None, [row], treasury_published_dates=set(), now_utc=_now_after_close(),
-        deferred_store=store, prior_lookup=lambda *a, **k: {D1},
-    )
+        deferred_store=store, prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert deferred and not rejected
     assert len(store.all_rows()) == 1
 
     accepted, deferred2, _ = m.route_historical_rows(
         None, [row], treasury_published_dates={D1, D}, now_utc=_now_after_close(),
         treasury_published_values={(CMT, D1): 4.8100, (CMT, D): 4.8500},
-        deferred_store=store, prior_lookup=lambda *a, **k: {D1},
-    )
+        deferred_store=store, prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert accepted and not deferred2
     assert accepted[0]["symbol"] == CMT
 
@@ -173,6 +187,7 @@ def test_stale_official_series_still_yields_available_official_rows():
                                    (CMT, dt.date(2026, 9, 22)): 4.8100},
         now_utc=_now_after_close(),
         prior_lookup=lambda *a, **k: {dt.date(2026, 9, 21), dt.date(2026, 9, 22)},
+        prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn(),
     )
     accepted_dates = sorted(r["date"] for r in accepted)
     deferred_dates = sorted(r["date"] for r, _reason in deferred)
@@ -201,7 +216,7 @@ def test_row_level_official_value_accepted():
     _seed_official()
     accepted, deferred, rejected = m.route_historical_rows(
         None, [{"date": D, "symbol": CMT, "close": A_OFFICIAL}],
-        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1})
+        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(accepted) == 1 and not deferred and not rejected
 
 
@@ -210,7 +225,7 @@ def test_row_level_unofficial_value_deferred_despite_date_present():
     _seed_official()                       # D IS in the publication-date set
     accepted, deferred, rejected = m.route_historical_rows(
         None, [{"date": D, "symbol": CMT, "close": B_INVESTING}],
-        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1})
+        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not accepted, "unofficial value must never enter historical storage"
     assert len(deferred) == 1
     assert deferred[0][1] == "CMT_VALUE_NOT_OFFICIAL"
@@ -224,7 +239,7 @@ def test_row_level_wrong_tenor_value_rejected():
     m._TREASURY_PUBLISHED_VALUES[("US10YT_CMT", D)] = 4.2000   # wrong tenor only
     accepted, deferred, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": CMT, "close": 4.2000}],
-        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1})
+        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not accepted, "wrong-tenor value must not authorise a write"
     assert len(deferred) == 1
 
@@ -234,7 +249,7 @@ def test_row_level_mismatched_source_value_deferred():
     _seed_official()
     accepted, deferred, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": CMT, "close": A_OFFICIAL + 0.02}],
-        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1})
+        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert not accepted and len(deferred) == 1
 
 
@@ -243,7 +258,7 @@ def test_row_level_rounding_within_tolerance_accepted():
     _seed_official()
     accepted, deferred, _ = m.route_historical_rows(
         None, [{"date": D, "symbol": CMT, "close": A_OFFICIAL + 0.00001}],
-        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1})
+        now_utc=_now_after_close(), prior_lookup=lambda *a, **k: {D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
     assert len(accepted) == 1 and not deferred
 
 
