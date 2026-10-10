@@ -97,6 +97,53 @@ _TREASURY_PUBLISHED_VALUES: dict = {}
 # source, not rounding.
 TREASURY_VALUE_TOLERANCE = 5e-5
 
+# Phase C.1: immutable trust-start mapping for HIGH-confidence provenance anchors.
+# Keyed by (symbol, source_definition). Only entries present here are authoritative.
+# Sorted deterministically by symbol. No family wildcard entries.
+SOURCE_DEFINITION_TRUST_START: dict = {
+    # Cash indices — 100% exact full-range
+    ("^GSPC", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("^DJI", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("^SKEW", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("^TNX", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("^FVX", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("^TYX", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("^HSI", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("^N225", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-07",
+    ("^FCHI", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    # Crypto
+    ("ETH-USD", "CRYPTO_24_7_DAILY"): "2025-01-02",
+    ("BTC-USD", "CRYPTO_24_7_DAILY"): "2026-07-09",  # outcome B
+    # Cash indices — outcome B
+    ("^VIX", "YFINANCE_CASH_EQUITY_DAILY"): "2026-06-03",
+    ("^KS11", "YFINANCE_CASH_EQUITY_DAILY"): "2026-08-14",
+    # CMT — Treasury.gov 100% exact
+    ("US2YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+    ("US3YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+    ("US5YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+    ("US7YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+    ("US10YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+    ("US20YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+    ("US30YT_CMT", "TREASURY_GOV_PAR_YIELD_DAILY"): "2026-09-25",
+}
+
+
+def _resolve_trust_start(symbol: str, source_definition: str):
+    """Return the trust-start date for (symbol, source_definition) or None.
+
+    Phase C.1: lookup into SOURCE_DEFINITION_TRUST_START. Only explicit
+    entries are authoritative. No family-level inference.
+    """
+    from datetime import date as _date
+    key = (symbol, source_definition)
+    val = SOURCE_DEFINITION_TRUST_START.get(key)
+    if val is None:
+        return None
+    if isinstance(val, _date):
+        return val
+    return _date.fromisoformat(val)
+
+
 # Phase A safety telemetry: populated by the EOD gate and consumed by the
 # exit-code/alert path so a calendar failure raises an explicit alert instead
 # of exiting 0 (coverage measures fetch success, not gate eligibility).
@@ -962,6 +1009,13 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
         by_symbol.setdefault(rec["symbol"], []).append(rec)
 
     for symbol, symbol_rows in by_symbol.items():
+        # Phase C.1: resolve trust_start from the immutable mapping if not
+        # explicitly provided. Only (symbol, source_definition) entries in
+        # SOURCE_DEFINITION_TRUST_START are authoritative.
+        _sd = symbol_rows[0].get("source_definition") if symbol_rows else None
+        _ts = trust_start
+        if _ts is None and _sd is not None:
+            _ts = _resolve_trust_start(symbol, _sd)
         known = lookup(engine, symbol, min_date, max_date)
         if known is None:
             # Lookup failed -> fail closed, defer the whole symbol.
@@ -1012,7 +1066,7 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
                     deferred.append((rec, "PRIOR_PROVENANCE_UNVERIFIED"))
                     continue
                 # Trust-start boundary: P must be >= trust_start
-                if trust_start is not None and decision.expected_prior < trust_start:
+                if _ts is not None and decision.expected_prior < _ts:
                     deferred.append((rec, "PRIOR_BEFORE_TRUST_START"))
                     continue
                 # Value dependency: D.prev_close must equal the *stored* P
