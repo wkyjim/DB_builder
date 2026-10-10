@@ -1374,7 +1374,11 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
                                trust_start=trust_start,
                                deferred_store=store)
         if written:
-            store.record_success(cand.symbol, cand.session_date, now=now)
+            # A real provider fetch occurred, so this resolution counts as one
+            # recovery attempt (attempt_count += 1), consistent with the
+            # failed/re-deferred paths. Explicit, never a default.
+            store.record_success(cand.symbol, cand.session_date, now=now,
+                                 attempted=True)
             print(f"[DEFERRED RECOVERY] RESOLVED {cand.symbol} "
                   f"{cand.session_date}")
             resolved += 1

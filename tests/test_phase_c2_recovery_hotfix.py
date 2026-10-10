@@ -196,13 +196,12 @@ class TestC2EndToEndRecoveryWrite:
         # A real historical INSERT must have been issued.
         assert eng.executed, "no SQL executed -> no historical write"
 
-    def test_success_path_does_not_increment_attempt_count(self, monkeypatch):
-        """Established A.2B semantic: record_success leaves attempt_count alone.
+    def test_success_path_increments_attempt_count(self, monkeypatch):
+        """A successful recovery IS a real fetch, so attempt_count += 1.
 
-        ``attempt_count`` tracks FAILED recovery attempts for escalation. A
-        successful recovery resolves the row, so the counter is frozen at its
-        pre-resolution value (production RESOLVED rows retain e.g. att=6).
-        Only a failed fetch that re-defers increments it.
+        ``attempt_count`` counts actual deferred-recovery provider fetch
+        attempts -- successes and failures alike. A resolved row therefore
+        carries the total number of fetches it took.
         """
         import macro_data_fetch as m
 
@@ -225,8 +224,8 @@ class TestC2EndToEndRecoveryWrite:
 
         row = store.all_rows()[0]
         assert row.status == RESOLVED
-        assert row.attempt_count == before, (
-            "successful recovery must not churn attempt_count")
+        assert row.attempt_count == before + 1, (
+            "a real successful fetch must increment attempt_count by exactly 1")
         assert row.retry_class is None
 
     def test_failed_fetch_increments_attempt_count(self, monkeypatch):
@@ -397,3 +396,384 @@ class TestC2InjectedProvenancePrecedence:
 
         assert result["resolved"] == 1
         assert store.all_rows()[0].status == RESOLVED
+
+
+# ============================================================
+# C2-44: REQUIRED positive-path acceptance proof
+# ============================================================
+
+class TestC2PositivePathAcceptanceProof:
+    """C2-44: the complete acceptance proof for an anchor-covered row.
+
+    Covers every assertion required by the C.2 hotfix acceptance criteria:
+    selection, exactly-one fetch, attempt_count +1, provenance callback
+    invocation, write, authoritative stored P.close, deterministic derived
+    fields, and RESOLVED.
+    """
+
+    def test_full_positive_path(self, monkeypatch):
+        import macro_data_fetch as m
+
+        store = MemoryDeferredStore()
+        eng = FakeEngine()
+
+        # Persisted retry_class = PROVENANCE_UNVERIFIED
+        store.record_deferral("^GSPC", D, "PRIOR_PROVENANCE_UNVERIFIED",
+                              now=NOW, attempted=False,
+                              retry_class=PROVENANCE_UNVERIFIED)
+        before_attempts = store.all_rows()[0].attempt_count
+
+        # exact C.1 anchor exists; D >= trust_start; P exists; P >= trust_start
+        assert m._resolve_trust_start(
+            "^GSPC", sc.SOURCE_DEFINITION_BY_SYMBOL["^GSPC"]) is not None
+
+        # Provenance callback invocation is observable: the anchor-derived
+        # resolver delegates to _stored_trusted_provenance_dates.
+        calls = {"provenance": 0, "fetch": 0}
+
+        def counting_provenance(engine, symbol, sd, min_d, max_d):
+            calls["provenance"] += 1
+            return {P}          # stored P trusted
+
+        monkeypatch.setattr(m, "_stored_trusted_provenance_dates",
+                            counting_provenance)
+
+        def fetch(symbol, dates):
+            calls["fetch"] += 1
+            return [_provider_row(symbol, D)]   # provider returns D
+
+        result = m.run_deferred_recovery(
+            eng, store, fetch_symbol_rows=fetch, now_utc=NOW,
+            recovery_days=RECOVERY_DAYS,
+            prior_lookup=lambda *a, **k: {P},
+            prior_value_lookup=lambda *a, **k: {P: P_CLOSE})
+
+        row = store.all_rows()[0]
+
+        # runtime override selects row
+        assert result["retried"] == 1, result
+        # actual provider fetch occurs exactly once
+        assert calls["fetch"] == 1, "provider fetch must occur exactly once"
+        # provenance callback is actually invoked
+        assert calls["provenance"] > 0, "provenance callback was never invoked"
+        # attempt_count +1
+        assert row.attempt_count == before_attempts + 1, (
+            f"attempt_count must increment on a real fetch "
+            f"(was {before_attempts}, now {row.attempt_count})")
+        # D is written
+        assert result["resolved"] == 1, result
+        assert eng.executed, "no historical write occurred"
+        # deferred row becomes RESOLVED
+        assert row.status == RESOLVED
+
+        # final D.prev_close == stored P.close (stored P is authoritative)
+        rec = eng.executed[-1][0][1][0]
+        assert rec["prev_close"] == P_CLOSE
+        assert rec["prev_close"] != 9999.0, "provider prev_close leaked through"
+        # change/pct_chg/amplitude recomputed from stored P.close
+        assert rec["change"] == pytest.approx(round(7818.93 - P_CLOSE, 4))
+        assert rec["pct_chg"] == pytest.approx(
+            round((7818.93 - P_CLOSE) / P_CLOSE * 100, 4))
+        assert rec["amplitude"] == pytest.approx(
+            round((7830.0 - 7785.0) / P_CLOSE * 100, 4))
+
+
+# ============================================================
+# C2-45: REQUIRED fail-closed companion
+# ============================================================
+
+class TestC2FailClosedCompanion:
+    """C2-45: anchor exists but required P is outside the trust boundary.
+
+    BTC 2026-07-09 is the canonical boundary case: the anchor exists and
+    D >= trust_start, but P = 2026-07-08 < trust_start = 2026-07-09.
+    """
+
+    def test_btc_2026_07_09_fails_closed_without_fetch(self):
+        import macro_data_fetch as m
+
+        store = MemoryDeferredStore()
+        eng = FakeEngine()
+        d = dt.date(2026, 7, 9)
+
+        store.record_deferral("BTC-USD", d, "PRIOR_PROVENANCE_UNVERIFIED",
+                              now=NOW, attempted=False,
+                              retry_class=PROVENANCE_UNVERIFIED)
+        before_attempts = store.all_rows()[0].attempt_count
+
+        fetch_calls = {"n": 0}
+
+        def fetch(symbol, dates):
+            fetch_calls["n"] += 1
+            return []
+
+        result = m.run_deferred_recovery(
+            eng, store, fetch_symbol_rows=fetch, now_utc=NOW,
+            recovery_days=RECOVERY_DAYS)
+
+        row = store.all_rows()[0]
+        # no provider fetch: the failure is knowable pre-fetch
+        assert fetch_calls["n"] == 0, "must not fetch a pre-fetch-blocked row"
+        # attempt_count unchanged
+        assert row.attempt_count == before_attempts
+        # no historical write
+        assert not eng.executed
+        # row remains unresolved
+        assert row.status != RESOLVED
+        # precise provenance reason retained
+        assert row.reason == "PRIOR_PROVENANCE_UNVERIFIED"
+        assert row.retry_class == PROVENANCE_UNVERIFIED
+        assert result["resolved"] == 0
+
+    def test_missing_trusted_p_fails_closed(self, monkeypatch):
+        """Anchor exists and P >= trust_start, but P is absent from storage."""
+        import macro_data_fetch as m
+
+        store = MemoryDeferredStore()
+        eng = FakeEngine()
+        store.record_deferral("^GSPC", D, "PRIOR_PROVENANCE_UNVERIFIED",
+                              now=NOW, attempted=False,
+                              retry_class=PROVENANCE_UNVERIFIED)
+        before_attempts = store.all_rows()[0].attempt_count
+
+        # Trusted-provenance resolver returns nothing for this symbol.
+        monkeypatch.setattr(
+            m, "_stored_trusted_provenance_dates",
+            lambda engine, symbol, sd, min_d, max_d: set())
+
+        fetch_calls = {"n": 0}
+
+        def fetch(symbol, dates):
+            fetch_calls["n"] += 1
+            return [_provider_row(symbol, D)]
+
+        result = m.run_deferred_recovery(
+            eng, store, fetch_symbol_rows=fetch, now_utc=NOW,
+            recovery_days=RECOVERY_DAYS,
+            prior_lookup=lambda *a, **k: {P},
+            prior_value_lookup=lambda *a, **k: {P: P_CLOSE})
+
+        row = store.all_rows()[0]
+        assert fetch_calls["n"] == 0, "no fetch when trusted P is missing"
+        assert row.attempt_count == before_attempts
+        assert not eng.executed
+        assert row.status != RESOLVED
+        assert result["resolved"] == 0
+
+
+# ============================================================
+# C2-46: wiring regression guard (the exact 91bdd7d defect)
+# ============================================================
+
+class TestC2WiringRegressionGuard:
+    """C2-46: fails if the recovery write again passes provenance_lookup=None.
+
+    This is the guard against the exact defect found at 91bdd7d, where the
+    resolver existed but was never consumed, so the gate failed closed.
+    """
+
+    def test_resolver_consumed_by_recovery_write(self, monkeypatch):
+        import macro_data_fetch as m
+
+        store = MemoryDeferredStore()
+        eng = FakeEngine()
+        store.record_deferral("^GSPC", D, "PRIOR_PROVENANCE_UNVERIFIED",
+                              now=NOW, attempted=False,
+                              retry_class=PROVENANCE_UNVERIFIED)
+
+        monkeypatch.setattr(
+            m, "_stored_trusted_provenance_dates",
+            lambda engine, symbol, sd, min_d, max_d: {P})
+
+        # Capture the provenance_lookup actually handed to upsert_macro.
+        captured = {}
+
+        real_upsert = m.upsert_macro
+
+        def spy(engine, rows, **kwargs):
+            captured["provenance_lookup"] = kwargs.get("provenance_lookup")
+            return real_upsert(engine, rows, **kwargs)
+
+        monkeypatch.setattr(m, "upsert_macro", spy)
+
+        m.run_deferred_recovery(
+            eng, store, fetch_symbol_rows=lambda s, d: [_provider_row(s, D)],
+            now_utc=NOW, recovery_days=RECOVERY_DAYS,
+            prior_lookup=lambda *a, **k: {P},
+            prior_value_lookup=lambda *a, **k: {P: P_CLOSE})
+
+        assert "provenance_lookup" in captured, "upsert_macro was never reached"
+        resolver = captured["provenance_lookup"]
+        assert resolver is not None, (
+            "recovery write passed provenance_lookup=None -> the 91bdd7d "
+            "defect has regressed; the gate would fail closed")
+        # The resolver must satisfy the gate contract and actually resolve P.
+        assert resolver(FakeEngine(), "^GSPC", P, D) == {P}, (
+            "resolver does not return the trusted P for the anchor-covered "
+            "symbol")
+
+    def test_no_anchor_symbol_resolves_empty(self):
+        """No family inheritance: an unanchored symbol resolves to empty."""
+        import macro_data_fetch as m
+
+        resolver = m._build_anchor_provenance_lookup(FakeEngine())
+        assert resolver(FakeEngine(), "NOT_AN_ANCHORED_SYMBOL", P, D) == set()
+        # A real symbol WITHOUT an explicit C.1 anchor entry also resolves empty.
+        assert resolver(FakeEngine(), "^KS200", P, D) == set()
+
+
+# ============================================================
+# C2-47: attempt_count counts PROVIDER FETCHES, not outcomes
+# ============================================================
+
+class TestC2AttemptCountCountsFetches:
+    """C2-47: the mechanically testable invariant
+
+        Σ attempt_count_delta == actual provider fetch calls
+
+    for every outcome of a recovery batch. attempt_count counts real
+    provider fetch attempts -- successes and failures alike.
+    """
+
+    def _run(self, monkeypatch, fetch_rows):
+        """Drive one recovery candidate; return (row, fetch_calls, result)."""
+        import macro_data_fetch as m
+
+        store = MemoryDeferredStore()
+        eng = FakeEngine()
+        store.record_deferral("^GSPC", D, "PRIOR_PROVENANCE_UNVERIFIED",
+                              now=NOW, attempted=False,
+                              retry_class=PROVENANCE_UNVERIFIED)
+        monkeypatch.setattr(
+            m, "_stored_trusted_provenance_dates",
+            lambda engine, symbol, sd, min_d, max_d: {P})
+
+        calls = {"n": 0}
+
+        def fetch(symbol, dates):
+            calls["n"] += 1
+            if isinstance(fetch_rows, Exception):
+                raise fetch_rows
+            return fetch_rows
+
+        result = m.run_deferred_recovery(
+            eng, store, fetch_symbol_rows=fetch, now_utc=NOW,
+            recovery_days=RECOVERY_DAYS,
+            prior_lookup=lambda *a, **k: {P},
+            prior_value_lookup=lambda *a, **k: {P: P_CLOSE})
+        return store.all_rows()[0], calls["n"], result
+
+    def test_success_fetch_once_delta_plus_one(self, monkeypatch):
+        """fetch=1, write succeeds -> delta +1, RESOLVED."""
+        row, fetches, result = self._run(
+            monkeypatch, [_provider_row("^GSPC", D)])
+        assert fetches == 1
+        assert result["resolved"] == 1
+        assert row.status == RESOLVED
+        assert row.attempt_count == 1
+
+    def test_redefer_fetch_once_delta_plus_one(self, monkeypatch):
+        """fetch=1, gate re-defers -> delta +1, unresolved."""
+        row, fetches, result = self._run(
+            monkeypatch, [_provider_row("^GSPC", dt.date(2026, 10, 6))])
+        assert fetches == 1
+        assert result["resolved"] == 0
+        assert row.status != RESOLVED
+        assert row.attempt_count == 1
+
+    def test_fetch_exception_once_delta_plus_one(self, monkeypatch):
+        """fetch=1 raising -> delta +1."""
+        row, fetches, result = self._run(
+            monkeypatch, ConnectionError("provider down"))
+        assert fetches == 1
+        assert row.status != RESOLVED
+        assert row.attempt_count == 1
+
+    def test_prefetch_block_zero_fetch_zero_delta(self, monkeypatch):
+        """fetch=0 (provenance-blocked pre-fetch) -> delta 0."""
+        import macro_data_fetch as m
+
+        store = MemoryDeferredStore()
+        eng = FakeEngine()
+        store.record_deferral("^GSPC", D, "PRIOR_PROVENANCE_UNVERIFIED",
+                              now=NOW, attempted=False,
+                              retry_class=PROVENANCE_UNVERIFIED)
+        monkeypatch.setattr(
+            m, "_stored_trusted_provenance_dates",
+            lambda engine, symbol, sd, min_d, max_d: set())  # no trusted P
+
+        calls = {"n": 0}
+
+        def fetch(symbol, dates):
+            calls["n"] += 1
+            return [_provider_row(symbol, D)]
+
+        m.run_deferred_recovery(
+            eng, store, fetch_symbol_rows=fetch, now_utc=NOW,
+            recovery_days=RECOVERY_DAYS,
+            prior_lookup=lambda *a, **k: {P},
+            prior_value_lookup=lambda *a, **k: {P: P_CLOSE})
+
+        assert calls["n"] == 0, "blocked row must not be fetched"
+        assert store.all_rows()[0].attempt_count == 0
+
+    def test_no_double_count_on_success(self, monkeypatch):
+        """A single successful fetch must produce exactly +1, never +2.
+
+        Guards against record_deferral(attempted=True) also firing on the
+        success path before record_success().
+        """
+        row, fetches, result = self._run(
+            monkeypatch, [_provider_row("^GSPC", D)])
+        assert fetches == 1
+        assert row.attempt_count == 1, (
+            f"exactly one fetch must yield exactly +1 (got "
+            f"{row.attempt_count}) -- double counting detected")
+
+
+# ============================================================
+# C2-48: record_success attempted= API semantics
+# ============================================================
+
+class TestC2RecordSuccessAttemptedSemantics:
+    """C2-48: record_success(attempted=...) explicit semantics (both stores)."""
+
+    def test_memory_success_default_increments(self):
+        store = MemoryDeferredStore()
+        store.record_deferral("^GSPC", D, "X", now=NOW, attempted=False)
+        assert store.all_rows()[0].attempt_count == 0
+        store.record_success("^GSPC", D, now=NOW, attempted=True)
+        row = store.all_rows()[0]
+        assert row.status == RESOLVED
+        assert row.attempt_count == 1
+        assert row.last_attempt == NOW
+
+    def test_memory_success_not_attempted_does_not_increment(self):
+        store = MemoryDeferredStore()
+        store.record_deferral("^GSPC", D, "X", now=NOW, attempted=False)
+        store.record_success("^GSPC", D, now=NOW, attempted=False)
+        row = store.all_rows()[0]
+        assert row.status == RESOLVED
+        assert row.attempt_count == 0
+
+    def test_memory_success_insert_branch_counts_attempt(self):
+        """No prior deferral row + real fetch -> attempt_count 1, not 0."""
+        store = MemoryDeferredStore()
+        store.record_success("^GSPC", D, now=NOW, attempted=True)
+        row = store.all_rows()[0]
+        assert row.status == RESOLVED
+        assert row.attempt_count == 1
+
+    def test_sql_record_success_sql_preserves_and_increments(self):
+        """SQL store: ON CONFLICT must ADD to attempt_count, not reset it."""
+        import re
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "src" / "db_builder" / "deferred_history.py"
+        text = src.read_text()
+        # Locate the SqlDeferredStore.record_success body.
+        idx = text.rindex("def record_success")
+        body = text[idx:idx + 1600]
+        assert "attempt_count = public.macro_deferred_history.attempt_count" in body, (
+            "SQL record_success must increment attempt_count on conflict")
+        assert "EXCLUDED.attempt_count" in body
+        assert ":inc" in body, "attempted must be parameterised, not hard-coded"

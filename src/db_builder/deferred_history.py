@@ -72,7 +72,8 @@ class DeferredStore:
                         manual_review_required=None) -> DeferredRow:
         raise NotImplementedError
 
-    def record_success(self, symbol, session_date, now=None) -> None:
+    def record_success(self, symbol, session_date, now=None, *,
+                       attempted=True) -> None:
         raise NotImplementedError
 
     def due_candidates(self, now=None, limit=RECOVERY_BATCH,
@@ -163,20 +164,37 @@ class MemoryDeferredStore(DeferredStore):
             manual_review_required=manual_review_required)
         return row
 
-    def record_success(self, symbol, session_date, now=None):
+    def record_success(self, symbol, session_date, now=None, *,
+                       attempted=True):
+        """Mark a deferred row resolved after a successful recovery.
+
+        ``attempted`` mirrors :meth:`record_deferral`: ``attempt_count`` counts
+        real deferred-recovery PROVIDER FETCH attempts, so a success reached
+        through the actual fetch path increments it exactly like a failed
+        fetch does. Only a resolution that did NOT originate from a real
+        recovery fetch (e.g. a synthetic/admin resolution) passes
+        ``attempted=False``. The production call site is always post-fetch and
+        passes ``attempted=True`` explicitly.
+        """
         now = now or dt.datetime.now(dt.timezone.utc)
         key = (symbol, session_date)
         row = self._rows.get(key)
         if row is None:
+            # No prior deferral row: a real successful recovery fetch still
+            # counts as one attempt (internally consistent with the update
+            # branch, never a silent 0).
             row = DeferredRow(symbol=symbol, session_date=session_date,
                               reason="RESOLVED_WITHOUT_PRIOR_DEFERRAL",
                               status=RESOLVED, first_seen=now,
-                              last_attempt=now, resolved_at=now)
+                              last_attempt=now, resolved_at=now,
+                              attempt_count=1 if attempted else 0)
             self._rows[key] = row
         else:
             row.status = RESOLVED
             row.resolved_at = now
             row.last_attempt = now
+            if attempted:
+                row.attempt_count += 1
         row.retry_class = None
         row.next_retry_at = None
         row.manual_review_required = False
@@ -330,7 +348,15 @@ class SqlDeferredStore(DeferredStore):
                            last_error_class=last_error_class,
                            manual_review_required=bool(manual_review_required))
 
-    def record_success(self, symbol, session_date, now=None):
+    def record_success(self, symbol, session_date, now=None, *,
+                       attempted=True):
+        """SQL-store counterpart of :meth:`MemoryDeferredStore.record_success`.
+
+        ``attempt_count`` counts real deferred-recovery provider fetch
+        attempts, so a successful post-fetch recovery increments it exactly
+        like a failed fetch. ``attempted=False`` is only for a resolution that
+        did not originate from a real fetch.
+        """
         from sqlalchemy import text
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._engine.begin() as conn:
@@ -340,15 +366,18 @@ class SqlDeferredStore(DeferredStore):
                      first_seen, last_attempt, attempt_count, resolved_at,
                      retry_class, next_retry_at, manual_review_required)
                 VALUES (:symbol, :session_date, 'RESOLVED', 'RESOLVED',
-                        :now, :now, 0, :now, NULL, NULL, false)
+                        :now, :now, :inc, :now, NULL, NULL, false)
                 ON CONFLICT (symbol, session_date) DO UPDATE SET
                     status = 'RESOLVED',
                     resolved_at = EXCLUDED.resolved_at,
                     last_attempt = EXCLUDED.last_attempt,
+                    attempt_count = public.macro_deferred_history.attempt_count
+                                    + EXCLUDED.attempt_count,
                     retry_class = NULL,
                     next_retry_at = NULL,
                     manual_review_required = false
-            """), {"symbol": symbol, "session_date": session_date, "now": now})
+            """), {"symbol": symbol, "session_date": session_date, "now": now,
+                   "inc": 1 if attempted else 0})
 
     def due_candidates(self, now=None, limit=RECOVERY_BATCH,
                        recovery_days=RECOVERY_DAYS, *, provider_available=None,
