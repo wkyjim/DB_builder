@@ -38,6 +38,17 @@ from db_builder.deferred_history import (
     RECOVERY_BATCH,
     RECOVERY_DAYS,
     SqlDeferredStore,
+    ProviderBackoffStore,
+)
+from db_builder import retry_policy as _retry_policy
+from db_builder.retry_policy import (
+    PROVIDER_INVESTING,
+    PROVIDER_YFINANCE,
+    PROVIDER_TREASURY,
+    PROVIDER_UNKNOWN,
+    RETRY_ELIGIBLE,
+    BACKOFF_ACTIVE,
+    MANUAL_REVIEW_REQUIRED,
 )
 from db_builder.reconciliation import (
     AUTO_CORRECT_SYMBOLS,
@@ -1071,26 +1082,48 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
                           limit=RECOVERY_BATCH, recovery_days=RECOVERY_DAYS,
                           max_attempts=MAX_ATTEMPTS, prior_lookup=None,
                           prior_value_lookup=None, provenance_lookup=None,
-                          trust_start=None):
-    """Bounded retry of deferred historical sessions.
+                          trust_start=None, provider_backoff=None):
+    """Bounded retry of deferred historical sessions (Phase A.2B gated).
 
     ``fetch_symbol_rows(symbol, dates)`` must return historical row dicts for the
     requested dates (same shape as ``calculate_rows_for_symbol`` output).
     Rows that are still missing their prior session stay DEFERRED; rows that can
     now be built are written through the normal gate and marked RESOLVED.
 
-    Bounded by ``limit`` per run so an hourly cycle never becomes a historical
-    backfill. Rows are never deleted: repeated/expired failures escalate to
-    DEFERRED_HISTORY_UNRESOLVED but remain tracked.
+    Phase A.2B adds a retry-state layer that is orthogonal to writability:
+
+      * provider availability  -- decides whether a fetch may be attempted;
+      * deferred retry state   -- decides whether THIS item is retry-eligible;
+      * historical gate        -- independently decides whether data may write.
+
+    The retry layer only ever SUPPRESSES fetches. ``attempt_count`` increments
+    only on a real fetch attempt, so structural/frozen items stop churning.
     """
     now = now_utc or datetime.now(ZoneInfo("UTC"))
+
+    # Provider availability (top layer), keyed by (provider, data_class). A
+    # broken endpoint family suppresses redundant requests across every symbol
+    # that shares it -- but never changes any historical source definition.
+    unavailable_keys = set()
+    if provider_backoff is not None:
+        try:
+            unavailable_keys = provider_backoff.unavailable_keys(now=now)
+        except Exception as exc:
+            print(f"[DEFERRED BACKOFF] provider state read failed: "
+                  f"{type(exc).__name__}: {exc}")
+
     candidates = store.due_candidates(now=now, limit=limit,
-                                      recovery_days=recovery_days)
+                                      recovery_days=recovery_days,
+                                      provider_available=(
+                                          None if not unavailable_keys
+                                          else not unavailable_keys),
+                                      unavailable_keys=unavailable_keys)
     if not candidates:
         # Still run escalation: rows past the horizon / attempt limit must be
         # flagged even when nothing is retried this cycle.
         escalated = store.escalate_stale(now=now, recovery_days=recovery_days,
                                          max_attempts=max_attempts)
+        _report_deferred_states(store, now=now)
         for row in escalated:
             print(f"[DEFERRED_HISTORY_UNRESOLVED] {row.symbol} "
                   f"{row.session_date} attempts={row.attempt_count} "
@@ -1107,11 +1140,34 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
         try:
             rows = fetch_symbol_rows(cand.symbol, [cand.session_date])
         except Exception as exc:
+            exc_name = type(exc).__name__
+            reason = f"RECOVERY_FETCH_ERROR:{exc_name}"
             print(f"[DEFERRED RECOVERY] fetch failed {cand.symbol} "
                   f"{cand.session_date}: {exc}")
-            store.record_deferral(cand.symbol, cand.session_date,
-                                  f"RECOVERY_FETCH_ERROR:{type(exc).__name__}",
-                                  now=now)
+            # A provider-wide fault is recorded at the provider layer so the
+            # remaining symbols sharing that endpoint family are suppressed.
+            if provider_backoff is not None \
+                    and _retry_policy.is_provider_error(str(exc)):
+                try:
+                    prov, dclass = _retry_policy.provider_key(cand.symbol)
+                    provider_backoff.record_failure(prov, dclass, str(exc),
+                                                    now=now)
+                except Exception as bexc:
+                    print(f"[DEFERRED BACKOFF] could not record provider "
+                          f"outage: {type(bexc).__name__}: {bexc}")
+            # Classify by the actual blocker. A deterministic fetch error in
+            # the recovery path is our own routing defect (fixable), NOT a
+            # manual decision; a transient exception is ordinary backoff.
+            # Precedence is applied inside the store, so an incidental error
+            # never overwrites a stronger structural class already on the row.
+            if exc_name in _retry_policy.TRANSIENT_EXCEPTION_TYPES:
+                cls = BACKOFF_ACTIVE
+            else:
+                cls = _retry_policy.RETRY_PATH_DEFECT
+            store.record_deferral(
+                cand.symbol, cand.session_date, reason, now=now, attempted=True,
+                retry_class=cls,
+                last_error_class=_retry_policy.defect_identifier(str(exc)))
             still += 1
             continue
 
@@ -1119,7 +1175,8 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
                  if pd.to_datetime(r["date"]).date() == cand.session_date]
         if not match:
             store.record_deferral(cand.symbol, cand.session_date,
-                                  "RECOVERY_DATA_STILL_MISSING", now=now)
+                                  "RECOVERY_DATA_STILL_MISSING", now=now,
+                                  attempted=True, retry_class=BACKOFF_ACTIVE)
             still += 1
             continue
 
@@ -1136,11 +1193,13 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
             resolved += 1
         else:
             store.record_deferral(cand.symbol, cand.session_date,
-                                  "RECOVERY_PRIOR_STILL_UNCONFIRMED", now=now)
+                                  "RECOVERY_PRIOR_STILL_UNCONFIRMED", now=now,
+                                  attempted=True, retry_class=BACKOFF_ACTIVE)
             still += 1
 
     escalated = store.escalate_stale(now=now, recovery_days=recovery_days,
                                      max_attempts=max_attempts)
+    _report_deferred_states(store, now=now)
     for row in escalated:
         print(f"[DEFERRED_HISTORY_UNRESOLVED] {row.symbol} "
               f"{row.session_date} attempts={row.attempt_count} "
@@ -1148,6 +1207,46 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
 
     return {"retried": len(candidates), "resolved": resolved,
             "still_deferred": still, "escalated": len(escalated)}
+
+
+def _report_deferred_states(store, *, now, unavailable_keys=None):
+    """One concise summary per state instead of per-symbol spam."""
+    try:
+        rows = [r for r in store.all_rows() if r.status != "RESOLVED"]
+    except Exception:
+        return
+    buckets = {}
+    for r in rows:
+        b = _retry_policy.classify_bucket(
+            r, now, unavailable_keys=unavailable_keys)
+        buckets.setdefault(b, []).append(r)
+    frozen = buckets.get("FROZEN", [])
+    if frozen:
+        legacy = sum(1 for r in frozen
+                     if getattr(r, "symbol", "").startswith("US")
+                     and getattr(r, "symbol", "").endswith("YT=X"))
+        print(f"[EXPECTED FROZEN] legacy_treasury={legacy} "
+              f"(no retry, intentional)")
+    structural = buckets.get("STRUCTURAL", [])
+    if structural:
+        print(f"[DEFERRED STRUCTURAL] reason=PROVENANCE_UNVERIFIED "
+              f"symbols={len(structural)} retry=manual")
+    defect = buckets.get("RETRY_PATH_DEFECT", [])
+    if defect:
+        print(f"[DEFERRED DEFECT] retry_path_defect={len(defect)} "
+              f"retry=after-code-fix")
+    manual = buckets.get("MANUAL", [])
+    if manual:
+        print(f"[DEFERRED MANUAL] symbols={len(manual)} retry=manual")
+    provider = buckets.get("PROVIDER_UNAVAILABLE", [])
+    if provider:
+        print(f"[DEFERRED BACKOFF] provider_unavailable={len(provider)}")
+    backoff = buckets.get("TIME_BACKOFF", [])
+    if backoff:
+        print(f"[DEFERRED BACKOFF] active={len(backoff)}")
+    blocked = buckets.get("PREREQUISITE_BLOCKED", [])
+    if blocked:
+        print(f"[DEFERRED DEPENDENCY] prerequisite_blocked={len(blocked)}")
 
 
 def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
@@ -2687,29 +2786,95 @@ def _process_investiny_fallback_for_symbol(
 
 
 
-def _recovery_fetch_symbol_rows(symbol, dates):
-    """D2: provider fetch used by bounded deferred-history recovery.
+# ============================================================
+# SHARED HISTORICAL FETCH ROUTING (Phase A.2B)
+# ============================================================
+# Single source of truth for the approved historical fetch path. The main
+# ingestion cycle and the bounded deferred-recovery path MUST agree on a
+# symbol's source identity; recovery may change the fetch window/date
+# selection but never the source. Keeping one dispatcher prevents the two
+# paths from diverging again (the D2 hotfix defect routed every non-Treasury,
+# non-Investing symbol into the oil-only yfinance fallback, raising
+# "yfinance fallback is not enabled for <symbol>").
+ROUTE_TREASURY_OFFICIAL = "TREASURY_OFFICIAL"
+ROUTE_INVESTING = "INVESTING"
+ROUTE_YFINANCE_HISTORICAL = "YFINANCE_HISTORICAL"
+ROUTE_FROZEN = "FROZEN"        # no approved historical route -> fail closed
 
-    Returns historical row dicts for the requested session dates, in the same
-    shape as ``calculate_rows_for_symbol`` output. Uses the symbol's own
-    provider path so a recovered row is never sourced differently from a
-    normal cycle row.
+
+def historical_fetch_route(symbol, *, source_definition=None):
+    """Return ``(route_kind, source_definition)`` for a symbol.
+
+    Mirrors the main-ingestion routing exactly. A symbol whose historical
+    source definition is unresolved (HK50/KOR200c1/CIHc1) or absent fails
+    closed -- no source inference is performed.
+    """
+    from db_builder.session_calendar import (
+        SOURCE_DEFINITION_BY_SYMBOL, SOURCE_DEFINITION_UNRESOLVED,
+    )
+    sd = source_definition or SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+    # Unresolved / unknown definition -> fail closed (never guess a source).
+    if symbol in SOURCE_DEFINITION_UNRESOLVED or sd is None:
+        return ROUTE_FROZEN, sd
+    # Treasury.gov official par-yield (CMT series and legacy US*YT=X).
+    if symbol in CMT_SYMBOLS or symbol in TREASURY_PUBLICATION_SYMBOLS:
+        return ROUTE_TREASURY_OFFICIAL, sd
+    # Investing.com continuous front-contract futures (BZ=F/CL=F).
+    if symbol in INVESTINY_ASSETS:
+        return ROUTE_INVESTING, sd
+    # FX / crypto / cash equity / cash indices: approved yfinance historical.
+    return ROUTE_YFINANCE_HISTORICAL, sd
+
+
+def _yfinance_historical_rows(symbol, meta, dates, *, source_definition=None):
+    """Approved yfinance historical fetch, mirroring the main cycle.
+
+    Uses the same extract -> remove-unfinished -> calculate_rows_for_symbol
+    path as normal ingestion, so a recovered row is never sourced differently.
     """
     wanted = {pd.to_datetime(d).date() for d in dates}
+    batch_df, target_start_date = download_recent_batch([symbol])
+    symbol_df = extract_symbol_df_from_batch(batch_df, symbol)
+    symbol_df = remove_unfinished_bars(symbol_df, symbol)
+    if symbol_df.empty:
+        return []
+    rows = calculate_rows_for_symbol(
+        df=symbol_df, symbol=symbol, name=meta["name"],
+        asset_type=meta["asset_type"], source_definition=source_definition)
+    rows = filter_rows_to_target_window(rows=rows,
+                                        target_start_date=target_start_date)
+    return [r for r in (rows or [])
+            if pd.to_datetime(r["date"]).date() in wanted]
+
+
+def _recovery_fetch_symbol_rows(symbol, dates):
+    """Bounded deferred-history recovery fetch.
+
+    Routes through :func:`historical_fetch_route` -- the SAME approved source
+    decision the normal historical ingestion uses. Recovery changes only the
+    fetch window/date selection, never the source identity.
+    """
     meta = {
         "name": dict((s, n) for s, n, _a in ASSETS).get(symbol, symbol),
         "asset_type": dict((s, a) for s, _n, a in ASSETS).get(
             symbol, "unknown"),
     }
-    if symbol in CMT_SYMBOLS or symbol in TREASURY_PUBLICATION_SYMBOLS:
+    route, sd = historical_fetch_route(symbol)
+    if route == ROUTE_FROZEN:
+        # No approved historical route (unresolved source definition): fail
+        # closed. The historical gate independently refuses the write; the
+        # retry policy keeps such rows non-retry-eligible.
+        return []
+    if route == ROUTE_TREASURY_OFFICIAL:
         rows, _live, _fetched, _latest = process_treasury_fallback_symbol(
             symbol, meta)
-    elif symbol in INVESTINY_ASSETS:
+    elif route == ROUTE_INVESTING:
         rows, _live, _fetched, _latest = process_investiny_symbol(
             symbol, meta)
-    else:
-        rows, _live, _fetched, _latest = process_yfinance_fallback_symbol(
-            symbol, meta)
+    else:  # ROUTE_YFINANCE_HISTORICAL
+        return _yfinance_historical_rows(symbol, meta, dates,
+                                         source_definition=sd)
+    wanted = {pd.to_datetime(d).date() for d in dates}
     return [r for r in (rows or [])
             if pd.to_datetime(r["date"]).date() in wanted]
 
@@ -2724,11 +2889,18 @@ def run_production_deferred_recovery(now_utc=None):
     failure without disappearing from tracking.
     """
     store = production_deferred_store()
+    provider_backoff = None
+    try:
+        provider_backoff = ProviderBackoffStore(local_engine)
+    except Exception as exc:
+        print(f"[DEFERRED BACKOFF] provider store unavailable: "
+              f"{type(exc).__name__}: {exc}")
     try:
         result = run_deferred_recovery(
             local_engine, store,
             fetch_symbol_rows=_recovery_fetch_symbol_rows,
             now_utc=now_utc,
+            provider_backoff=provider_backoff,
         )
     except Exception as exc:
         print(f"[DEFERRED RECOVERY] skipped: {type(exc).__name__}: {exc}")

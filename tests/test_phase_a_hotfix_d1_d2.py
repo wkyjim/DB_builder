@@ -227,7 +227,9 @@ def test_d2_recovery_resolves_and_is_idempotent(m, monkeypatch):
 
     store = MemoryDeferredStore()
     session = D(2026, 9, 23)
-    store.record_deferral("^GSPC", session, "PREVIOUS_SESSION_NOT_CONFIRMED")
+    base = dt.datetime(2026, 9, 30, tzinfo=UTC)
+    store.record_deferral("^GSPC", session, "PREVIOUS_SESSION_NOT_CONFIRMED",
+                          now=base)
 
     assert [r.status for r in store.all_rows()] == [DEFERRED]
 
@@ -239,16 +241,18 @@ def test_d2_recovery_resolves_and_is_idempotent(m, monkeypatch):
         return [{"date": session, "symbol": symbol, "close": 5000.0}]
 
     prior = lambda e, s, a, b: {D(2026, 9, 22)}   # prior session confirmed
+    # Phase A.2B: retry after the transient backoff window has elapsed.
+    retry_now = base + dt.timedelta(hours=1, seconds=1)
     result = m.run_deferred_recovery(
         FakeEngine(), store, fetch_symbol_rows=fetch,
-        now_utc=dt.datetime(2026, 9, 30, tzinfo=UTC), prior_lookup=prior)
+        now_utc=retry_now, prior_lookup=prior)
     assert result["resolved"] == 1
     assert [r.status for r in store.all_rows()] == [RESOLVED]
 
     # Second retry: a RESOLVED row is not a due candidate -> idempotent.
     result2 = m.run_deferred_recovery(
         FakeEngine(), store, fetch_symbol_rows=fetch,
-        now_utc=dt.datetime(2026, 9, 30, tzinfo=UTC), prior_lookup=prior)
+        now_utc=retry_now, prior_lookup=prior)
     assert result2["retried"] == 0
     assert len(store.all_rows()) == 1
 
@@ -260,14 +264,17 @@ def test_d2_unresolved_case_persists_and_escalates(m):
 
     store = MemoryDeferredStore()
     session = D(2026, 9, 23)
-    store.record_deferral("^GSPC", session, "PREVIOUS_SESSION_NOT_CONFIRMED")
+    base = dt.datetime(2026, 9, 30, tzinfo=UTC)
+    store.record_deferral("^GSPC", session, "PREVIOUS_SESSION_NOT_CONFIRMED",
+                          now=base)
 
     def fetch_nothing(symbol, dates):
         return []
 
+    # Phase A.2B: retry after the transient backoff window has elapsed.
     result = m.run_deferred_recovery(
         FakeEngine(), store, fetch_symbol_rows=fetch_nothing,
-        now_utc=dt.datetime(2026, 9, 30, tzinfo=UTC))
+        now_utc=base + dt.timedelta(hours=1, seconds=1))
     assert result["still_deferred"] == 1
     assert [r.status for r in store.all_rows()] == ["DEFERRED"]
 

@@ -392,9 +392,10 @@ def test_t_rec_1_successful_recovery_and_idempotency():
                  "volume": 1000, "prev_close": 7764.6401, "change": -58.6401,
                  "pct_chg": -0.7552, "amplitude": 0.0258}]
 
-    # Batch too small to matter here; force small window so the row is due.
+    # Phase A.2B: a transient deferral is retried after its backoff window.
+    retry_now = now + dt.timedelta(hours=1, seconds=1)
     result = m.run_deferred_recovery(eng, store, fetch_symbol_rows=fetch,
-                                     now_utc=now, recovery_days=RECOVERY_DAYS,
+                                     now_utc=retry_now, recovery_days=RECOVERY_DAYS,
                                      prior_lookup=_no_prior,
                                      prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
         provenance_lookup=_provenance_lookup_fn())
@@ -403,7 +404,7 @@ def test_t_rec_1_successful_recovery_and_idempotency():
 
     # Idempotent retry: a resolved row is no longer a candidate.
     result2 = m.run_deferred_recovery(eng, store, fetch_symbol_rows=fetch,
-                                      now_utc=now, prior_lookup=_no_prior,
+                                      now_utc=retry_now, prior_lookup=_no_prior,
                                       prior_value_lookup=lambda *a, **k: {dt.date(2026, 9, 22): 7764.6401},
         provenance_lookup=_provenance_lookup_fn())
     assert result2["retried"] == 0
@@ -442,7 +443,9 @@ def test_deferred_rows_survive_beyond_five_day_lookback():
     now = dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc)   # 20 days later
 
     store.record_deferral("^GSPC", d, "PREVIOUS_SESSION_NOT_CONFIRMED", now=now)
-    due = store.due_candidates(now=now, recovery_days=RECOVERY_DAYS)
+    # Phase A.2B: transient deferrals are retried after their backoff window.
+    due = store.due_candidates(now=now + dt.timedelta(hours=1, seconds=1),
+                               recovery_days=RECOVERY_DAYS)
     assert len(due) == 1, "a 20-day-old deferral must still be retried"
 
     # But beyond the horizon it is no longer retried (still retained).
@@ -458,8 +461,11 @@ def test_recovery_batch_is_bounded():
     now = dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc)
     for i in range(120):
         store.record_deferral("^GSPC", dt.date(2026, 9, 1) + dt.timedelta(days=i),
-                              "X", now=now)
-    due = store.due_candidates(now=now, limit=50)
+                              "PREVIOUS_SESSION_NOT_CONFIRMED", now=now)
+    # Phase A.2B: retry after the transient backoff window; the batch is still
+    # capped at `limit` so an hourly run never becomes a full backfill.
+    due = store.due_candidates(now=now + dt.timedelta(hours=1, seconds=1),
+                               limit=50)
     assert len(due) == 50, "hourly runs must never become a full backfill"
 
 

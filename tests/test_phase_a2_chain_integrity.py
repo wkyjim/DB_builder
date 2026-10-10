@@ -385,7 +385,10 @@ class TestA2_8_RecoveryOrder:
         store.record_deferral(SYMBOL, D, "PREVIOUS_SESSION_NOT_CONFIRMED", now=now)
         store.record_deferral(SYMBOL, P, "PREVIOUS_SESSION_NOT_CONFIRMED", now=now)
 
-        cands = store.due_candidates(now=now)
+        # Phase A.2B: transient failures are subject to backoff, so both rows
+        # are eligible again only after the backoff window elapses.
+        later = now + dt.timedelta(hours=1, seconds=1)
+        cands = store.due_candidates(now=later)
         order = [c.session_date for c in cands]
         assert order == sorted(order), "recovery must be chronological"
         assert order.index(P) < order.index(D), "P must be retried before D"
