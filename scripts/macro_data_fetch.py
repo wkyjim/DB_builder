@@ -49,6 +49,7 @@ from db_builder.retry_policy import (
     RETRY_ELIGIBLE,
     BACKOFF_ACTIVE,
     MANUAL_REVIEW_REQUIRED,
+    PROVENANCE_UNVERIFIED,
 )
 from db_builder.reconciliation import (
     AUTO_CORRECT_SYMBOLS,
@@ -142,6 +143,53 @@ def _resolve_trust_start(symbol: str, source_definition: str):
     if isinstance(val, _date):
         return val
     return _date.fromisoformat(val)
+
+
+def _stored_trusted_provenance_dates(
+    engine,
+    symbol: str,
+    source_definition: str,
+    min_date,
+    max_date,
+) -> set:
+    """ANCHOR_DERIVED_PROVENANCE: dates with verified same-definition provenance.
+
+    Backed by SOURCE_DEFINITION_TRUST_START. Returns stored dates that satisfy
+    the anchor boundary. Only explicit (symbol, source_definition) entries
+    qualify. No family inheritance. No DB source-definition column assumed.
+
+    If max_date is None, the query returns all stored dates >= effective_min.
+    """
+    from datetime import date as _date
+
+    trust_start = _resolve_trust_start(symbol, source_definition)
+    if trust_start is None:
+        return set()
+    effective_min = max(trust_start, min_date) if min_date is not None else trust_start
+    if max_date is not None:
+        if effective_min > max_date:
+            return set()
+        sql = text(
+            "SELECT date FROM public.macro "
+            "WHERE symbol = :symbol AND date >= :effective_min AND date <= :max_date"
+        )
+        params = {
+            "symbol": symbol,
+            "effective_min": effective_min,
+            "max_date": max_date,
+        }
+    else:
+        sql = text(
+            "SELECT date FROM public.macro "
+            "WHERE symbol = :symbol AND date >= :effective_min"
+        )
+        params = {"symbol": symbol, "effective_min": effective_min}
+    try:
+        with engine.begin() as conn:
+            df = pd.read_sql(sql, conn, params=params)
+    except Exception:
+        return set()
+    return {pd.to_datetime(v).date() for v in df["date"]}
 
 
 # Phase A safety telemetry: populated by the EOD gate and consumed by the
@@ -1097,7 +1145,7 @@ def route_historical_rows(engine, rows, *, mode="INGEST",
             try:
                 deferred_store.record_deferral(
                     rec["symbol"], pd.to_datetime(rec["date"]).date(), reason,
-                    now=now_utc)
+                    now=now_utc, attempted=False)
             except Exception as exc:
                 print(f"[DEFERRED WARN] could not persist deferral "
                       f"{rec['symbol']} {rec['date']}: {exc}")
@@ -1166,12 +1214,63 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
             print(f"[DEFERRED BACKOFF] provider state read failed: "
                   f"{type(exc).__name__}: {exc}")
 
+    # Phase C.2: Build anchor override closure for anchor-covered PU rows.
+    # Pre-compute provenance evidence to avoid N+1 SQL in selector callbacks.
+    _pu_rows = [r for r in store.all_rows()
+                if r.retry_class == PROVENANCE_UNVERIFIED
+                and r.status != "RESOLVED"]
+    _anchor_eligibility = {}
+    for _r in _pu_rows:
+        _sym = _r.symbol
+        _sd = SOURCE_DEFINITION_BY_SYMBOL.get(_sym)
+        _key = (_sym, _r.session_date)
+        if _sd is None:
+            _anchor_eligibility[_key] = False
+            continue
+        _ts = _resolve_trust_start(_sym, _sd)
+        if _ts is None:
+            _anchor_eligibility[_key] = False
+            continue
+        if _r.session_date < _ts:
+            _anchor_eligibility[_key] = False
+            continue
+        # Resolve expected P using canonical session logic
+        _expected_p = previous_valid_observation_date(_sym, _r.session_date, _sd)
+        if _expected_p is None:
+            _anchor_eligibility[_key] = False
+            continue
+        if _expected_p < _ts:
+            _anchor_eligibility[_key] = False
+            continue
+        # Check stored trusted P
+        _min_d = _r.session_date - timedelta(days=10)
+        _trusted_dates = _stored_trusted_provenance_dates(
+            engine, _sym, _sd, _min_d, _r.session_date)
+        if _expected_p not in _trusted_dates:
+            _anchor_eligibility[_key] = False
+            continue
+        _anchor_eligibility[_key] = True
+
+    def _anchor_override(row):
+        """Return True only for exact C.1 anchor-covered PU rows with trusted P."""
+        if getattr(row, "retry_class", None) != PROVENANCE_UNVERIFIED:
+            return False
+        return _anchor_eligibility.get((row.symbol, row.session_date), False)
+
+    # Phase C.2: Build provenance_lookup closure backed by anchor-derived provenance
+    def _provenance_lookup_fn(sym, min_d, max_d):
+        sd = SOURCE_DEFINITION_BY_SYMBOL.get(sym)
+        if sd is None:
+            return set()
+        return _stored_trusted_provenance_dates(engine, sym, sd, min_d, max_d)
+
     candidates = store.due_candidates(now=now, limit=limit,
                                       recovery_days=recovery_days,
                                       provider_available=(
                                           None if not unavailable_keys
                                           else not unavailable_keys),
-                                      unavailable_keys=unavailable_keys)
+                                      unavailable_keys=unavailable_keys,
+                                      anchor_override=_anchor_override)
     if not candidates:
         # Still run escalation: rows past the horizon / attempt limit must be
         # flagged even when nothing is retried this cycle.

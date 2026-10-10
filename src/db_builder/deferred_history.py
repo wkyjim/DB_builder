@@ -183,14 +183,15 @@ class MemoryDeferredStore(DeferredStore):
 
     def due_candidates(self, now=None, limit=RECOVERY_BATCH,
                        recovery_days=RECOVERY_DAYS, *, provider_available=None,
-                       unavailable_keys=None):
+                       unavailable_keys=None, anchor_override=None):
         now = now or dt.datetime.now(dt.timezone.utc)
         cutoff = now.date() - dt.timedelta(days=recovery_days)
         pool = [r for r in self._rows.values()
                 if r.status == DEFERRED and r.session_date >= cutoff]
         eligible = _rp.filter_eligible(pool, now,
                                        provider_available=provider_available,
-                                       unavailable_keys=unavailable_keys)
+                                       unavailable_keys=unavailable_keys,
+                                       anchor_override=anchor_override)
         return eligible[:limit]
 
     def all_rows(self):
@@ -351,12 +352,16 @@ class SqlDeferredStore(DeferredStore):
 
     def due_candidates(self, now=None, limit=RECOVERY_BATCH,
                        recovery_days=RECOVERY_DAYS, *, provider_available=None,
-                       unavailable_keys=None):
+                       unavailable_keys=None, anchor_override=None):
         """Rows eligible for a recovery attempt this cycle.
 
         The provider/class/time/dependency gates are applied in Python via the
         shared retry policy so memory and SQL stores cannot diverge. Only
         non-RESOLVED rows within the retention horizon are loaded.
+
+        Phase C.2: ``anchor_override`` is forwarded to ``filter_eligible``
+        so that anchor-covered PU rows can be runtime-eligible without
+        changing persisted state.
         """
         from sqlalchemy import text
         now = now or dt.datetime.now(dt.timezone.utc)
@@ -371,7 +376,8 @@ class SqlDeferredStore(DeferredStore):
         pool = [self._to_row(r) for r in rows]
         eligible = _rp.filter_eligible(pool, now,
                                        provider_available=provider_available,
-                                       unavailable_keys=unavailable_keys)
+                                       unavailable_keys=unavailable_keys,
+                                       anchor_override=anchor_override)
         return eligible[:limit]
 
     def all_rows(self):

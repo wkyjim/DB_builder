@@ -373,11 +373,23 @@ def _time_gate_open(row, now: dt.datetime) -> bool:
 
 
 def is_retry_eligible(row, now: dt.datetime, *,
-                      provider_available: Optional[bool] = None) -> bool:
+                      provider_available: Optional[bool] = None,
+                      anchor_override=None) -> bool:
     """Whether this single row may be *fetched* this cycle.
 
     This says nothing about writability -- the historical gate decides that
     independently and may still defer or reject a successfully fetched row.
+
+    ``anchor_override`` is a callable(row) -> bool supplied ONLY by
+    Phase C.2 deferred recovery. It returns True only when:
+      - effective_class(row) == PROVENANCE_UNVERIFIED
+      - exact (symbol, source_definition) exists in SOURCE_DEFINITION_TRUST_START
+      - D >= trust_start
+      - expected P exists and P >= trust_start
+      - stored P qualifies as anchor-derived provenance
+
+    Default behavior (anchor_override=None) is unchanged:
+    PROVENANCE_UNVERIFIED remains non-retryable.
     """
     if getattr(row, "status", None) == STATUS_RESOLVED:
         return False
@@ -392,6 +404,10 @@ def is_retry_eligible(row, now: dt.datetime, *,
             return True
         return False
     if cls in CONDITION_TRIGGERED_CLASSES:
+        # Phase C.2: narrow-scope anchor override — ONLY for PROVENANCE_UNVERIFIED
+        if cls == PROVENANCE_UNVERIFIED and anchor_override is not None \
+                and anchor_override(row):
+            return True  # Immediately due — no time gate
         return False
     if cls == RETRY_ELIGIBLE:
         return True
@@ -400,7 +416,8 @@ def is_retry_eligible(row, now: dt.datetime, *,
     return False
 
 
-def blocked_prerequisites(rows: Sequence, now: Optional[dt.datetime] = None
+def blocked_prerequisites(rows: Sequence, now: Optional[dt.datetime] = None,
+                          *, anchor_override=None
                           ) -> Set[Tuple[str, dt.date]]:
     """(symbol, session_date) keys of rows that are blocking this cycle.
 
@@ -409,6 +426,10 @@ def blocked_prerequisites(rows: Sequence, now: Optional[dt.datetime] = None
       * structural / frozen / manual / provider / defect classes block
         unconditionally;
       * a BACKOFF_ACTIVE row blocks only while its backoff has not elapsed.
+
+    Phase C.2: if ``anchor_override`` is supplied and returns True for a
+    CONDITION_TRIGGERED row, that row does NOT block dependents (it is
+    runtime-eligible).
     """
     out: Set[Tuple[str, dt.date]] = set()
     for r in rows:
@@ -416,6 +437,10 @@ def blocked_prerequisites(rows: Sequence, now: Optional[dt.datetime] = None
             continue
         cls = effective_class(r)
         if cls in CONDITION_TRIGGERED_CLASSES:
+            # Phase C.2: if anchor_override says this row is runtime-eligible,
+            # it does NOT block dependents
+            if anchor_override is not None and anchor_override(r):
+                continue
             out.add((getattr(r, "symbol", None), getattr(r, "session_date", None)))
         elif cls == BACKOFF_ACTIVE:
             if now is None or not _time_gate_open(r, now):
@@ -436,7 +461,8 @@ def has_blocked_prerequisite(symbol: str, session_date: dt.date,
 
 def filter_eligible(rows: Sequence, now: dt.datetime, *,
                     provider_available: Optional[bool] = None,
-                    unavailable_keys: Optional[Set[Tuple[str, str]]] = None) -> List:
+                    unavailable_keys: Optional[Set[Tuple[str, str]]] = None,
+                    anchor_override=None) -> List:
     """Rows eligible for a recovery attempt this cycle, dependency-ordered.
 
     Applies, in order:
@@ -445,8 +471,12 @@ def filter_eligible(rows: Sequence, now: dt.datetime, *,
       3. time gate       -- next_retry_at must have elapsed
       4. dependency gate -- D suppressed while an earlier same-symbol row
                             is blocked (never hammer D when P cannot resolve)
+
+    Phase C.2: ``anchor_override`` is forwarded to ``blocked_prerequisites``
+    and ``is_retry_eligible`` so that anchor-covered PU rows can be
+    runtime-eligible without changing persisted state.
     """
-    blocked = blocked_prerequisites(rows, now)
+    blocked = blocked_prerequisites(rows, now, anchor_override=anchor_override)
     out = []
     for r in rows:
         sym = getattr(r, "symbol", None)
@@ -454,7 +484,8 @@ def filter_eligible(rows: Sequence, now: dt.datetime, *,
             if provider_key(sym) in unavailable_keys:
                 continue
         if not is_retry_eligible(r, now,
-                                 provider_available=provider_available):
+                                 provider_available=provider_available,
+                                 anchor_override=anchor_override):
             continue
         if has_blocked_prerequisite(sym, getattr(r, "session_date", None),
                                     blocked):
