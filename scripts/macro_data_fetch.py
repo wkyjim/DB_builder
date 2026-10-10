@@ -192,6 +192,34 @@ def _stored_trusted_provenance_dates(
     return {pd.to_datetime(v).date() for v in df["date"]}
 
 
+def _build_anchor_provenance_lookup(engine):
+    """Return the canonical C.2 anchor-derived provenance resolver.
+
+    This is the SINGLE shared trust resolver consumed by deferred recovery.
+    It satisfies the ``route_historical_rows`` callback contract exactly::
+
+        provenance_lookup(engine, symbol, min_date, max_date) -> set[date]
+
+    Semantics are ANCHOR_DERIVED_PROVENANCE: trust comes from the immutable
+    C.1 ``(symbol, source_definition)`` anchor mapping, NOT from a DB-verified
+    source-definition column (``public.macro`` has none). The ``engine``
+    argument supplied by the gate is ignored in favour of the captured engine
+    so the resolver stays bound to the recovery engine it was built for.
+
+    Symbols without an explicit C.1 anchor resolve to the empty set, so the
+    provenance gate keeps failing closed for them (no family inheritance).
+    """
+
+    def _resolver(_engine, symbol, min_date, max_date):
+        source_definition = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+        if source_definition is None:
+            return set()
+        return _stored_trusted_provenance_dates(
+            engine, symbol, source_definition, min_date, max_date)
+
+    return _resolver
+
+
 # Phase A safety telemetry: populated by the EOD gate and consumed by the
 # exit-code/alert path so a calendar failure raises an explicit alert instead
 # of exiting 0 (coverage measures fetch success, not gate eligibility).
@@ -1198,8 +1226,11 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
       * deferred retry state   -- decides whether THIS item is retry-eligible;
       * historical gate        -- independently decides whether data may write.
 
-    The retry layer only ever SUPPRESSES fetches. ``attempt_count`` increments
-    only on a real fetch attempt, so structural/frozen items stop churning.
+    ``provenance_lookup`` is an OPTIONAL injection point used by tests. When it
+    is None (the production calling convention) the recovery path supplies the
+    shared C.1 anchor-derived resolver internally, so provenance is never
+    silently unknown. Precedence is explicit: an injected resolver wins;
+    otherwise the anchor-derived resolver is used.
     """
     now = now_utc or datetime.now(ZoneInfo("UTC"))
 
@@ -1213,6 +1244,16 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
         except Exception as exc:
             print(f"[DEFERRED BACKOFF] provider state read failed: "
                   f"{type(exc).__name__}: {exc}")
+
+    # Phase C.2: the canonical anchor-derived provenance resolver. An explicit
+    # ``provenance_lookup`` (test injection) takes precedence; otherwise the
+    # recovery path uses the shared C.1 anchor-derived resolver. There is only
+    # ever ONE provenance source, shared by the selector overlay and the write
+    # gate, so the selector can never release a row the gate then refuses.
+    _effective_provenance_lookup = (
+        provenance_lookup
+        if provenance_lookup is not None
+        else _build_anchor_provenance_lookup(engine))
 
     # Phase C.2: Build anchor override closure for anchor-covered PU rows.
     # Pre-compute provenance evidence to avoid N+1 SQL in selector callbacks.
@@ -1242,10 +1283,10 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
         if _expected_p < _ts:
             _anchor_eligibility[_key] = False
             continue
-        # Check stored trusted P
+        # Check stored trusted P through the SAME resolver the write gate uses.
         _min_d = _r.session_date - timedelta(days=10)
-        _trusted_dates = _stored_trusted_provenance_dates(
-            engine, _sym, _sd, _min_d, _r.session_date)
+        _trusted_dates = _effective_provenance_lookup(
+            engine, _sym, _min_d, _r.session_date)
         if _expected_p not in _trusted_dates:
             _anchor_eligibility[_key] = False
             continue
@@ -1256,13 +1297,6 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
         if getattr(row, "retry_class", None) != PROVENANCE_UNVERIFIED:
             return False
         return _anchor_eligibility.get((row.symbol, row.session_date), False)
-
-    # Phase C.2: Build provenance_lookup closure backed by anchor-derived provenance
-    def _provenance_lookup_fn(sym, min_d, max_d):
-        sd = SOURCE_DEFINITION_BY_SYMBOL.get(sym)
-        if sd is None:
-            return set()
-        return _stored_trusted_provenance_dates(engine, sym, sd, min_d, max_d)
 
     candidates = store.due_candidates(now=now, limit=limit,
                                       recovery_days=recovery_days,
@@ -1336,7 +1370,7 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
         written = upsert_macro(engine, match, mode="INGEST",
                                prior_lookup=prior_lookup,
                                prior_value_lookup=prior_value_lookup,
-                               provenance_lookup=provenance_lookup,
+                               provenance_lookup=_effective_provenance_lookup,
                                trust_start=trust_start,
                                deferred_store=store)
         if written:
