@@ -358,6 +358,7 @@ class SqlDeferredStore(DeferredStore):
         shared retry policy so memory and SQL stores cannot diverge. Only
         non-RESOLVED rows within the retention horizon are loaded.
         """
+        from sqlalchemy import text
         now = now or dt.datetime.now(dt.timezone.utc)
         cutoff = now.date() - dt.timedelta(days=recovery_days)
         with self._engine.begin() as conn:
