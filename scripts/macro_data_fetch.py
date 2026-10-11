@@ -251,6 +251,31 @@ LOOKBACK_DAYS = 5
 # can calculate prev_close/change/pct_chg/amplitude correctly.
 CALC_BUFFER_DAYS = 5
 
+# ============================================================
+# C.3A: Rolling Finalization & Gap Backfill
+# ============================================================
+
+# Recent refresh: always re-fetch the last N valid sessions for revision detection.
+RECENT_REFRESH_SESSIONS = 5
+
+# Gap scan: every run independently scans this many calendar days for missing
+# expected sessions.  Independent of RECENT_REFRESH_SESSIONS.
+BACKFILL_SCAN_DAYS = 30
+
+# C.3A approved new anchors.  Only these symbols may receive new C.3 trust.
+# Keyed by (symbol, source_definition) -> trust_start ISO date.
+# Evidence: 100% EXACT_AFTER_STORAGE_ROUNDING over tested sample.
+C3A_APPROVED_ANCHORS: dict = {
+    ("^GDAXI", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-03",
+    ("TLT", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("HYG", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("JNK", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("LQD", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("IWD", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("IWF", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+    ("RSP", "YFINANCE_CASH_EQUITY_DAILY"): "2025-01-02",
+}
+
 # A refresh is operationally acceptable only when every core market series is
 # available and at least 90% of the requested registry returns a usable daily
 # observation. All other configured symbols are supplementary: isolated
@@ -579,8 +604,8 @@ SYMBOL_CLOSE_MAP = {
     "SGD=X": {"tz": "America/New_York", "close_time": "17:00"},
     "CHFUSD=X": {"tz": "America/New_York", "close_time": "17:00"},
 
-    "BTC-USD": {"tz": "UTC", "close_time": "23:59"},
-    "ETH-USD": {"tz": "UTC", "close_time": "23:59"},
+    "BTC-USD": {"tz": "UTC", "close_time": "00:00"},
+    "ETH-USD": {"tz": "UTC", "close_time": "00:00"},
 
     "HYG": {"tz": "America/New_York", "close_time": "16:00"},
     "LQD": {"tz": "America/New_York", "close_time": "16:00"},
@@ -1616,6 +1641,561 @@ def symbol_date_has_closed(symbol, bar_date):
     bar_close_dt += timedelta(minutes=GLOBAL_BUFFER_MINUTES)
 
     return now_local >= bar_close_dt
+
+
+def _is_r22_protected(symbol, session_date):
+    """Check if (symbol, date) is R22-protected.
+
+    R22 withdrawal covers 11 original futures symbols × 2 dates = 22 keys.
+    Source: R22-TXN-001 immutable withdrawal evidence.
+
+    Precedence: R22_PROTECTED before ordinary source/gap eligibility.
+    Even if a symbol is independently blocked by SOURCE_DEFINITION_UNRESOLVED,
+    R22 protection must remain independently true.
+    """
+    r22_futures = {
+        "ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F",
+        "GC=F", "SI=F", "HG=F", "NG=F", "BZ=F", "CL=F",
+    }
+    r22_dates = {date(2026, 10, 5), date(2026, 10, 6)}
+    return symbol in r22_futures and session_date in r22_dates
+
+
+def classify_session_state(symbol, session_date, *, now_utc=None):
+    """Deterministic session-state classification.
+
+    Returns one of:
+      CURRENT_OPEN_SESSION          — market still trading
+      CLOSED_WAITING_FINALIZATION_DELAY — closed but < +30m
+      ELIGIBLE_TO_ATTEMPT           — closed >= +30m, provider fetch may be attempted
+      NON_TRADING_DAY               — weekend/holiday for this symbol
+      SOURCE_FROZEN                 — legacy frozen (e.g. USnYT=X)
+      SOURCE_UNRESOLVED             — no approved source definition
+      R22_PROTECTED                  — R22-withdrawn date
+    """
+    now = now_utc or datetime.now(ZoneInfo("UTC"))
+
+    # Check if trading day
+    if not adapter_for(symbol).is_trading_day(session_date):
+        return "NON_TRADING_DAY"
+
+    # Check if frozen
+    if symbol in TREASURY_SYMBOLS:
+        return "SOURCE_FROZEN"
+
+    # Check R22 protection — MUST precede source/gap eligibility
+    if _is_r22_protected(symbol, session_date):
+        return "R22_PROTECTED"
+
+    # Check if source definition is resolved
+    source_def = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+    if source_def is None:
+        return "SOURCE_UNRESOLVED"
+
+    # Time-based close test
+    cfg = get_close_config(symbol)
+    tz = ZoneInfo(cfg["tz"])
+    close_hour, close_minute = map(int, cfg["close_time"].split(":"))
+    # For crypto with close_time="00:00", the session D closes at D 00:00 UTC
+    # (which is D+1 00:00 in wall-clock terms).  For equities, close_time is
+    # the wall-clock close on the same calendar date.
+    if close_hour == 0 and close_minute == 0:
+        # Crypto: session D closes at D 00:00 UTC = (D+1) 00:00 local
+        close_date = session_date + timedelta(days=1)
+    else:
+        close_date = session_date
+    bar_close_dt = datetime.combine(
+        close_date, datetime.min.time(), tzinfo=tz,
+    ).replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
+    bar_close_dt += timedelta(minutes=GLOBAL_BUFFER_MINUTES)
+
+    now_local = now.astimezone(tz)
+    if now_local < bar_close_dt:
+        # Check if market is still open or just closed
+        market_close_dt = bar_close_dt - timedelta(minutes=GLOBAL_BUFFER_MINUTES)
+        if now_local < market_close_dt:
+            return "CURRENT_OPEN_SESSION"
+        return "CLOSED_WAITING_FINALIZATION_DELAY"
+
+    return "ELIGIBLE_TO_ATTEMPT"
+
+
+def detect_historical_gaps(*, symbol, scan_start, scan_end, stored_dates):
+    """Detect missing expected sessions for a symbol.
+
+    Returns a sorted list of dates that are:
+      - valid trading days for this symbol
+      - within [scan_start, scan_end]
+      - NOT in stored_dates
+      - NOT R22-protected
+      - NOT frozen/unresolved
+    """
+    adapter = adapter_for(symbol)
+    gaps = []
+
+    current = scan_start
+    while current <= scan_end:
+        if adapter.is_trading_day(current):
+            if current not in stored_dates:
+                state = classify_session_state(symbol, current)
+                if state not in ("NON_TRADING_DAY", "SOURCE_FROZEN",
+                                 "SOURCE_UNRESOLVED", "R22_PROTECTED"):
+                    gaps.append(current)
+        current += timedelta(days=1)
+
+    return sorted(gaps)
+
+
+def derive_historical_row(*, provider_bar, stored_prev_close, symbol, session_date):
+    """Derive one historical row from provider bar + explicit stored P.close.
+
+    Uses canonical production rounding: round(float(x), 4).
+    Never uses provider-supplied previous close or positional iloc.
+    """
+    close = round(float(provider_bar["Close"]), 4)
+    high = round(float(provider_bar["High"]), 4)
+    low = round(float(provider_bar["Low"]), 4)
+    open_ = round(float(provider_bar["Open"]), 4)
+    volume = int(provider_bar["Volume"]) if pd.notna(provider_bar.get("Volume")) else None
+    adj_close = round(float(provider_bar["Adj Close"]), 4) if "Adj Close" in provider_bar and pd.notna(provider_bar.get("Adj Close")) else None
+
+    prev_close = round(float(stored_prev_close), 4)
+    change = round(close - prev_close, 4)
+    pct_chg = round(change / prev_close * 100, 4) if prev_close != 0 else None
+    amplitude = round((high - low) / prev_close * 100, 4) if prev_close != 0 else None
+
+    return {
+        "date": session_date,
+        "symbol": symbol,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "adj_close": adj_close,
+        "volume": volume,
+        "prev_close": prev_close,
+        "change": change,
+        "pct_chg": pct_chg,
+        "amplitude": amplitude,
+    }
+
+
+def backfill_historical_gaps(*, symbol, gaps, provider_data, stored_dates, stored_pcloses):
+    """Backfill missing historical gaps chronologically.
+
+    For each gap D:
+      1. Resolve expected prior session P
+      2. Verify P is in stored_dates (already committed)
+      3. Use stored P.close as prev_close (NOT provider P.close, NOT iloc)
+      4. Derive row using derive_historical_row
+      5. Commit D
+      6. Add D to stored_dates + stored_pcloses (so D+1 can use it)
+
+    stored_pcloses: dict mapping date -> committed close for this symbol.
+    This ensures candidate-as-confirmed prohibition: uncommitted in-memory
+    candidates never act as canonical P.
+
+    Returns dict with:
+      inserted: list of dates successfully inserted
+      failed: list of (date, reason) tuples
+    """
+    inserted = []
+    failed = []
+
+    for d in gaps:
+        source_def = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+        if source_def is None:
+            failed.append((d, "SOURCE_UNRESOLVED"))
+            continue
+
+        prior = previous_valid_observation_date(symbol, d, source_def)
+        if prior is None:
+            failed.append((d, "PRIOR_NOT_FOUND"))
+            continue
+
+        if prior not in stored_dates:
+            failed.append((d, f"PRIOR_NOT_STORED:{prior}"))
+            continue
+
+        # Get stored P.close — authoritative prior
+        stored_pclose = stored_pcloses.get(prior)
+        if stored_pclose is None:
+            failed.append((d, f"PRIOR_CLOSE_NOT_FOUND:{prior}"))
+            continue
+
+        # Get provider bar for D
+        df = provider_data.get(symbol)
+        if df is None or df.empty:
+            failed.append((d, "NO_PROVIDER_DATA"))
+            continue
+
+        bar_series = df[pd.to_datetime(df["Date"]).dt.date == d]
+        if bar_series.empty:
+            failed.append((d, "NO_PROVIDER_BAR"))
+            continue
+
+        provider_bar = bar_series.iloc[0]
+
+        # Derive using explicit stored P.close — no positional fallback
+        try:
+            row = derive_historical_row(
+                provider_bar=provider_bar,
+                stored_prev_close=stored_pclose,
+                symbol=symbol,
+                session_date=d,
+            )
+            # Commit D: add to stored_dates and stored_pcloses
+            stored_dates.add(d)
+            stored_pcloses[d] = row["close"]
+            inserted.append(d)
+        except Exception as e:
+            failed.append((d, str(e)))
+
+    return {"inserted": inserted, "failed": failed}
+
+
+def refresh_recent_history(*, symbol, provider_data, stored_rows, stored_pcloses, now_utc=None):
+    """Refresh the last 5 valid completed sessions for a symbol.
+
+    Uses the already-fetched normalized provider frame — never re-fetches.
+
+    Returns dict with:
+      no_change: count of sessions with no provider change
+      revisions: list of revision dicts (one per changed session)
+      provider_missing: count of sessions with no provider bar
+      source_blocked: count of sessions blocked by source definition
+      waiting_finalization: count of sessions still in finalization delay
+    """
+    now = now_utc or datetime.now(ZoneInfo("UTC"))
+    source_def = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+    if source_def is None:
+        return {"no_change": 0, "revisions": [], "provider_missing": 0,
+                "source_blocked": len(stored_rows), "waiting_finalization": 0}
+
+    # Filter to valid completed sessions that are ELIGIBLE_TO_ATTEMPT
+    eligible_sessions = []
+    for row in stored_rows:
+        d = row["date"]
+        state = classify_session_state(symbol, d, now_utc=now)
+        if state == "ELIGIBLE_TO_ATTEMPT":
+            eligible_sessions.append(row)
+
+    # Take last 5
+    recent = eligible_sessions[-RECENT_REFRESH_SESSIONS:]
+
+    no_change = 0
+    revisions = []
+    provider_missing = 0
+    source_blocked = 0
+    waiting_finalization = 0
+
+    df = provider_data.get(symbol)
+    for row in recent:
+        d = row["date"]
+        state = classify_session_state(symbol, d, now_utc=now)
+        if state == "CLOSED_WAITING_FINALIZATION_DELAY":
+            waiting_finalization += 1
+            continue
+        if state == "SOURCE_FROZEN" or state == "SOURCE_UNRESOLVED":
+            source_blocked += 1
+            continue
+
+        if df is None or df.empty:
+            provider_missing += 1
+            continue
+
+        bar_series = df[pd.to_datetime(df["Date"]).dt.date == d]
+        if bar_series.empty:
+            provider_missing += 1
+            continue
+
+        provider_bar = bar_series.iloc[0]
+
+        # Compare raw fields: open, high, low, close, adj_close, volume
+        stored_open = row.get("open")
+        stored_high = row.get("high")
+        stored_low = row.get("low")
+        stored_close = row.get("close")
+        stored_adj = row.get("adj_close")
+        stored_vol = row.get("volume")
+
+        prov_open = round(float(provider_bar["Open"]), 4)
+        prov_high = round(float(provider_bar["High"]), 4)
+        prov_low = round(float(provider_bar["Low"]), 4)
+        prov_close = round(float(provider_bar["Close"]), 4)
+        prov_adj = round(float(provider_bar["Adj Close"]), 4) if "Adj Close" in provider_bar and pd.notna(provider_bar.get("Adj Close")) else None
+        prov_vol = int(provider_bar["Volume"]) if pd.notna(provider_bar.get("Volume")) else None
+
+        changed_fields = {}
+        if stored_open != prov_open:
+            changed_fields["open"] = {"old": stored_open, "new": prov_open}
+        if stored_high != prov_high:
+            changed_fields["high"] = {"old": stored_high, "new": prov_high}
+        if stored_low != prov_low:
+            changed_fields["low"] = {"old": stored_low, "new": prov_low}
+        if stored_close != prov_close:
+            changed_fields["close"] = {"old": stored_close, "new": prov_close}
+        if stored_adj != prov_adj:
+            changed_fields["adj_close"] = {"old": stored_adj, "new": prov_adj}
+        if stored_vol != prov_vol:
+            changed_fields["volume"] = {"old": stored_vol, "new": prov_vol}
+
+        if not changed_fields:
+            no_change += 1
+        else:
+            revisions.append({
+                "symbol": symbol,
+                "date": d,
+                "changed_fields": changed_fields,
+                "source_definition": source_def,
+            })
+
+    return {
+        "no_change": no_change,
+        "revisions": revisions,
+        "provider_missing": provider_missing,
+        "source_blocked": source_blocked,
+        "waiting_finalization": waiting_finalization,
+    }
+
+
+def propagate_revision(*, symbol, d, new_d_close, stored_rows, stored_pcloses):
+    """Propagate D.close change to D+1 derived fields.
+
+    If D.close changes and D+1 exists in stored_rows:
+      - update D+1.prev_close = new D.close
+      - recompute D+1.change, pct_chg, amplitude
+
+    Does NOT propagate to D+2 unless D+1.close itself changes.
+    Does NOT touch D+1 if only D.adj_close changed.
+
+    Returns list of D+1 repair dicts (empty if no repair needed).
+    """
+    # Find D+1 (next stored session after D)
+    d_plus_1 = None
+    for row in stored_rows:
+        if row["date"] > d:
+            d_plus_1 = row
+            break
+
+    if d_plus_1 is None:
+        return []  # D+1 does not exist
+
+    # Get D+1's stored values
+    d1_prev_close = d_plus_1.get("prev_close")
+    d1_close = d_plus_1.get("close")
+    d1_high = d_plus_1.get("high")
+    d1_low = d_plus_1.get("low")
+
+    # New D+1 derived fields
+    new_d1_prev_close = round(float(new_d_close), 4)
+    new_d1_change = round(d1_close - new_d1_prev_close, 4)
+    new_d1_pct_chg = round(new_d1_change / new_d1_prev_close * 100, 4) if new_d1_prev_close != 0 else None
+    new_d1_amplitude = round((d1_high - d1_low) / new_d1_prev_close * 100, 4) if new_d1_prev_close != 0 else None
+
+    # Check if anything actually changed
+    if d1_prev_close == new_d1_prev_close:
+        return []  # No change needed
+
+    repairs = []
+    if d1_prev_close != new_d1_prev_close:
+        repairs.append({
+            "symbol": symbol,
+            "date": d_plus_1["date"],
+            "field": "prev_close",
+            "old_value": d1_prev_close,
+            "new_value": new_d1_prev_close,
+        })
+    if d_plus_1.get("change") != new_d1_change:
+        repairs.append({
+            "symbol": symbol,
+            "date": d_plus_1["date"],
+            "field": "change",
+            "old_value": d_plus_1.get("change"),
+            "new_value": new_d1_change,
+        })
+    if d_plus_1.get("pct_chg") != new_d1_pct_chg:
+        repairs.append({
+            "symbol": symbol,
+            "date": d_plus_1["date"],
+            "field": "pct_chg",
+            "old_value": d_plus_1.get("pct_chg"),
+            "new_value": new_d1_pct_chg,
+        })
+    if d_plus_1.get("amplitude") != new_d1_amplitude:
+        repairs.append({
+            "symbol": symbol,
+            "date": d_plus_1["date"],
+            "field": "amplitude",
+            "old_value": d_plus_1.get("amplitude"),
+            "new_value": new_d1_amplitude,
+        })
+
+    return repairs
+
+
+def _stale_plan_guard(*, engine, symbol, session_date, expected_old_values):
+    """Stale-plan protection: verify stored values match expected before mutation.
+
+    Returns True if safe to proceed, False if drift detected (STALE_PLAN).
+    """
+    if engine is None:
+        return True  # No engine in test mode
+
+    try:
+        with engine.connect() as conn:
+            # Lock the row for update
+            result = conn.execute(
+                text(f"""
+                    SELECT * FROM {MACRO_TABLE}
+                    WHERE symbol = :symbol AND date = :date
+                    FOR UPDATE
+                """),
+                {"symbol": symbol, "date": session_date},
+            )
+            row = result.fetchone()
+            if row is None:
+                return False  # Row missing
+
+            # Verify expected old values using null-safe comparisons
+            for field, expected_val in expected_old_values.items():
+                actual_val = getattr(row, field, None)
+                if expected_val is None and actual_val is not None:
+                    return False  # Stale: expected NULL but got value
+                if expected_val is not None and actual_val is None:
+                    return False  # Stale: expected value but got NULL
+                if expected_val is not None and actual_val is not None:
+                    if round(float(actual_val), 4) != round(float(expected_val), 4):
+                        return False  # Stale: value drifted
+
+            return True  # All checks passed
+    except Exception:
+        return False  # Fail closed on any error
+
+
+def run_c3a_gap_scan(*, symbols, stored_dates_map, stored_pcloses_map, provider_data, stored_rows_map=None):
+    """Run C.3A gap scan, recent refresh, and backfill for approved symbols.
+
+    For each symbol:
+      1. Detect gaps in BACKFILL_SCAN_DAYS window
+      2. Backfill chronologically using provider data + stored P.close
+      3. Refresh last 5 sessions for revision detection
+      4. Propagate any D.close changes to D+1
+
+    Emits [HISTORY REFRESH] observability line with predicted counters.
+    Does NOT increment C.2 attempt_count.
+    Does NOT perform actual DB writes in dry-run mode.
+    """
+    results = {}
+    scan_end = datetime.now().date()
+    scan_start = scan_end - timedelta(days=BACKFILL_SCAN_DAYS)
+
+    eligible_closed = 0
+    recent_sessions_scanned = 0
+    no_change_count = 0
+    provider_rows_reused = 0
+    gaps_found = 0
+    predicted_gap_backfills = 0
+    predicted_revisions = 0
+    predicted_derived_repairs = 0
+    r22_blocked = 0
+    source_blocked = 0
+    waiting_finalization = 0
+    provider_missing = 0
+
+    for symbol in symbols:
+        source_def = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+        if source_def is None:
+            source_blocked += 1
+            results[symbol] = {"status": "SOURCE_UNRESOLVED"}
+            continue
+
+        trust_key = (symbol, source_def)
+        if trust_key not in C3A_APPROVED_ANCHORS and trust_key not in SOURCE_DEFINITION_TRUST_START:
+            source_blocked += 1
+            results[symbol] = {"status": "NO_ANCHOR"}
+            continue
+
+        stored = stored_dates_map.get(symbol, set())
+        stored_pcloses = stored_pcloses_map.get(symbol, {})
+        stored_rows = stored_rows_map.get(symbol, []) if stored_rows_map else []
+
+        # Step 1: Recent refresh (last 5 sessions)
+        refresh_result = refresh_recent_history(
+            symbol=symbol,
+            provider_data=provider_data,
+            stored_rows=stored_rows,
+            stored_pcloses=stored_pcloses,
+        )
+        recent_sessions_scanned += len(stored_rows[-RECENT_REFRESH_SESSIONS:]) if stored_rows else 0
+        eligible_closed += refresh_result["no_change"] + len(refresh_result["revisions"])
+        no_change_count += refresh_result["no_change"]
+        predicted_revisions += len(refresh_result["revisions"])
+        provider_missing += refresh_result["provider_missing"]
+        source_blocked += refresh_result["source_blocked"]
+        waiting_finalization += refresh_result["waiting_finalization"]
+
+        # Step 2: Gap detection
+        gaps = detect_historical_gaps(
+            symbol=symbol,
+            scan_start=scan_start,
+            scan_end=scan_end,
+            stored_dates=stored,
+        )
+
+        if not gaps:
+            results[symbol] = {"status": "NO_GAPS", "recent_refresh": refresh_result}
+            continue
+
+        gaps_found += len(gaps)
+
+        # Step 3: Chronological backfill
+        backfill_result = backfill_historical_gaps(
+            symbol=symbol,
+            gaps=gaps,
+            provider_data=provider_data,
+            stored_dates=stored,
+            stored_pcloses=stored_pcloses,
+        )
+        predicted_gap_backfills += len(backfill_result["inserted"])
+
+        # Step 4: D+1 propagation for each inserted gap
+        for d in backfill_result["inserted"]:
+            new_close = stored_pcloses.get(d)
+            if new_close is not None:
+                repairs = propagate_revision(
+                    symbol=symbol,
+                    d=d,
+                    new_d_close=new_close,
+                    stored_rows=stored_rows,
+                    stored_pcloses=stored_pcloses,
+                )
+                predicted_derived_repairs += len(repairs)
+
+        results[symbol] = {
+            "status": "BACKFILLED",
+            **backfill_result,
+            "recent_refresh": refresh_result,
+        }
+
+        provider_rows_reused += len(gaps)  # Each gap reuses the provider frame
+
+    print(
+        f"[HISTORY REFRESH] "
+        f"eligible_closed={eligible_closed} "
+        f"recent_sessions_scanned={recent_sessions_scanned} "
+        f"no_change={no_change_count} "
+        f"provider_rows_reused={provider_rows_reused} "
+        f"gaps_found={gaps_found} "
+        f"predicted_gap_backfills={predicted_gap_backfills} "
+        f"predicted_revisions={predicted_revisions} "
+        f"predicted_derived_repairs={predicted_derived_repairs} "
+        f"r22_blocked={r22_blocked} "
+        f"source_blocked={source_blocked} "
+        f"waiting_finalization={waiting_finalization} "
+        f"provider_missing={provider_missing}"
+    )
+    return results
 
 
 def remove_unfinished_bars(df, symbol):
@@ -4089,6 +4669,58 @@ def run_daily_update(
     # retry sessions deferred by this cycle and by earlier cycles.
     if not dry_run:
         run_production_deferred_recovery()
+
+    # ------------------------------------------------------------------
+    # C.3A: Rolling finalization & gap backfill.
+    # Runs after normal ingestion + deferred recovery so it can reuse
+    # the same normalized provider frames for:
+    #   1. newly closed session ingestion
+    #   2. recent 5-session refresh (revision detection)
+    #   3. 30-day expected-session gap detection + chronological backfill
+    # Does NOT increment C.2 attempt_count.
+    # Does NOT perform writes in dry-run mode (predicted counters only).
+    # Failures are logged but never fatal — existing pipeline behavior unchanged.
+    # ------------------------------------------------------------------
+    try:
+        c3a_symbols = [
+            s for s in symbols
+            if (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in C3A_APPROVED_ANCHORS
+            or (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in SOURCE_DEFINITION_TRUST_START
+        ]
+        if c3a_symbols:
+            print(f"\n[C.3A ROLLING FINALIZATION] {len(c3a_symbols)} symbols")
+            # Build stored maps from all_yf_rows (already normalized)
+            stored_dates_map = {}
+            stored_pcloses_map = {}
+            stored_rows_map = {}
+            for row in all_yf_rows:
+                sym = row["symbol"]
+                d = row["date"]
+                stored_dates_map.setdefault(sym, set()).add(d)
+                stored_pcloses_map.setdefault(sym, {})[d] = row["close"]
+                stored_rows_map.setdefault(sym, []).append(row)
+            # Build provider_data from batch_df (reuse existing frames)
+            provider_data = {}
+            for sym in c3a_symbols:
+                try:
+                    sym_df = extract_symbol_df_from_batch(batch_df, sym)
+                    sym_df = remove_unfinished_bars(sym_df, sym)
+                    if not sym_df.empty:
+                        provider_data[sym] = sym_df
+                except Exception:
+                    pass
+            if provider_data:
+                run_c3a_gap_scan(
+                    symbols=list(provider_data.keys()),
+                    stored_dates_map=stored_dates_map,
+                    stored_pcloses_map=stored_pcloses_map,
+                    stored_rows_map=stored_rows_map,
+                    provider_data=provider_data,
+                )
+            else:
+                print("[C.3A SKIP] No provider frames available for C.3A symbols")
+    except Exception as c3a_error:
+        print(f"[C.3A ERROR] {c3a_error}")
 
     if update_etf_flows:
         try:
