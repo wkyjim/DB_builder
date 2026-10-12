@@ -2090,6 +2090,297 @@ def _stale_plan_guard(*, engine, symbol, session_date, expected_old_values):
         return False  # Fail closed on any error
 
 
+def run_eod_5session_refresh(
+    *,
+    symbols: list,
+    provider_data: dict,
+    now_utc=None,
+    dry_run: bool = False,
+    engine=None,
+    close_check=None,
+) -> dict:
+    """Run simplified EOD 5-session rolling refresh.
+
+    For each symbol:
+      1. Get latest 5 valid trading sessions from provider frame.
+      2. Only process sessions where now >= close+30.
+      3. Compare each eligible session against DB.
+      4. Missing → INSERT with P.close as prev_close.
+      5. Different → UPDATE raw fields, recompute derived.
+      6. If D.close changed → repair D+1.
+
+    Returns committed outcome counters (not predictions).
+    Does NOT use C2 attempt_count. Does NOT depend on deferred recovery.
+
+    ``engine`` and ``close_check`` are injectable for testing; production
+    callers omit them and get ``local_engine`` / ``symbol_date_has_closed``.
+    """
+    from datetime import timezone as _tz
+
+    now = now_utc or datetime.now(_tz.utc)
+    _engine = engine if engine is not None else local_engine
+    _closed = close_check if close_check is not None else symbol_date_has_closed
+
+    counters = {
+        "symbols_checked": 0,
+        "sessions_checked": 0,
+        "not_yet_finalized": 0,
+        "no_change": 0,
+        "rows_inserted": 0,
+        "rows_revised": 0,
+        "close_revisions": 0,
+        "open_revisions": 0,
+        "high_revisions": 0,
+        "low_revisions": 0,
+        "volume_revisions": 0,
+        "adj_close_revisions": 0,
+        "d1_repairs": 0,
+        "provider_missing": 0,
+        "source_blocked": 0,
+        "missing_close_time_mapping": 0,
+    }
+
+    for symbol in symbols:
+        # Check close-time mapping exists
+        if symbol not in SYMBOL_CLOSE_MAP:
+            counters["missing_close_time_mapping"] += 1
+            continue
+
+        # Check source definition / anchor
+        source_def = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+        if source_def is None:
+            counters["source_blocked"] += 1
+            continue
+
+        trust_key = (symbol, source_def)
+        if trust_key not in C3A_APPROVED_ANCHORS and trust_key not in SOURCE_DEFINITION_TRUST_START:
+            counters["source_blocked"] += 1
+            continue
+
+        counters["symbols_checked"] += 1
+
+        # Get provider frame
+        df = provider_data.get(symbol)
+        if df is None or df.empty:
+            counters["provider_missing"] += 1
+            continue
+
+        # Get the LATEST 5 valid trading sessions (frame may be ascending)
+        adapter = adapter_for(symbol)
+        all_valid = []
+        for d in df["Date"]:
+            d_date = pd.to_datetime(d).date()
+            if adapter.is_trading_day(d_date):
+                all_valid.append(d_date)
+
+        if not all_valid:
+            counters["provider_missing"] += 1
+            continue
+
+        # Deduplicate and take the latest 5, then sort oldest→newest for
+        # sequential processing (required: an uncommitted row must never be P).
+        valid_dates = sorted(set(all_valid))[-RECENT_REFRESH_SESSIONS:]
+
+        # Process each session
+        for d in valid_dates:
+            # Check close+30 eligibility
+            if not _closed(symbol, d):
+                counters["not_yet_finalized"] += 1
+                continue
+
+            counters["sessions_checked"] += 1
+
+            # Check R22 protection
+            if _is_r22_protected(symbol, d):
+                counters["source_blocked"] += 1
+                continue
+
+            # Get provider bar
+            bar = df[pd.to_datetime(df["Date"]).dt.date == d]
+            if bar.empty:
+                counters["provider_missing"] += 1
+                continue
+            bar = bar.iloc[0]
+
+            # Get stored P (previous valid session)
+            p = previous_valid_observation_date(symbol, d, source_def)
+
+            # Canonical normalization — the SAME function normal ingestion uses.
+            _n = canonical_normalize_daily_bar(bar)
+            open_, high, low = _n["open"], _n["high"], _n["low"]
+            close, adj_close, volume = _n["close"], _n["adj_close"], _n["volume"]
+
+            # Check DB
+            with _engine.begin() as conn:
+                row = conn.execute(
+                    text("SELECT * FROM public.macro WHERE symbol = :s AND date = :d"),
+                    {"s": symbol, "d": d},
+                ).fetchone()
+
+            if row is None:
+                # Missing → INSERT
+                if p is None:
+                    # No P available, cannot determine prev_close
+                    counters["source_blocked"] += 1
+                    continue
+
+                # Get stored P.close
+                with _engine.begin() as conn:
+                    p_row = conn.execute(
+                        text("SELECT close FROM public.macro WHERE symbol = :s AND date = :d"),
+                        {"s": symbol, "d": p},
+                    ).fetchone()
+
+                if p_row is None:
+                    counters["source_blocked"] += 1
+                    continue
+
+                p_close = float(p_row[0])
+                change = round_4(close - p_close)
+                pct_chg = round_4(change / p_close * 100) if p_close != 0 else None
+                amplitude = round_4((high - low) / p_close * 100) if p_close != 0 else None
+
+                if not dry_run:
+                    with _engine.begin() as conn:
+                        conn.execute(
+                            text("""
+                                INSERT INTO public.macro (date, symbol, open, high, low, close, adj_close, volume, prev_close, change, pct_chg, amplitude)
+                                VALUES (:d, :s, :o, :h, :l, :c, :ac, :v, :pc, :ch, :pct, :amp)
+                            """),
+                            {"d": d, "s": symbol, "o": open_, "h": high, "l": low, "c": close,
+                             "ac": adj_close, "v": volume, "pc": p_close, "ch": change,
+                             "pct": pct_chg, "amp": amplitude},
+                        )
+                counters["rows_inserted"] += 1
+
+            else:
+                # Existing → compare and update if different
+                stored_close = float(row.close)
+                stored_open = float(row.open) if row.open is not None else None
+                stored_high = float(row.high) if row.high is not None else None
+                stored_low = float(row.low) if row.low is not None else None
+                stored_adj = float(row.adj_close) if row.adj_close is not None else None
+                stored_vol = round_4(row.volume) if row.volume is not None else None
+
+                changed_fields = {}
+                if stored_open != open_:
+                    changed_fields["open"] = open_
+                if stored_high != high:
+                    changed_fields["high"] = high
+                if stored_low != low:
+                    changed_fields["low"] = low
+                if stored_close != close:
+                    changed_fields["close"] = close
+                if stored_adj != adj_close:
+                    changed_fields["adj_close"] = adj_close
+                if stored_vol != volume:
+                    changed_fields["volume"] = volume
+
+                if not changed_fields:
+                    counters["no_change"] += 1
+                    continue
+
+                close_changed = "close" in changed_fields
+                hl_changed = "high" in changed_fields or "low" in changed_fields
+
+                # Resolve P.close only when a derived field must be recomputed.
+                if close_changed or hl_changed:
+                    if p is not None:
+                        with _engine.begin() as conn:
+                            p_row = conn.execute(
+                                text("SELECT close FROM public.macro WHERE symbol = :s AND date = :d"),
+                                {"s": symbol, "d": p},
+                            ).fetchone()
+                        p_close = float(p_row[0]) if p_row else stored_close
+                    else:
+                        p_close = stored_close
+
+                    # Recompute only the fields affected by the revision.
+                    if close_changed:
+                        new_change = round_4(close - p_close)
+                        changed_fields["prev_close"] = p_close
+                        changed_fields["change"] = new_change
+                        changed_fields["pct_chg"] = (
+                            round_4(new_change / p_close * 100) if p_close != 0 else None
+                        )
+                    if close_changed or hl_changed:
+                        changed_fields["amplitude"] = (
+                            round_4((high - low) / p_close * 100) if p_close != 0 else None
+                        )
+
+                if not dry_run:
+                    set_clause = ", ".join(f"{k} = :{k}" for k in changed_fields)
+                    with _engine.begin() as conn:
+                        conn.execute(
+                            text(f"UPDATE public.macro SET {set_clause} WHERE symbol = :s AND date = :d"),
+                            {"s": symbol, "d": d, **changed_fields},
+                        )
+
+                counters["rows_revised"] += 1
+                if close_changed:
+                    counters["close_revisions"] += 1
+                for _f, _ck in (("open", "open_revisions"), ("high", "high_revisions"),
+                                ("low", "low_revisions"), ("volume", "volume_revisions"),
+                                ("adj_close", "adj_close_revisions")):
+                    if _f in changed_fields:
+                        counters[_ck] += 1
+
+                # D+1 repair only when D.close actually changed.
+                if close_changed:
+                    d1_candidates = [x for x in valid_dates if x > d]
+                    if d1_candidates:
+                        d1 = d1_candidates[0]
+                        # Check D+1 exists in DB
+                        with _engine.begin() as conn:
+                            d1_row = conn.execute(
+                                text("SELECT * FROM public.macro WHERE symbol = :s AND date = :d"),
+                                {"s": symbol, "d": d1},
+                            ).fetchone()
+                        if d1_row:
+                            d1_close = float(d1_row.close)
+                            d1_high = float(d1_row.high)
+                            d1_low = float(d1_row.low)
+                            d1_new_change = round_4(d1_close - close)
+                            d1_new_pct = round_4(d1_new_change / close * 100) if close != 0 else None
+                            d1_new_amp = round_4((d1_high - d1_low) / close * 100) if close != 0 else None
+
+                            if not dry_run:
+                                with _engine.begin() as conn:
+                                    conn.execute(
+                                        text("""
+                                            UPDATE public.macro
+                                            SET prev_close = :pc, change = :ch, pct_chg = :pct, amplitude = :amp
+                                            WHERE symbol = :s AND date = :d
+                                        """),
+                                        {"pc": close, "ch": d1_new_change, "pct": d1_new_pct,
+                                         "amp": d1_new_amp, "s": symbol, "d": d1},
+                                    )
+                            counters["d1_repairs"] += 1
+
+    # Print summary
+    print(
+        f"[DAILY HISTORY REFRESH] "
+        f"symbols_checked={counters['symbols_checked']} "
+        f"sessions_checked={counters['sessions_checked']} "
+        f"not_yet_finalized={counters['not_yet_finalized']} "
+        f"no_change={counters['no_change']} "
+        f"rows_inserted={counters['rows_inserted']} "
+        f"rows_revised={counters['rows_revised']} "
+        f"close_revisions={counters['close_revisions']} "
+        f"open_revisions={counters['open_revisions']} "
+        f"high_revisions={counters['high_revisions']} "
+        f"low_revisions={counters['low_revisions']} "
+        f"volume_revisions={counters['volume_revisions']} "
+        f"adj_close_revisions={counters['adj_close_revisions']} "
+        f"d1_repairs={counters['d1_repairs']} "
+        f"provider_missing={counters['provider_missing']} "
+        f"source_blocked={counters['source_blocked']} "
+        f"missing_close_time_mapping={counters['missing_close_time_mapping']}"
+    )
+
+    return counters
+
+
 def run_c3a_gap_scan(*, symbols, stored_dates_map, stored_pcloses_map, provider_data, stored_rows_map=None):
     """Run C.3A gap scan, recent refresh, and backfill for approved symbols.
 
@@ -2436,6 +2727,9 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
             if pd.notna(high) and pd.notna(low):
                 amplitude = ((high - low) / prev_close) * 100
 
+        # Single canonical normalization shared with the EOD 5-session refresh.
+        _norm = canonical_normalize_daily_bar(latest)
+
         rows.append({
             "date": latest_date,
             "symbol": symbol,
@@ -2443,12 +2737,12 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
             "asset_type": asset_type,
             "source_definition": source_definition
             or SOURCE_DEFINITION_BY_SYMBOL.get(symbol),
-            "open": round_4(open_price),
-            "high": round_4(high),
-            "low": round_4(low),
-            "close": round_4(close),
-            "adj_close": round_4(adj_close),
-            "volume": round_4(volume),
+            "open": _norm["open"],
+            "high": _norm["high"],
+            "low": _norm["low"],
+            "close": _norm["close"],
+            "adj_close": _norm["adj_close"],
+            "volume": _norm["volume"],
             "prev_close": round_4(prev_close),
             "change": round_4(change),
             "pct_chg": round_4(pct_chg),
@@ -2898,6 +3192,68 @@ def validate_fallback_observations(symbol_df):
     valid_rows["Date"] = dates.loc[valid_mask]
     valid_rows["Close"] = closes.loc[valid_mask]
     return valid_rows, len(valid_rows), valid_rows["Date"].max().date()
+
+
+def canonical_normalize_daily_bar(bar, *, source_definition=None):
+    """THE canonical daily-bar normalization for public.macro.
+
+    Both normal ingestion and the EOD 5-session refresh MUST call this so the
+    same provider frame always yields byte-identical field values.
+
+    Semantics (must reproduce existing intended production behavior):
+      - open/high/low/close/adj_close: ``round_4`` (Python round(float(x), 4))
+      - volume: ``round_4`` (public.macro.volume is numeric)
+    """
+    def _g(name):
+        try:
+            v = bar.get(name)
+        except Exception:
+            v = None
+        return v
+
+    def _num(v):
+        if v is None:
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except Exception:
+            pass
+        return round_4(v)
+
+    return {
+        "open": _num(_g("Open")),
+        "high": _num(_g("High")),
+        "low": _num(_g("Low")),
+        "close": _num(_g("Close")),
+        "adj_close": _num(_g("Adj Close")),
+        "volume": _num(_g("Volume")),
+    }
+
+
+def fetch_yfinance_daily_frame(symbols, *, start_date=None):
+    """THE canonical Yahoo daily-bar provider route for public.macro.
+
+    Both normal ingestion and the EOD 5-session refresh MUST fetch through this
+    function so a provider bar can never be seen differently by the two paths.
+
+    Delegates to ``download_recent_batch`` (the production route) and returns
+    per-symbol finished-bar frames keyed by symbol.
+    """
+    batch_df, target_start_date = download_recent_batch(list(symbols), start_date=start_date)
+    frames = {}
+    for sym in symbols:
+        try:
+            f = extract_symbol_df_from_batch(batch_df, sym)
+            if f is None or f.empty:
+                continue
+            f = remove_unfinished_bars(f, sym)
+            if f is None or f.empty:
+                continue
+            frames[sym] = f
+        except Exception:
+            continue
+    return frames, target_start_date
 
 
 def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_at=None):
@@ -4776,78 +5132,31 @@ def run_daily_update(
         run_production_deferred_recovery()
 
     # ------------------------------------------------------------------
-    # C.3A: Rolling finalization & gap backfill.
+    # Simplified EOD 5-Session Rolling Refresh.
     # Runs after normal ingestion + deferred recovery so it can reuse
-    # the same normalized provider frames for:
-    #   1. newly closed session ingestion
-    #   2. recent 5-session refresh (revision detection)
-    #   3. 30-day expected-session gap detection + chronological backfill
-    # Does NOT increment C.2 attempt_count.
-    # Does NOT perform writes in dry-run mode (predicted counters only).
+    # the same normalized provider frames.
+    # Directly owns DB mutation. Does NOT use C2 attempt_count.
     # Failures are logged but never fatal — existing pipeline behavior unchanged.
     # ------------------------------------------------------------------
     try:
-        c3a_symbols = [
+        eod_symbols = [
             s for s in symbols
             if (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in C3A_APPROVED_ANCHORS
             or (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in SOURCE_DEFINITION_TRUST_START
         ]
-        if c3a_symbols:
-            print(f"\n[C.3A ROLLING FINALIZATION] {len(c3a_symbols)} symbols")
-            # Build stored maps from DB query (actual committed state)
-            stored_dates_map = {}
-            stored_pcloses_map = {}
-            stored_rows_map = {}
-            
-            from datetime import date as _date, timedelta as _td
-            _c3a_scan_start = _date.today() - _td(days=BACKFILL_SCAN_DAYS + 7)
-            
-            try:
-                with local_engine.begin() as _conn:
-                    _sql = text(
-                        "SELECT date, symbol, close FROM public.macro "
-                        "WHERE symbol = ANY(:symbols) AND date >= :scan_start "
-                        "ORDER BY symbol, date"
-                    )
-                    _df = pd.read_sql(_sql, _conn, params={
-                        "symbols": c3a_symbols,
-                        "scan_start": _c3a_scan_start.isoformat(),
-                    })
-                for _, _row in _df.iterrows():
-                    _sym = _row["symbol"]
-                    _d = pd.to_datetime(_row["date"]).date()
-                    stored_dates_map.setdefault(_sym, set()).add(_d)
-                    stored_pcloses_map.setdefault(_sym, {})[_d] = float(_row["close"])
-                    stored_rows_map.setdefault(_sym, []).append({
-                        "symbol": _sym,
-                        "date": _d,
-                        "close": float(_row["close"]),
-                    })
-            except Exception as _c3a_db_err:
-                print(f"[C.3A DB QUERY ERROR] {_c3a_db_err}")
-            
-            # Build provider_data from batch_df (reuse existing frames)
-            provider_data = {}
-            for sym in c3a_symbols:
-                try:
-                    sym_df = extract_symbol_df_from_batch(batch_df, sym)
-                    sym_df = remove_unfinished_bars(sym_df, sym)
-                    if not sym_df.empty:
-                        provider_data[sym] = sym_df
-                except Exception:
-                    pass
+        if eod_symbols:
+            # Canonical provider route — the SAME fetch normal ingestion uses.
+            provider_data, _ = fetch_yfinance_daily_frame(eod_symbols)
             if provider_data:
-                run_c3a_gap_scan(
+                run_eod_5session_refresh(
                     symbols=list(provider_data.keys()),
-                    stored_dates_map=stored_dates_map,
-                    stored_pcloses_map=stored_pcloses_map,
-                    stored_rows_map=stored_rows_map,
                     provider_data=provider_data,
+                    dry_run=dry_run,
                 )
             else:
-                print("[C.3A SKIP] No provider frames available for C.3A symbols")
-    except Exception as c3a_error:
-        print(f"[C.3A ERROR] {c3a_error}")
+                print("[EOD REFRESH SKIP] No provider frames available")
+    except Exception as eod_error:
+        print(f"[EOD REFRESH ERROR] {eod_error}")
 
     if update_etf_flows:
         try:

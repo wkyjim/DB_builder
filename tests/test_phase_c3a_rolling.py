@@ -991,22 +991,22 @@ class TestC3AStalePlan:
 
 
 class TestC3AScheduledPathIntegration:
-    def test_run_daily_update_reaches_c3a(self):
-        """C3-69: Calling run_daily_update executes C.3A exactly once."""
+    def test_run_daily_update_reaches_eod_refresh(self):
+        """C3-69: Calling run_daily_update executes EOD refresh exactly once."""
         # This test verifies the call chain exists in the code
         import inspect
         from scripts.macro_data_fetch import run_daily_update
         source = inspect.getsource(run_daily_update)
-        assert "run_c3a_gap_scan" in source
-        assert "C.3A ROLLING FINALIZATION" in source
+        assert "run_eod_5session_refresh" in source
+        assert "Simplified EOD 5-Session Rolling Refresh" in source
 
-    def test_c3a_not_called_twice(self):
-        """C3-70: No duplicate C.3A execution in single run."""
+    def test_eod_refresh_not_called_twice(self):
+        """C3-70: No duplicate EOD refresh execution in single run."""
         import inspect
         from scripts.macro_data_fetch import run_daily_update
         source = inspect.getsource(run_daily_update)
-        # Count occurrences of run_c3a_gap_scan call (not def)
-        call_count = source.count("run_c3a_gap_scan(") - source.count("def run_c3a_gap_scan(")
+        # Count occurrences of run_eod_5session_refresh call (not def)
+        call_count = source.count("run_eod_5session_refresh(") - source.count("def run_eod_5session_refresh(")
         assert call_count == 1
 
 
