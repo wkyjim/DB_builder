@@ -1622,8 +1622,49 @@ def get_close_config(symbol):
     return SYMBOL_CLOSE_MAP[symbol]
 
 
-def symbol_date_has_closed(symbol, bar_date):
-    """Time-based close test for a bar date, plus Phase A trading-day validity.
+# 24/7 daily-session products. For these the daily bar labelled D spans
+# D 00:00:00 UTC -> D+1 00:00:00 UTC, so there is no exchange close to use as
+# the session boundary. The session boundary substitutes for the exchange close
+# and the global "close + 30 minutes" rule is preserved unchanged:
+#
+#     session_end(D)  = D+1 00:00:00 UTC
+#     EOD_ELIGIBLE(D) = D+1 00:30:00 UTC
+#
+# Consequently the current UTC calendar day's bar is never finalized.
+# Membership is derived from the existing source definition (no new schema).
+CRYPTO_24_7_SYMBOLS: frozenset = frozenset(
+    sym for sym, sd in SOURCE_DEFINITION_BY_SYMBOL.items()
+    if sd == "CRYPTO_24_7_DAILY"
+)
+
+
+def is_24_7_daily_session(symbol) -> bool:
+    """True when ``symbol`` trades 24/7 and uses the UTC daily-session boundary."""
+    return symbol in CRYPTO_24_7_SYMBOLS
+
+
+def session_end_utc(symbol, bar_date):
+    """Return the UTC instant at which the daily session labelled ``bar_date`` ends.
+
+    Exchange-traded products: ``bar_date`` at the configured exchange close.
+    CRYPTO_24_7_DAILY: ``bar_date + 1 day`` at 00:00 UTC.
+    """
+    cfg = get_close_config(symbol)
+
+    if is_24_7_daily_session(symbol):
+        return datetime.combine(
+            bar_date + timedelta(days=1), datetime.min.time(), tzinfo=ZoneInfo("UTC")
+        )
+
+    tz = ZoneInfo(cfg["tz"])
+    close_hour, close_minute = map(int, cfg["close_time"].split(":"))
+    return datetime.combine(
+        bar_date, datetime.min.time(), tzinfo=tz
+    ).replace(hour=close_hour, minute=close_minute, second=0, microsecond=0)
+
+
+def symbol_date_has_closed(symbol, bar_date, now=None):
+    """EOD eligibility test for a bar date: session end + 30 minutes, plus trading-day validity.
 
     H1: the original test was time-only, so a provider row labelled a holiday or
     weekend passed whenever ``now >= close_time``. A non-session date is now
@@ -1633,28 +1674,36 @@ def symbol_date_has_closed(symbol, bar_date):
     unavailable calendar returns False (defer), never True. It is deliberately
     NOT a weekday-only rule, because crypto trades weekends and Globex has a
     Sunday session.
+
+    24/7 products (``CRYPTO_24_7_DAILY``) use the UTC daily-session boundary in
+    place of an exchange close: session end is ``D+1 00:00 UTC`` and the bar
+    becomes eligible at ``D+1 00:30 UTC``. The global "session close + 30
+    minutes" rule is unchanged; only the session-end instant differs. The
+    current UTC calendar day's bar is therefore never finalized.
+
+    ``now`` is injectable for deterministic tests; production callers omit it
+    and get the current wall clock in the symbol's timezone.
     """
     cfg = get_close_config(symbol)
 
     if not adapter_for(symbol).is_trading_day(bar_date):
         return False
 
+    if is_24_7_daily_session(symbol):
+        # Compare in UTC so the decision is independent of the caller's clock.
+        current = now if now is not None else datetime.now(ZoneInfo("UTC"))
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=ZoneInfo("UTC"))
+        else:
+            current = current.astimezone(ZoneInfo("UTC"))
+        return current >= session_end_utc(symbol, bar_date) + timedelta(
+            minutes=GLOBAL_BUFFER_MINUTES
+        )
+
     tz = ZoneInfo(cfg["tz"])
-    now_local = datetime.now(tz)
+    now_local = now.astimezone(tz) if now is not None else datetime.now(tz)
 
-    close_hour, close_minute = map(int, cfg["close_time"].split(":"))
-
-    bar_close_dt = datetime.combine(
-        bar_date,
-        datetime.min.time(),
-        tzinfo=tz,
-    ).replace(
-        hour=close_hour,
-        minute=close_minute,
-        second=0,
-        microsecond=0,
-    )
-
+    bar_close_dt = session_end_utc(symbol, bar_date)
     bar_close_dt += timedelta(minutes=GLOBAL_BUFFER_MINUTES)
 
     return now_local >= bar_close_dt
@@ -2119,7 +2168,11 @@ def run_eod_5session_refresh(
 
     now = now_utc or datetime.now(_tz.utc)
     _engine = engine if engine is not None else local_engine
-    _closed = close_check if close_check is not None else symbol_date_has_closed
+    # One shared eligibility implementation. Production passes the same instant
+    # the refresh itself resolved, so ingestion and refresh cannot disagree.
+    _closed = close_check if close_check is not None else (
+        lambda sym, d: symbol_date_has_closed(sym, d, now)
+    )
 
     counters = {
         "symbols_checked": 0,
@@ -2594,7 +2647,13 @@ def run_c3a_gap_scan(*, symbols, stored_dates_map, stored_pcloses_map, provider_
     return results
 
 
-def remove_unfinished_bars(df, symbol):
+def remove_unfinished_bars(df, symbol, now=None):
+    """Drop provider bars whose daily session has not yet finalized.
+
+    Uses the single shared eligibility helper ``symbol_date_has_closed`` so that
+    normal ingestion and the EOD refresh always agree — including the 24/7
+    crypto session boundary.
+    """
     if df.empty:
         return df
 
@@ -2603,7 +2662,12 @@ def remove_unfinished_bars(df, symbol):
 
     for _, row in df.iterrows():
         bar_date = pd.to_datetime(row["Date"]).date()
-        keep_mask.append(symbol_date_has_closed(symbol, bar_date))
+        # Preserve the 2-argument call contract for existing callers/stubs;
+        # only pass an explicit instant when one was supplied.
+        if now is None:
+            keep_mask.append(symbol_date_has_closed(symbol, bar_date))
+        else:
+            keep_mask.append(symbol_date_has_closed(symbol, bar_date, now))
 
     return df[keep_mask].copy()
 

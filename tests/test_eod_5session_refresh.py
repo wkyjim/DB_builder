@@ -710,3 +710,154 @@ class TestNormalizationParity:
         c2 = run_eod_5session_refresh(symbols=["TLT"], provider_data={"TLT": frame},
                                       dry_run=False, engine=eng, close_check=ALWAYS_CLOSED)
         assert c2["rows_revised"] == 0
+
+
+# ============================================================
+# CRYPTO 24/7 DAILY-SESSION BOUNDARY TESTS (CRYPTO-EOD-1 .. 9)
+#
+# Convention: daily bar labelled D spans D 00:00:00 UTC -> D+1 00:00:00 UTC.
+#   session_end(D)   = D+1 00:00 UTC
+#   EOD_ELIGIBLE(D)  = D+1 00:30 UTC
+# The current UTC calendar day's bar must never be finalized.
+# ============================================================
+
+from datetime import timezone as _timezone
+
+
+def _closed_at(symbol, bar_date, instant):
+    """Ask the production helper with an explicit instant (no wall-clock)."""
+    return symbol_date_has_closed(symbol, bar_date, instant)
+
+
+# ---- CRYPTO-EOD-1 --------------------------------------------------------
+def test_crypto_eod_1_same_day_2359_not_finalized():
+    """D 23:59 UTC -> NOT FINALIZED."""
+    d = date(2026, 10, 12)
+    now = datetime(2026, 10, 12, 23, 59, tzinfo=_timezone.utc)
+    assert _closed_at("BTC-USD", d, now) is False
+    assert _closed_at("ETH-USD", d, now) is False
+
+
+# ---- CRYPTO-EOD-2 --------------------------------------------------------
+def test_crypto_eod_2_next_day_0000_waiting():
+    """D+1 00:00 UTC -> CLOSED_WAITING_FINALIZATION_DELAY."""
+    d = date(2026, 10, 12)
+    now = datetime(2026, 10, 13, 0, 0, tzinfo=_timezone.utc)
+    assert _closed_at("BTC-USD", d, now) is False
+    assert _closed_at("ETH-USD", d, now) is False
+
+
+# ---- CRYPTO-EOD-3 --------------------------------------------------------
+def test_crypto_eod_3_next_day_0029_59_waiting():
+    """D+1 00:29:59 UTC -> CLOSED_WAITING_FINALIZATION_DELAY."""
+    d = date(2026, 10, 12)
+    now = datetime(2026, 10, 13, 0, 29, 59, tzinfo=_timezone.utc)
+    assert _closed_at("BTC-USD", d, now) is False
+    assert _closed_at("ETH-USD", d, now) is False
+
+
+# ---- CRYPTO-EOD-4 --------------------------------------------------------
+def test_crypto_eod_4_next_day_0030_eligible():
+    """D+1 00:30:00 UTC -> ELIGIBLE."""
+    d = date(2026, 10, 12)
+    now = datetime(2026, 10, 13, 0, 30, 0, tzinfo=_timezone.utc)
+    assert _closed_at("BTC-USD", d, now) is True
+    assert _closed_at("ETH-USD", d, now) is True
+
+
+# ---- CRYPTO-EOD-5 --------------------------------------------------------
+def test_crypto_eod_5_remove_unfinished_bars_excludes_current_utc_day():
+    """Current UTC day's crypto bar must be removed by remove_unfinished_bars()."""
+    import scripts.macro_data_fetch as mdf
+    today = datetime.now(_timezone.utc).date()
+    df = pd.DataFrame({
+        "Date": pd.to_datetime([str(today - timedelta(days=2)),
+                                str(today - timedelta(days=1)),
+                                str(today)]),
+        "Open": [1.0, 2.0, 3.0], "High": [1.1, 2.1, 3.1],
+        "Low": [0.9, 1.9, 2.9], "Close": [1.0, 2.0, 3.0],
+        "Adj Close": [1.0, 2.0, 3.0], "Volume": [10, 20, 30],
+    })
+    kept = mdf.remove_unfinished_bars(df.copy(), "BTC-USD")
+    kept_dates = [pd.to_datetime(d).date() for d in kept["Date"]]
+    assert today not in kept_dates, "current UTC day must NOT be finalized"
+    assert (today - timedelta(days=1)) in kept_dates or (today - timedelta(days=2)) in kept_dates
+
+
+# ---- CRYPTO-EOD-6 --------------------------------------------------------
+def test_crypto_eod_6_eod_refresh_excludes_current_utc_day():
+    """The EOD refresh must not write the still-open current UTC crypto day."""
+    today = datetime.now(_timezone.utc).date()
+    prev = today - timedelta(days=1)
+    df = pd.DataFrame({
+        "Date": pd.to_datetime([str(prev - timedelta(days=1)), str(prev), str(today)]),
+        "Open": [100.0, 101.0, 102.0], "High": [101.0, 102.0, 103.0],
+        "Low": [99.0, 100.0, 101.0], "Close": [100.5, 101.5, 102.5],
+        "Adj Close": [100.5, 101.5, 102.5], "Volume": [10, 20, 30],
+    })
+    eng = FakeEngine()
+    res = run_eod_5session_refresh(
+        symbols=["BTC-USD"], provider_data={"BTC-USD": df},
+        dry_run=False, engine=eng,
+    )
+    written = [k for k in eng.store if k[1] == str(today)]
+    assert written == [], f"current UTC day was written: {written}"
+    assert res["not_yet_finalized"] >= 1
+
+
+# ---- CRYPTO-EOD-7 --------------------------------------------------------
+def test_crypto_eod_7_previous_utc_day_eligible_only_after_plus_30m():
+    """Previous UTC day becomes eligible only at its own +30m boundary."""
+    d = date(2026, 10, 11)
+    assert _closed_at("BTC-USD", d, datetime(2026, 10, 12, 0, 29, tzinfo=_timezone.utc)) is False
+    assert _closed_at("BTC-USD", d, datetime(2026, 10, 12, 0, 30, tzinfo=_timezone.utc)) is True
+
+
+# ---- CRYPTO-EOD-8 --------------------------------------------------------
+def test_crypto_eod_8_ingestion_and_refresh_share_eligibility():
+    """Normal ingestion and EOD refresh must make the SAME eligibility decision."""
+    import scripts.macro_data_fetch as mdf
+    for sym in ("BTC-USD", "ETH-USD"):
+        for bar_date, instant, expected in (
+            (date(2026, 10, 12), datetime(2026, 10, 12, 23, 59, tzinfo=_timezone.utc), False),
+            (date(2026, 10, 12), datetime(2026, 10, 13, 0, 0, tzinfo=_timezone.utc), False),
+            (date(2026, 10, 12), datetime(2026, 10, 13, 0, 29, 59, tzinfo=_timezone.utc), False),
+            (date(2026, 10, 12), datetime(2026, 10, 13, 0, 30, 0, tzinfo=_timezone.utc), True),
+        ):
+            one = mdf.symbol_date_has_closed(sym, bar_date, instant)
+            assert one is expected, f"{sym} {bar_date} {instant}: {one} != {expected}"
+        # remove_unfinished_bars is the ingestion-side consumer of the same helper
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(["2026-10-10", "2026-10-11", "2026-10-12"]),
+            "Open": [1.0, 2.0, 3.0], "High": [1.1, 2.1, 3.1],
+            "Low": [0.9, 1.9, 2.9], "Close": [1.0, 2.0, 3.0],
+            "Adj Close": [1.0, 2.0, 3.0], "Volume": [10, 20, 30],
+        })
+        kept = {pd.to_datetime(d).date() for d in mdf.remove_unfinished_bars(df.copy(), sym)["Date"]}
+        for bd in (date(2026, 10, 10), date(2026, 10, 11), date(2026, 10, 12)):
+            assert (bd in kept) == mdf.symbol_date_has_closed(sym, bd), (
+                f"ingestion/refresh disagree for {sym} {bd}")
+
+
+# ---- CRYPTO-EOD-9 --------------------------------------------------------
+def test_crypto_eod_9_second_identical_finalized_refresh_zero_writes():
+    """A second identical refresh over FINALIZED crypto bars writes nothing."""
+    # bars well in the past => all finalized
+    df = pd.DataFrame({
+        "Date": pd.to_datetime(["2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"]),
+        "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "High": [101.0, 102.0, 103.0, 104.0, 105.0],
+        "Low": [99.0, 100.0, 101.0, 102.0, 103.0],
+        "Close": [100.5, 101.5, 102.5, 103.5, 104.5],
+        "Adj Close": [100.5, 101.5, 102.5, 103.5, 104.5],
+        "Volume": [10, 20, 30, 40, 50],
+    })
+    eng = FakeEngine()
+    r1 = run_eod_5session_refresh(symbols=["BTC-USD"], provider_data={"BTC-USD": df.copy()},
+                                  dry_run=False, engine=eng)
+    r2 = run_eod_5session_refresh(symbols=["BTC-USD"], provider_data={"BTC-USD": df.copy()},
+                                  dry_run=False, engine=eng)
+    assert r2["rows_inserted"] == 0
+    assert r2["rows_revised"] == 0
+    assert r2["close_revisions"] == 0
+    assert r2["d1_repairs"] == 0
