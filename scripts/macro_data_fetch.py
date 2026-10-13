@@ -2631,7 +2631,7 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
     # In test mode (injected engine), use the injected engine consistently.
     if to_submit and not dry_run:
         try:
-            _write_neon = _neon if neon_engine_ is not None else neon_engine()
+            _write_neon = _neon if neon_engine_ is not None else make_neon_engine()
             with _write_neon.begin() as conn:
                 conn.execute(
                     text("""
@@ -2707,7 +2707,7 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
 
             # Fresh Neon engine for verification (not the sync engine)
             # In test mode, use the injected engine consistently.
-            _verify_neon = _neon if neon_engine_ is not None else neon_engine()
+            _verify_neon = _neon if neon_engine_ is not None else make_neon_engine()
             with _verify_neon.connect() as conn:
                 verify_neon_rows = conn.execute(
                     text("""
