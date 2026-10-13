@@ -44,7 +44,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from db_builder.config import local_engine  # noqa: E402
+from db_builder.config import local_engine, neon_engine  # noqa: E402
 from db_builder.trading_calendar import (  # noqa: E402
     NYSE,
     latest_completed_nyse_session_date,
@@ -69,6 +69,7 @@ class FreshnessRule:
     fail_days: int = 5
     is_critical: bool = False
     custom_query: str | None = None
+    engine_override: Any = None  # when set, check_rule uses this engine instead of the default
 
 
 @dataclass
@@ -299,16 +300,22 @@ FRESHNESS_RULES: list[FreshnessRule] = [
         is_critical=False,
         custom_query="SELECT MAX(snapshot_updated_at) FROM public.us_equities_short_analytics_latest",
     ),
+    # Neon macro convergence — queries NEON directly, not local.
+    # The old rule checked local sync_state.updated_at which only measures
+    # when the last sync job ran, not whether Neon actually has the data.
+    # This rule compares local MAX(date) vs Neon MAX(date) for the recent
+    # window, so a stale Neon is caught even when local is fresh.
     FreshnessRule(
-        name="Neon sync",
-        table="public.sync_state",
-        timestamp_field="updated_at",
-        is_date_not_timestamp=False,
+        name="Neon macro convergence",
+        table="public.macro",
+        timestamp_field="date",
+        is_date_not_timestamp=True,
         cadence="daily_nyse",
-        warn_days=2,
-        fail_days=5,
-        is_critical=False,
-        custom_query="SELECT MAX(updated_at) FROM public.sync_state",
+        warn_days=0,
+        fail_days=1,
+        is_critical=True,
+        custom_query=None,  # handled specially in check_rule via NeonConvergenceChecker
+        engine_override=None,
     ),
     FreshnessRule(
         name="Market report",
@@ -328,9 +335,147 @@ FRESHNESS_RULES: list[FreshnessRule] = [
 # ---------------------------------------------------------------------------
 
 
+def _check_neon_convergence(rule: FreshnessRule, engine) -> FreshnessResult:
+    """Check that Neon public.macro matches local public.macro for the recent window.
+
+    Queries BOTH local and Neon directly. The wrapper must NOT report full
+    freshness success when Neon is materially stale.
+
+    Compares:
+      - local latest finalized date for approved recent symbols
+      - Neon latest date for the same symbols
+      - count of (symbol,date) keys missing from Neon
+      - count of value mismatches (OHLCV + derived)
+    """
+    from scripts.macro_data_fetch import (
+        SOURCE_DEFINITION_BY_SYMBOL,
+        C3A_APPROVED_ANCHORS,
+        SOURCE_DEFINITION_TRUST_START,
+        RECENT_REFRESH_SESSIONS,
+    )
+
+    # Approved universe (same set the convergence sync targets)
+    approved = [
+        s for s in SOURCE_DEFINITION_BY_SYMBOL
+        if (s, SOURCE_DEFINITION_BY_SYMBOL[s]) in C3A_APPROVED_ANCHORS
+        or (s, SOURCE_DEFINITION_BY_SYMBOL[s]) in SOURCE_DEFINITION_TRUST_START
+    ]
+    if not approved:
+        return FreshnessResult(
+            rule_name=rule.name, table=rule.table, timestamp_field=rule.timestamp_field,
+            latest_value=None, lag_days=None, status="ERROR",
+            message="No approved symbols found for Neon convergence check",
+            is_critical=True,
+        )
+
+    try:
+        # Local: latest date per symbol
+        with engine.begin() as conn:
+            local_rows = conn.execute(text("""
+                SELECT symbol, MAX(date) AS latest_date
+                FROM public.macro
+                WHERE symbol = ANY(:symbols)
+                GROUP BY symbol
+            """), {"symbols": approved}).fetchall()
+        local_latest = {r[0]: r[1] for r in local_rows}
+        local_max = max(local_latest.values()) if local_latest else None
+
+        # Neon: latest date per symbol
+        _neon = neon_engine()
+        with _neon.begin() as conn:
+            neon_rows = conn.execute(text("""
+                SELECT symbol, MAX(date) AS latest_date
+                FROM public.macro
+                WHERE symbol = ANY(:symbols)
+                GROUP BY symbol
+            """), {"symbols": approved}).fetchall()
+        neon_latest = {r[0]: r[1] for r in neon_rows}
+        neon_max = max(neon_latest.values()) if neon_latest else None
+        _neon.dispose()
+
+        # Missing keys and value mismatches for the recent window
+        missing_keys = 0
+        value_mismatches = 0
+        mismatch_details = []
+
+        if neon_latest:
+            with engine.begin() as conn:
+                local_window = conn.execute(text("""
+                    SELECT date, symbol, open, high, low, close, adj_close, volume,
+                           prev_close, change, pct_chg, amplitude
+                    FROM (
+                        SELECT m.*, row_number() OVER (
+                            PARTITION BY symbol ORDER BY date DESC
+                        ) AS _rn
+                        FROM public.macro m
+                        WHERE symbol = ANY(:symbols)
+                    ) ranked WHERE _rn <= :window
+                    ORDER BY symbol, date
+                """), {"symbols": approved, "window": RECENT_REFRESH_SESSIONS}).mappings().all()
+
+            with neon_engine().begin() as conn:
+                neon_window_rows = conn.execute(text("""
+                    SELECT date, symbol, open, high, low, close, adj_close, volume,
+                           prev_close, change, pct_chg, amplitude
+                    FROM public.macro WHERE symbol = ANY(:symbols)
+                """), {"symbols": approved}).mappings().all()
+            neon_map = {(r["symbol"], str(r["date"])): r for r in neon_window_rows}
+
+            def _eq(a, b):
+                if a is None and b is None:
+                    return True
+                if a is None or b is None:
+                    return False
+                try:
+                    return abs(float(a) - float(b)) < 1e-9
+                except (TypeError, ValueError):
+                    return a == b
+
+            for lr in local_window:
+                key = (lr["symbol"], str(lr["date"]))
+                nr = neon_map.get(key)
+                if nr is None:
+                    missing_keys += 1
+                    continue
+                for f in ("open", "high", "low", "close", "adj_close", "volume",
+                          "prev_close", "change", "pct_chg", "amplitude"):
+                    if not _eq(lr[f], nr.get(f)):
+                        value_mismatches += 1
+                        mismatch_details.append(f"{key[0]}/{key[1]}.{f}")
+
+        # Status
+        if missing_keys == 0 and value_mismatches == 0:
+            status = "OK"
+            msg = (f"Neon converged: {len(local_latest)} symbols, "
+                   f"latest={local_max}, missing=0, mismatches=0")
+        else:
+            status = "FAIL"
+            msg = (f"Neon stale: local_latest={local_max} neon_latest={neon_max} "
+                   f"missing_keys={missing_keys} value_mismatches={value_mismatches}")
+            if mismatch_details:
+                msg += f" e.g. {mismatch_details[:3]}"
+
+        return FreshnessResult(
+            rule_name=rule.name, table=rule.table, timestamp_field=rule.timestamp_field,
+            latest_value=local_max, lag_days=None, status=status, message=msg,
+            is_critical=True,
+        )
+    except Exception as exc:
+        return FreshnessResult(
+            rule_name=rule.name, table=rule.table, timestamp_field=rule.timestamp_field,
+            latest_value=None, lag_days=None, status="FAIL",
+            message=f"Neon convergence check failed: {type(exc).__name__}: {exc}",
+            is_critical=True,
+        )
+
+
 def check_rule(rule: FreshnessRule, engine) -> FreshnessResult:
     """Execute a single freshness check."""
     try:
+        # Neon macro convergence — must query Neon directly.
+        if rule.name == "Neon macro convergence":
+            return _check_neon_convergence(rule, engine)
+
         # File-based rule
         if rule.cadence == "file":
             latest = _fetch_file_mtime("rule_based_market_update_*.md")

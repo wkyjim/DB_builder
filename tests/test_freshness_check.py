@@ -94,6 +94,7 @@ if "db_builder" not in sys.modules:
 
 config_mod = types.ModuleType("db_builder.config")
 config_mod.local_engine = lambda **kwargs: MockEngine()
+config_mod.neon_engine = lambda **kwargs: MockEngine()
 config_mod.PROJECT_ROOT = Path("/workspace/DB_builder")
 sys.modules["db_builder.config"] = config_mod
 

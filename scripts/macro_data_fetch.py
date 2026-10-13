@@ -1564,6 +1564,14 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
             print("[GATE] no eligible historical rows after EOD gate")
             return 0
 
+    # ``mode="MIRROR"`` is a destination-mirroring write: the input rows are
+    # already-canonical, already-committed LOCAL rows being copied to another
+    # database (Neon). It deliberately does NOT run the Phase A ingestion gate:
+    # no provider eligibility, no provenance reclassification, no deferral, no
+    # attempt_count, no C2 mutation. Universe/window safety is enforced by the
+    # caller (sync_recent_macro_to_neon) before rows reach here.
+    # Fall through to the same INSERT ... ON CONFLICT DO UPDATE below.
+
     df = pd.DataFrame(rows)
     df = df.where(pd.notna(df), None)
 
@@ -2431,6 +2439,313 @@ def run_eod_5session_refresh(
         f"missing_close_time_mapping={counters['missing_close_time_mapping']}"
     )
 
+    return counters
+
+
+def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
+                              window=RECENT_REFRESH_SESSIONS, dry_run=False):
+    """Converge Neon's ``public.macro`` to the canonical LOCAL rows.
+
+    Ordering contract (production)::
+
+        provider fetch -> normal ingestion -> C2 recovery
+          -> local EOD 5-session refresh -> LOCAL COMMIT
+          -> local-to-Neon convergence sync -> downstream/API availability
+
+    LOCAL is authoritative. This function reads the canonical, already-committed
+    rows straight out of local ``public.macro``; it never fetches provider data
+    and never recalculates a value. For the bounded recent window (the latest
+    ``window`` sessions per symbol — the same window the EOD refresh maintains)
+    it upserts every local row into Neon using the existing conflict key
+    ``(date, symbol)`` with ``ON CONFLICT ... DO UPDATE``, so that BOTH new rows
+    and revisions of existing rows propagate.
+
+    Destination safety is enforced here (MIRROR bypasses ingestion *eligibility*,
+    never universe controls):
+
+    * only symbols present in the approved EOD/API universe;
+    * R22-protected keys are never synchronized;
+    * a bounded recent window only — no uncontrolled full-history mirror;
+    * the destination engine must not be the local engine (MIRROR never writes
+      back to local).
+
+    Counters are truthful: ``committed_rows`` counts rows actually submitted to
+    the upsert and accepted (never merely candidates).
+
+    ``local_engine_`` / ``neon_engine_`` are injectable for tests; production
+    callers omit them and get ``local_engine`` / ``neon_engine``.
+    """
+    _local = local_engine_ if local_engine_ is not None else local_engine
+    _neon = neon_engine_ if neon_engine_ is not None else neon_engine
+
+    if _local is None or _neon is None:
+        raise ValueError("sync_recent_macro_to_neon requires both engines")
+    if _neon is _local:
+        raise ValueError(
+            "MIRROR destination must not be the local engine: "
+            "the convergence sync never writes back to local"
+        )
+
+    counters = {
+        "candidate_rows": 0,
+        "committed_rows": 0,
+        "inserted_rows": 0,
+        "updated_rows": 0,
+        "unchanged_rows": 0,
+        "failed_rows": 0,
+        "skipped_rows": 0,
+        "local_latest_date": None,
+        "neon_latest_date": None,
+        "window": window,
+    }
+
+    # ---- destination safety: approved universe, R22 excluded ----
+    approved = []
+    for s in symbols:
+        sd = SOURCE_DEFINITION_BY_SYMBOL.get(s)
+        if sd is None:
+            counters["skipped_rows"] += 1
+            continue
+        key = (s, sd)
+        if key not in C3A_APPROVED_ANCHORS and key not in SOURCE_DEFINITION_TRUST_START:
+            counters["skipped_rows"] += 1
+            continue
+        approved.append(s)
+
+    if not approved:
+        print("[NEON MACRO SYNC] no approved symbols in scope")
+        return counters
+
+    # ---- read canonical rows from LOCAL (never from provider) ----
+    with _local.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT date, symbol, name, asset_type,
+                       open, high, low, close, adj_close, volume,
+                       prev_close, change, pct_chg, amplitude
+                FROM (
+                    SELECT m.*,
+                           row_number() OVER (
+                               PARTITION BY symbol ORDER BY date DESC
+                           ) AS _rn
+                    FROM public.macro m
+                    WHERE symbol = ANY(:symbols)
+                ) ranked
+                WHERE _rn <= :window
+                ORDER BY symbol, date
+            """),
+            {"symbols": approved, "window": window},
+        ).mappings().all()
+
+    local_rows = []
+    for r in rows:
+        d = r["date"]
+        # R22 exact-key protection (mirror must never restore withdrawn keys)
+        if _is_r22_protected(r["symbol"], d):
+            counters["skipped_rows"] += 1
+            continue
+        local_rows.append({k: r[k] for k in (
+            "date", "symbol", "name", "asset_type",
+            "open", "high", "low", "close", "adj_close", "volume",
+            "prev_close", "change", "pct_chg", "amplitude")})
+
+    counters["candidate_rows"] = len(local_rows)
+    if local_rows:
+        counters["local_latest_date"] = str(max(r["date"] for r in local_rows))
+
+    if not local_rows:
+        print(f"[NEON MACRO SYNC] candidate_rows=0 window={window}")
+        return counters
+
+    # ---- current Neon state (for truthful unchanged/committed accounting) ----
+    neon_existing = {}
+    try:
+        with _neon.connect() as conn:
+            ex = conn.execute(
+                text("""
+                    SELECT date, symbol, open, high, low, close, adj_close, volume,
+                           prev_close, change, pct_chg, amplitude
+                    FROM public.macro
+                    WHERE symbol = ANY(:symbols)
+                """),
+                {"symbols": approved},
+            ).mappings().all()
+        for r in ex:
+            neon_existing[(r["symbol"], str(r["date"]))] = r
+            counters["neon_latest_date"] = str(max(
+                counters["neon_latest_date"] or str(r["date"]), str(r["date"])))
+    except Exception as exc:
+        counters["failed_rows"] = len(local_rows)
+        counters["committed_rows"] = 0
+        print(f"[NEON MACRO SYNC FAILED] could not read Neon state: "
+              f"{type(exc).__name__}: {exc}")
+        print("[NEON MACRO SYNC] local DB remains authoritative; "
+              "no local rollback performed")
+        print(
+            f"[NEON MACRO SYNC] candidate_rows={counters['candidate_rows']} "
+            f"inserted_rows={counters['inserted_rows']} "
+            f"updated_rows={counters['updated_rows']} "
+            f"unchanged_rows={counters['unchanged_rows']} "
+            f"committed_rows={counters['committed_rows']} "
+            f"failed_rows={counters['failed_rows']} "
+            f"skipped_rows={counters['skipped_rows']} "
+            f"local_latest_date={counters['local_latest_date']} "
+            f"neon_latest_date={counters['neon_latest_date']}"
+        )
+        return counters
+
+    VALUE_FIELDS = ("open", "high", "low", "close", "adj_close", "volume",
+                    "prev_close", "change", "pct_chg", "amplitude")
+
+    def _eq(a, b):
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        try:
+            return abs(float(a) - float(b)) < 1e-9
+        except (TypeError, ValueError):
+            return a == b
+
+    to_submit = []
+    for r in local_rows:
+        key = (r["symbol"], str(r["date"]))
+        prior = neon_existing.get(key)
+        if prior is None:
+            to_submit.append(r)
+            counters["inserted_rows"] += 1
+            continue
+        differs = any(
+            not _eq(r[f], prior.get(f)) for f in VALUE_FIELDS
+        ) or (r.get("name") != prior.get("name")) \
+           or (r.get("asset_type") != prior.get("asset_type"))
+        if differs:
+            to_submit.append(r)
+            counters["updated_rows"] += 1
+        else:
+            counters["unchanged_rows"] += 1
+
+    # ---- submit (MIRROR: direct upsert, no Phase A gate) ----
+    if to_submit and not dry_run:
+        try:
+            with _neon.begin() as conn:
+                conn.execute(
+                    text("""
+                        INSERT INTO public.macro (
+                            date, symbol, name, asset_type,
+                            open, high, low, close, adj_close, volume,
+                            prev_close, change, pct_chg, amplitude
+                        )
+                        VALUES (
+                            :date, :symbol, :name, :asset_type,
+                            :open, :high, :low, :close, :adj_close, :volume,
+                            :prev_close, :change, :pct_chg, :amplitude
+                        )
+                        ON CONFLICT (date, symbol)
+                        DO UPDATE SET
+                            name = EXCLUDED.name,
+                            asset_type = EXCLUDED.asset_type,
+                            open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            adj_close = EXCLUDED.adj_close,
+                            volume = EXCLUDED.volume,
+                            prev_close = EXCLUDED.prev_close,
+                            change = EXCLUDED.change,
+                            pct_chg = EXCLUDED.pct_chg,
+                            amplitude = EXCLUDED.amplitude
+                    """),
+                    to_submit,
+                )
+            counters["committed_rows"] = len(to_submit)
+        except Exception as exc:
+            counters["failed_rows"] = len(to_submit)
+            counters["committed_rows"] = 0
+            print(f"[NEON MACRO SYNC FAILED] submitted={len(to_submit)} "
+                  f"error={type(exc).__name__}: {exc}")
+            print("[NEON MACRO SYNC] local DB remains authoritative; "
+                  "no local rollback performed")
+    elif to_submit and dry_run:
+        print(f"[DRY RUN SKIP NEON MACRO SYNC] would_submit={len(to_submit)}")
+
+    # refresh neon_latest_date view after commit
+    if counters["committed_rows"]:
+        counters["neon_latest_date"] = str(max(
+            [counters["neon_latest_date"]] + [str(r["date"]) for r in to_submit]
+            if counters["neon_latest_date"] else [str(r["date"]) for r in to_submit]
+        ))
+
+    # ---- post-sync convergence verification (read-only) ----
+    # For every synchronized key, compare local vs Neon for OHLCV + derived.
+    # Required: LOCAL_NEON_MISMATCH = 0 for the synchronized window.
+    if counters["committed_rows"] and not dry_run:
+        try:
+            with _local.connect() as conn:
+                verify_local = conn.execute(
+                    text("""
+                        SELECT date, symbol, open, high, low, close, adj_close, volume,
+                               prev_close, change, pct_chg, amplitude
+                        FROM (
+                            SELECT m.*, row_number() OVER (
+                                PARTITION BY symbol ORDER BY date DESC
+                            ) AS _rn
+                            FROM public.macro m
+                            WHERE symbol = ANY(:symbols)
+                        ) ranked WHERE _rn <= :window
+                        ORDER BY symbol, date
+                    """),
+                    {"symbols": approved, "window": window},
+                ).mappings().all()
+
+            with _neon.connect() as conn:
+                verify_neon_rows = conn.execute(
+                    text("""
+                        SELECT date, symbol, open, high, low, close, adj_close, volume,
+                               prev_close, change, pct_chg, amplitude
+                        FROM public.macro WHERE symbol = ANY(:symbols)
+                    """),
+                    {"symbols": approved},
+                ).mappings().all()
+            verify_neon_map = {(r["symbol"], str(r["date"])): r for r in verify_neon_rows}
+
+            mismatch_count = 0
+            mismatch_details = []
+            for lr in verify_local:
+                key = (lr["symbol"], str(lr["date"]))
+                nr = verify_neon_map.get(key)
+                if nr is None:
+                    mismatch_count += 1
+                    mismatch_details.append(f"{key[0]}/{key[1]}:missing")
+                    continue
+                for f in VALUE_FIELDS:
+                    if not _eq(lr[f], nr.get(f)):
+                        mismatch_count += 1
+                        mismatch_details.append(f"{key[0]}/{key[1]}.{f}")
+
+            counters["convergence_mismatches"] = mismatch_count
+            if mismatch_count:
+                print(f"[NEON CONVERGENCE VERIFY FAILED] "
+                      f"LOCAL_NEON_MISMATCH={mismatch_count} "
+                      f"e.g. {mismatch_details[:5]}")
+            else:
+                print(f"[NEON CONVERGENCE VERIFY] LOCAL_NEON_MISMATCH=0 "
+                      f"({len(verify_local)} keys verified)")
+        except Exception as exc:
+            counters["convergence_mismatches"] = -1
+            print(f"[NEON CONVERGENCE VERIFY ERROR] {type(exc).__name__}: {exc}")
+
+    print(
+        f"[NEON MACRO SYNC] candidate_rows={counters['candidate_rows']} "
+        f"inserted_rows={counters['inserted_rows']} "
+        f"updated_rows={counters['updated_rows']} "
+        f"unchanged_rows={counters['unchanged_rows']} "
+        f"committed_rows={counters['committed_rows']} "
+        f"failed_rows={counters['failed_rows']} "
+        f"skipped_rows={counters['skipped_rows']} "
+        f"local_latest_date={counters['local_latest_date']} "
+        f"neon_latest_date={counters['neon_latest_date']}"
+    )
     return counters
 
 
@@ -5221,6 +5536,22 @@ def run_daily_update(
                 print("[EOD REFRESH SKIP] No provider frames available")
     except Exception as eod_error:
         print(f"[EOD REFRESH ERROR] {eod_error}")
+
+    # ---- local-to-Neon convergence sync (after LOCAL COMMIT) ----
+    # Ordering: provider fetch -> normal ingestion -> C2 recovery
+    #   -> local EOD 5-session refresh -> LOCAL COMMIT
+    #   -> local-to-Neon convergence sync -> downstream/API availability
+    # LOCAL is authoritative; this reads canonical local rows and never
+    # fetches provider data. MIRROR bypasses the Phase A ingestion gate but
+    # keeps universe/window/R22 destination safety.
+    if not dry_run:
+        try:
+            sync_recent_macro_to_neon(symbols=eod_symbols)
+        except Exception as sync_error:
+            # Local DB remains authoritative; never roll back valid local data.
+            print(f"[NEON MACRO SYNC ERROR] {type(sync_error).__name__}: {sync_error}")
+            print("[NEON MACRO SYNC] local DB remains authoritative; "
+                  "no local rollback performed")
 
     if update_etf_flows:
         try:
