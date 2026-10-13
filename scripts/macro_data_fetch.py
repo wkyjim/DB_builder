@@ -2626,9 +2626,13 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
             counters["unchanged_rows"] += 1
 
     # ---- submit (MIRROR: direct upsert, no Phase A gate) ----
+    # In production (no injected engine), use a FRESH Neon engine for the
+    # write to avoid connection-pool staleness from the pre-sync read.
+    # In test mode (injected engine), use the injected engine consistently.
     if to_submit and not dry_run:
         try:
-            with _neon.begin() as conn:
+            _write_neon = _neon if neon_engine_ is not None else neon_engine()
+            with _write_neon.begin() as conn:
                 conn.execute(
                     text("""
                         INSERT INTO public.macro (
@@ -2658,6 +2662,7 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                     """),
                     to_submit,
                 )
+            _write_neon.dispose()
             counters["committed_rows"] = len(to_submit)
         except Exception as exc:
             counters["failed_rows"] = len(to_submit)
@@ -2679,6 +2684,8 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
     # ---- post-sync convergence verification (read-only) ----
     # For every synchronized key, compare local vs Neon for OHLCV + derived.
     # Required: LOCAL_NEON_MISMATCH = 0 for the synchronized window.
+    # CRITICAL: Use a FRESH Neon engine for verification to avoid reading
+    # uncommitted/pooled state from the sync transaction.
     if counters["committed_rows"] and not dry_run:
         try:
             with _local.connect() as conn:
@@ -2698,7 +2705,10 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                     {"symbols": approved, "window": window},
                 ).mappings().all()
 
-            with _neon.connect() as conn:
+            # Fresh Neon engine for verification (not the sync engine)
+            # In test mode, use the injected engine consistently.
+            _verify_neon = _neon if neon_engine_ is not None else neon_engine()
+            with _verify_neon.connect() as conn:
                 verify_neon_rows = conn.execute(
                     text("""
                         SELECT date, symbol, open, high, low, close, adj_close, volume,
@@ -2707,6 +2717,7 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                     """),
                     {"symbols": approved},
                 ).mappings().all()
+            _verify_neon.dispose()
             verify_neon_map = {(r["symbol"], str(r["date"])): r for r in verify_neon_rows}
 
             mismatch_count = 0

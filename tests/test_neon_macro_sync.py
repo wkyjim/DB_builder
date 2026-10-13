@@ -31,13 +31,11 @@ _mock_config.MACRO_TABLE = "public.macro"
 _mock_config.RAW_TABLE = "public.us_equities"
 _mock_config.INDICATOR_TABLE = "public.us_equities_indicators"
 _mock_config.local_engine = lambda **kw: types.SimpleNamespace()
-_mock_config.neon_engine = lambda **kw: types.SimpleNamespace()
+_mock_config.neon_engine = lambda **kw: types.SimpleNamespace()  # will be overridden
 sys.modules["db_builder.config"] = _mock_config
 
 import pytest
 from datetime import date
-
-import scripts.macro_data_fetch as mdf
 
 
 # ------------------------------------------------------------------
@@ -141,6 +139,31 @@ class FakeEngine:
 
     def dispose(self):
         pass
+
+
+# Now that FakeEngine is defined, set up neon_engine factory
+_neon_engines = []
+def _neon_engine_factory(**kw):
+    eng = FakeEngine([], "neon")
+    _neon_engines.append(eng)
+    return eng
+_mock_config.neon_engine = _neon_engine_factory
+
+
+@pytest.fixture(autouse=True)
+def _reset_neon_engines():
+    """Clear the neon engine factory list before each test."""
+    _neon_engines.clear()
+    yield
+    _neon_engines.clear()
+
+
+# Now import mdf (which will capture the factory-based neon_engine)
+import scripts.macro_data_fetch as mdf
+
+# mdf captured neon_engine as a module-level instance at import time.
+# Override it with the factory so each call to neon_engine() creates a fresh engine.
+mdf.neon_engine = _neon_engine_factory
 
 
 def _row(sym, d, close=100.0, volume=1000.0, **kw):
