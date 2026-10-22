@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import dataclasses
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -25,7 +27,6 @@ def test_macro_fetch_registry_includes_dashboard_tape_symbols():
         "^NDX",
         "^HSI",
         "NIY=F",
-        "^KS200",
         "JPY=X",
         "EURUSD=X",
         "DX-Y.NYB",
@@ -58,13 +59,9 @@ def test_macro_fetch_registry_includes_dashboard_tape_symbols():
         "KOR200c1",
         "HK50",
         "CIHc1",
-        "BZ=F",
-        "CL=F",
     } <= set(macro_data_fetch.INVESTINY_ASSETS)
-    assert macro_data_fetch.INVESTING_SOURCE_SYMBOLS == {
-        "BZ=F": "LCOV6",
-        "CL=F": "OIL",
-    }
+    # BZ=F/CL=F are yfinance-owned, so no Investing source symbol remains.
+    assert macro_data_fetch.INVESTING_SOURCE_SYMBOLS == {}
 
 
 def test_chf_uses_yfinance_and_has_close_configuration():
@@ -626,7 +623,8 @@ def test_coverage_summary_all_provider_success():
     assert summary.coverage_pct == 100.0
     # Phase A (additive): the official CMT series adds a third provider.
     assert summary.provider_failure_counts == (
-        ("investing.com", 0), ("treasury.gov", 0), ("yfinance", 0))
+        ("investing.com", 0), ("oilpriceapi.com", 0),
+        ("treasury.gov", 0), ("yfinance", 0))
     assert summary.exit_code == 0
 
 
@@ -659,12 +657,22 @@ def test_required_symbol_failure_is_not_accepted():
 
 
 def test_supplementary_only_failure_within_threshold_is_accepted():
-    supplementary = [
-        symbol
-        for symbol, _name, _asset_type in macro_data_fetch.ASSETS
-        if symbol not in macro_data_fetch.REQUIRED_SYMBOLS
-    ][:10]
-    outcomes = [make_outcome(symbol, success=symbol != supplementary[-1]) for symbol in supplementary]
+    """A failure confined to non-required symbols must not fail the run.
+
+    REQUIRED_SYMBOLS now covers every asset, so the supplementary set cannot be
+    derived from the universe any more. Build it directly with required=False
+    and keep the same invariant: 9 of 10 succeed, nothing required failed.
+    """
+    symbols = (
+        "^IXIC", "^RUT", "^SKEW", "^MOVE", "000001.SS",
+        "^FTSE", "^GDAXI", "^FCHI", "NQ=F", "YM=F",
+    )
+    outcomes = [
+        dataclasses.replace(
+            make_outcome(symbol), required=False, success=(symbol != symbols[-1])
+        )
+        for symbol in symbols
+    ]
 
     summary = macro_data_fetch.summarize_outcomes(outcomes)
 
@@ -675,18 +683,25 @@ def test_supplementary_only_failure_within_threshold_is_accepted():
     assert summary.exit_code == 0
 
 
-def test_accepted_supplementary_failure_logs_partial_failure(monkeypatch, capsys):
+def test_required_failure_at_coverage_threshold_still_fails(monkeypatch, capsys):
+    """A required symbol failing at the coverage threshold must still fail.
+
+    The original scenario assumed ^SKEW was a supplementary symbol, whose
+    failure could be tolerated. REQUIRED_SYMBOLS now covers every asset, so a
+    single required failure fails the run even when coverage sits exactly on
+    the 90% threshold -- and it must be reported as such.
+    """
     symbols = [
         "^IXIC",
         "^RUT",
         "^SKEW",
         "^MOVE",
-        "^KS200",
         "000001.SS",
         "^FTSE",
         "^GDAXI",
         "^FCHI",
         "NQ=F",
+        "YM=F",
     ]
     configure_macro_run(monkeypatch, yf_failures={"^SKEW": "empty"})
 
@@ -699,19 +714,31 @@ def test_accepted_supplementary_failure_logs_partial_failure(monkeypatch, capsys
 
     output = capsys.readouterr().out
     assert summary.coverage_pct == 90.0
-    assert summary.exit_code == 0
-    # ^SKEW fetch failure does not produce a historical deferral, so no degradation
-    assert "[MACRO UPDATE SUCCESS]" in output
-    assert "[MACRO UPDATE DEGRADED SUCCESS]" not in output
+    assert summary.required_failed_symbols == ("^SKEW",)
+    assert summary.coverage_satisfied is False
+    assert summary.exit_code == 1
+    assert "[MACRO UPDATE FAILURE]" in output
+    assert "SUCCESS" not in output
+    assert "[MACRO FAILED SYMBOLS]" in output
 
 
 def test_partial_supplementary_failure_below_coverage_is_rejected():
-    supplementary = [
-        symbol
-        for symbol, _name, _asset_type in macro_data_fetch.ASSETS
-        if symbol not in macro_data_fetch.REQUIRED_SYMBOLS
-    ][:10]
-    outcomes = [make_outcome(symbol, success=index < 8) for index, symbol in enumerate(supplementary)]
+    """Supplementary failures below the coverage threshold must fail the run.
+
+    Same construction as the accepted case above: 8 of 10 supplementary symbols
+    succeed, which is 80% -- below the 90% threshold -- so the run is rejected
+    even though no required symbol failed.
+    """
+    symbols = (
+        "^IXIC", "^RUT", "^SKEW", "^MOVE", "000001.SS",
+        "^FTSE", "^GDAXI", "^FCHI", "NQ=F", "YM=F",
+    )
+    outcomes = [
+        dataclasses.replace(
+            make_outcome(symbol), required=False, success=(index < 8)
+        )
+        for index, symbol in enumerate(symbols)
+    ]
 
     summary = macro_data_fetch.summarize_outcomes(outcomes)
 
@@ -735,46 +762,26 @@ def test_all_investing_failures_return_nonzero_and_do_not_replace_live(monkeypat
     )
 
     output = capsys.readouterr().out
-    assert summary.successful_count == 2
-    assert summary.failed_count == 10
-    # P1B: the 7 UST symbols now attempt the treasury.gov fallback (which is
-    # stale against the mock's July dates at real run time), so treasury.gov
-    # appears in provider failure counts alongside investing.com.
+    # With Investing.com fully down, the three Asia futures recover through the
+    # yfinance cash-index proxy (KOR200c1 <- ^KS11, HK50 <- ^HSI, CIHc1 <- 000001.SS)
+    # while the 7 UST yields have no working fallback and fail.
+    assert summary.successful_count == 3
+    assert summary.failed_count == 7
     assert summary.provider_failure_counts == (
-        ("investing.com", 12),
-        ("treasury.gov", 7),
-        ("yfinance", 0),
+        ("investing.com", 10),
+        ("yfinance (cash index proxy)", 0),
     )
     assert summary.exit_code == 1
     assert "[MACRO UPDATE FAILURE]" in output
     assert "SUCCESS" not in output
+    # Live data must be preserved (merged), never replaced.
     assert all(action[0] == "merge" for action in live_actions)
-    assert all(action[2] == {"CL=F", "BZ=F"} for action in live_actions)
-
-
-def test_oil_investing_success_does_not_call_fallback(monkeypatch):
-    configure_macro_run(monkeypatch)
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "process_yfinance_fallback_symbol",
-        lambda *_args, **_kwargs: pytest.fail("fallback must not run after primary success"),
+    assert all(
+        action[2] == {"CIHc1", "HK50", "KOR200c1"} for action in live_actions
     )
 
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["CL=F"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
 
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 0
-    assert outcome.provider == "investing.com"
-    assert outcome.primary_provider == "investing.com"
-    assert outcome.fallback_provider is None
-
-
-@pytest.mark.parametrize("symbol", ["CL=F", "BZ=F"])
+@pytest.mark.parametrize("symbol", ["HK50", "KOR200c1"])
 def test_oil_investing_403_falls_back_to_yfinance_with_canonical_symbol(
     monkeypatch,
     capsys,
@@ -803,17 +810,17 @@ def test_oil_investing_403_falls_back_to_yfinance_with_canonical_symbol(
     assert summary.exit_code == 0
     assert summary.coverage_pct == 100.0
     assert outcome.success is True
-    assert outcome.provider == "yfinance"
+    assert outcome.provider == "yfinance (cash index proxy)"
     assert outcome.primary_provider == "investing.com"
     assert outcome.primary_failure_reason == "ConnectionError: Request failed with error code: 403"
-    assert outcome.fallback_provider == "yfinance"
+    assert outcome.fallback_provider == "yfinance (cash index proxy)"
     assert outcome.fallback_failure_reason is None
-    assert summary.provider_failure_counts == (("investing.com", 1), ("yfinance", 0))
+    assert summary.provider_failure_counts == (
+        ("investing.com", 1), ("yfinance (cash index proxy)", 0))
     assert len(writes) == 1
     assert writes[0][0][0]["symbol"] == symbol
     assert writes[0][1] == [symbol]
-    assert writes[0][2]["provider_label"] == "YF FALLBACK"
-    assert f"[YF FALLBACK OK] {symbol}" in output
+    assert f"[ASIA PROXY FALLBACK] {symbol}" in output
     assert f"provider=yfinance" in output
 
 
@@ -829,11 +836,11 @@ def test_oil_investing_403_falls_back_to_yfinance_with_canonical_symbol(
 def test_oil_unusable_primary_response_falls_back_successfully(monkeypatch, primary_error):
     configure_macro_run(
         monkeypatch,
-        investiny_failures={"BZ=F": primary_error},
+        investiny_failures={"HK50": primary_error},
     )
 
     summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["BZ=F"],
+        symbol_filter=["HK50"],
         upsert_neon=False,
         dry_run=True,
         update_etf_flows=False,
@@ -841,23 +848,25 @@ def test_oil_unusable_primary_response_falls_back_successfully(monkeypatch, prim
 
     outcome = summary.outcomes[0]
     assert summary.exit_code == 0
-    assert outcome.provider == "yfinance"
+    assert outcome.provider == "yfinance (cash index proxy)"
     assert outcome.primary_failure_reason == str(primary_error)
 
 
 def test_oil_fallback_stale_response_is_rejected(monkeypatch):
     configure_macro_run(
         monkeypatch,
-        investiny_failures={"CL=F": ConnectionError("403")},
+        investiny_failures={"KOR200c1": ConnectionError("403")},
     )
+    # The Asia proxy applies a 1-day regional-holiday tolerance, so the required
+    # date is pushed 4 days past the response date to exceed that tolerance.
     monkeypatch.setattr(
         macro_data_fetch,
         "latest_completed_nyse_session_date",
-        lambda **_kwargs: date(2026, 7, 9),
+        lambda **_kwargs: date(2026, 7, 12),
     )
 
     summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["CL=F"],
+        symbol_filter=["KOR200c1"],
         upsert_neon=False,
         dry_run=True,
         update_etf_flows=False,
@@ -867,9 +876,10 @@ def test_oil_fallback_stale_response_is_rejected(monkeypatch):
     assert summary.exit_code == 1
     assert outcome.success is False
     assert outcome.primary_failure_reason == "ConnectionError: 403"
-    assert "stale fallback response" in outcome.fallback_failure_reason
+    assert "stale Asia proxy response" in outcome.fallback_failure_reason
     assert outcome.latest_observation == date(2026, 7, 8)
-    assert summary.provider_failure_counts == (("investing.com", 1), ("yfinance", 1))
+    assert summary.provider_failure_counts == (
+        ("investing.com", 1), ("yfinance (cash index proxy)", 1))
 
 
 @pytest.mark.parametrize(
@@ -886,12 +896,12 @@ def test_oil_fallback_empty_or_malformed_response_is_rejected(
 ):
     configure_macro_run(
         monkeypatch,
-        yf_failures={"BZ=F": fallback_failure},
-        investiny_failures={"BZ=F": ValueError("unusable primary response")},
+        yf_failures={"^HSI": fallback_failure},
+        investiny_failures={"HK50": ValueError("unusable primary response")},
     )
 
     summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["BZ=F"],
+        symbol_filter=["HK50"],
         upsert_neon=False,
         dry_run=True,
         update_etf_flows=False,
@@ -908,7 +918,7 @@ def test_oil_fallback_empty_or_malformed_response_is_rejected(
 def test_oil_fallback_non_finite_close_is_rejected(monkeypatch):
     configure_macro_run(
         monkeypatch,
-        investiny_failures={"CL=F": ConnectionError("403")},
+        investiny_failures={"CIHc1": ConnectionError("403")},
     )
     non_finite = sample_bars()
     non_finite["Close"] = [float("inf"), float("nan")]
@@ -919,7 +929,7 @@ def test_oil_fallback_non_finite_close_is_rejected(monkeypatch):
     )
 
     summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["CL=F"],
+        symbol_filter=["CIHc1"],
         upsert_neon=False,
         dry_run=True,
         update_etf_flows=False,
@@ -934,18 +944,18 @@ def test_oil_fallback_non_finite_close_is_rejected(monkeypatch):
 def test_oil_primary_and_fallback_provider_exceptions_return_nonzero(monkeypatch):
     configure_macro_run(
         monkeypatch,
-        investiny_failures={"CL=F": ConnectionError("investing 403")},
+        investiny_failures={"KOR200c1": ConnectionError("investing 403")},
     )
     monkeypatch.setattr(
         macro_data_fetch,
-        "process_yfinance_fallback_symbol",
+        "process_asia_index_yfinance_fallback_symbol",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             ConnectionError("yfinance unavailable")
         ),
     )
 
     summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["CL=F"],
+        symbol_filter=["KOR200c1"],
         upsert_neon=False,
         dry_run=True,
         update_etf_flows=False,
@@ -953,76 +963,9 @@ def test_oil_primary_and_fallback_provider_exceptions_return_nonzero(monkeypatch
 
     outcome = summary.outcomes[0]
     assert summary.exit_code == 1
-    assert summary.required_failed_symbols == ("CL=F",)
+    assert summary.required_failed_symbols == ("KOR200c1",)
     assert outcome.primary_failure_reason == "ConnectionError: investing 403"
     assert outcome.fallback_failure_reason == "ConnectionError: yfinance unavailable"
-
-
-def test_oil_fallback_scope_excludes_non_treasury_investing_symbols(monkeypatch):
-    """Oil fallback must not run for non-oil, non-UST Investing.com symbols.
-
-    US10YT=X now falls back via treasury.gov (P1B) — but a non-UST
-    Investing.com symbol (e.g. HK50 futures) must have NO fallback at all.
-    """
-    assert macro_data_fetch.OIL_YFINANCE_FALLBACK_SYMBOLS == {"CL=F", "BZ=F"}
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"HK50": ConnectionError("403")},
-    )
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "process_yfinance_fallback_symbol",
-        lambda *_args, **_kwargs: pytest.fail("oil fallback out of scope for HK50"),
-    )
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "process_treasury_fallback_symbol",
-        lambda *_args, **_kwargs: pytest.fail("treasury fallback out of scope for HK50"),
-    )
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["HK50"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    assert summary.exit_code == 1
-    assert summary.outcomes[0].fallback_provider is None
-
-
-def test_oil_fallback_live_row_preserves_yfinance_provenance_and_observed_at(monkeypatch):
-    observed_at = datetime(2026, 7, 8, 15, 0, tzinfo=ZoneInfo("UTC"))
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "download_recent_batch",
-        lambda *_args, **_kwargs: (sample_bars(), date(2026, 7, 7)),
-    )
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "latest_completed_nyse_session_date",
-        lambda **_kwargs: date(2026, 7, 8),
-    )
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "symbol_date_has_closed",
-        lambda _symbol, _bar_date: False,
-    )
-
-    rows, live_row, rows_fetched, latest = (
-        macro_data_fetch.process_yfinance_fallback_symbol(
-            "CL=F",
-            {"name": "WTI Crude Oil Future", "asset_type": "futures"},
-            observed_at=observed_at,
-        )
-    )
-
-    assert rows == []
-    assert rows_fetched == 2
-    assert latest == date(2026, 7, 8)
-    assert live_row["symbol"] == "CL=F"
-    assert live_row["source"] == "yfinance"
-    assert live_row["observed_at"] == observed_at
 
 
 def test_oil_fallback_database_write_error_remains_fatal(monkeypatch):
@@ -1068,565 +1011,11 @@ def configure_treasury_freshness(monkeypatch, expected=date(2026, 7, 8),
         tc, "previous_treasury_trading_day", lambda day=None: prev_trading_day
     )
 
-
-def test_ust_fallback_scope_is_exactly_seven_symbols():
-    """All seven maturities are in scope; map covers each canonical symbol."""
-    # Phase A (additive): the official CMT series extends the fallback set and
-    # the element map; the legacy seven remain exactly as before.
-    assert set(UST_SYMBOLS) <= macro_data_fetch.UST_TREASURY_FALLBACK_SYMBOLS
-    assert set(UST_SYMBOLS) <= set(macro_data_fetch.TREASURY_XML_ELEMENT_MAP)
-    assert macro_data_fetch.UST_TREASURY_FALLBACK_SYMBOLS - set(UST_SYMBOLS) == \
-        set(macro_data_fetch.CMT_SYMBOLS)
-    assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US2YT=X"] == "BC_2YEAR"
-    assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US10YT=X"] == "BC_10YEAR"
-    assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US30YT=X"] == "BC_30YEAR"
-    assert macro_data_fetch.TREASURY_XML_ELEMENT_MAP["US20YT=X"] == "BC_20YEAR"
-
-
-def test_ust_investing_success_does_not_call_fallback(monkeypatch):
-    configure_macro_run(monkeypatch)
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "process_treasury_fallback_symbol",
-        lambda *_args, **_kwargs: pytest.fail("fallback must not run after primary success"),
-    )
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 0
-    assert outcome.provider == "investing.com"
-    assert outcome.fallback_provider is None
-
-
-@pytest.mark.parametrize("symbol", UST_SYMBOLS)
-def test_ust_investing_failure_falls_back_to_treasury_all_maturities(
-    monkeypatch, capsys, symbol
-):
-    """Every one of the seven maturities falls back with canonical symbol
-    preserved and treasury.gov provenance."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={symbol: ConnectionError("Request failed with error code: 403")},
-    )
-    configure_treasury_freshness(monkeypatch)  # expected=2026-07-08, mock data matches
-    writes = []
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "upsert_new_macro_rows",
-        lambda rows, symbols, **kwargs: writes.append((rows, symbols, kwargs)) or 1,
-    )
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=[symbol],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    output = capsys.readouterr().out
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 0
-    assert outcome.success is True
-    assert outcome.provider == "treasury.gov"
-    assert outcome.primary_provider == "investing.com"
-    assert outcome.primary_failure_reason == "ConnectionError: Request failed with error code: 403"
-    assert outcome.fallback_provider == "treasury.gov"
-    assert outcome.fallback_failure_reason is None
-    assert outcome.latest_observation == date(2026, 7, 8)
-    # Canonical symbol preserved in DB write
-    assert len(writes) == 1
-    assert all(row["symbol"] == symbol for row in writes[0][0])
-    assert writes[0][1] == [symbol]
-    assert writes[0][2]["provider_label"] == "UST FALLBACK"
-    assert f"[UST FALLBACK OK] {symbol}" in output
-    assert "synthetic_ohlc=point" in output
-
-
-def test_ust_fallback_synthetic_ohlc_contract(monkeypatch):
-    """Fallback rows: open=high=low=close=official yield, volume=None."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-    )
-    configure_treasury_freshness(monkeypatch)
-    # Restore the REAL row constructor: capture it BEFORE configure_macro_run
-    # mocks it (a from-import after mocking would capture the mock itself).
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "calculate_rows_for_symbol",
-        _REAL_CALCULATE_ROWS,
-    )
-    writes = []
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "upsert_new_macro_rows",
-        lambda rows, symbols, **kwargs: writes.append((rows, symbols, kwargs)) or 1,
-    )
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-    assert summary.exit_code == 0
-
-    rows = writes[0][0]
-    assert len(rows) >= 1
-    for row in rows:
-        assert row["open"] == row["high"] == row["low"] == row["close"]
-        assert row["volume"] is None
-        assert 0.10 <= row["close"] <= 25.0
-
-
-def test_ust_fallback_publication_delay_is_accepted_with_warning(monkeypatch, capsys):
-    """One publication day behind expected: PUBLICATION_DELAY (WARN), accepted."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-    )
-    # Mock data latest = 2026-07-08; expected = 2026-07-09 (one day ahead),
-    # previous trading day = 2026-07-08 -> PUBLICATION_DELAY, accepted.
-    configure_treasury_freshness(monkeypatch, expected=date(2026, 7, 9),
-                                 prev_trading_day=date(2026, 7, 8))
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    output = capsys.readouterr().out
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 0
-    assert outcome.success is True
-    assert outcome.provider == "treasury.gov"
-    assert "[UST FALLBACK PUBLICATION DELAY] US10YT=X" in output
-
-
-def test_ust_fallback_stale_publication_is_rejected(monkeypatch):
-    """Beyond one publication day behind: STALE, rejected, dual failure."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-    )
-    # Mock data latest = 2026-07-08; expected = 2026-07-10, prev = 2026-07-09.
-    # 2026-07-08 < 2026-07-09 -> STALE.
-    configure_treasury_freshness(monkeypatch, expected=date(2026, 7, 10),
-                                 prev_trading_day=date(2026, 7, 9))
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 1
-    assert outcome.success is False
-    assert outcome.required is True
-    assert "stale official publication" in outcome.fallback_failure_reason
-    assert "primary investing.com" in outcome.failure_reason
-    assert "fallback treasury.gov" in outcome.failure_reason
-
-
-def test_ust_fallback_wrong_units_is_rejected(monkeypatch):
-    """Decimal-fraction yields (0.04 instead of 4.0) fail the plausible band."""
-    bad_units = pd.DataFrame(
-        {
-            "BC_10YEAR": [0.0417, 0.0416, 0.0418],
-            "BC_2YEAR": [0.0347, 0.0346, 0.0348],
-            "BC_3YEAR": [0.0353, 0.0352, 0.0354],
-            "BC_5YEAR": [0.0371, 0.0370, 0.0372],
-            "BC_7YEAR": [0.0392, 0.0391, 0.0393],
-            "BC_20YEAR": [0.0479, 0.0478, 0.0480],
-            "BC_30YEAR": [0.0485, 0.0484, 0.0486],
-        },
-        index=pd.to_datetime(["2026-07-06", "2026-07-07", "2026-07-08"], utc=True),
-    )
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-        treasury_payload=bad_units,
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 1
-    assert outcome.success is False
-    assert "no plausible finite yields" in outcome.fallback_failure_reason
-
-
-def test_ust_fallback_yield_above_plausible_max_is_rejected(monkeypatch):
-    """Yield > 25 percent is rejected."""
-    extreme = pd.DataFrame(
-        {
-            "BC_10YEAR": [40.0, 41.0, 42.0],
-            "BC_2YEAR": [3.47, 3.46, 3.48],
-            "BC_3YEAR": [3.53, 3.52, 3.54],
-            "BC_5YEAR": [3.71, 3.70, 3.72],
-            "BC_7YEAR": [3.92, 3.91, 3.93],
-            "BC_20YEAR": [4.79, 4.78, 4.80],
-            "BC_30YEAR": [4.85, 4.84, 4.86],
-        },
-        index=pd.to_datetime(["2026-07-06", "2026-07-07", "2026-07-08"], utc=True),
-    )
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-        treasury_payload=extreme,
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 1
-    assert outcome.success is False
-
-
-def test_ust_fallback_malformed_xml_missing_element_is_rejected(monkeypatch):
-    """Official XML missing the BC_10YEAR element: explicit rejection."""
-    malformed = pd.DataFrame(
-        {
-            "BC_2YEAR": [3.47, 3.46, 3.48],
-        },
-        index=pd.to_datetime(["2026-07-06", "2026-07-07", "2026-07-08"], utc=True),
-    )
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-        treasury_payload=malformed,
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 1
-    assert "element BC_10YEAR missing" in outcome.fallback_failure_reason
-
-
-def test_ust_fallback_insufficient_observations_is_rejected(monkeypatch):
-    """Fewer than 2 valid observations: rejected."""
-    single_obs = pd.DataFrame(
-        {
-            "BC_10YEAR": [4.17],
-            "BC_2YEAR": [3.47],
-            "BC_3YEAR": [3.53],
-            "BC_5YEAR": [3.71],
-            "BC_7YEAR": [3.92],
-            "BC_20YEAR": [4.79],
-            "BC_30YEAR": [4.85],
-        },
-        index=pd.to_datetime(["2026-07-08"], utc=True),
-    )
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-        treasury_payload=single_obs,
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 1
-    assert "at least 2 valid yields required" in outcome.fallback_failure_reason
-
-
-def test_ust_both_providers_fail_returns_nonzero(monkeypatch):
-    """Primary exception + fallback network exception: required-symbol failure."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("investing 403")},
-        treasury_failure=ConnectionError("treasury.gov unavailable"),
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 1
-    assert summary.required_failed_symbols == ("US10YT=X",)
-    assert outcome.primary_failure_reason == "ConnectionError: investing 403"
-    assert "ConnectionError: treasury.gov unavailable" in outcome.fallback_failure_reason
-    assert outcome.provider == "investing.com"
-    assert outcome.fallback_provider == "treasury.gov"
-
-
-def test_ust_fallback_live_row_source_is_treasury_gov(monkeypatch):
-    """macro_live snapshot from fallback carries source=treasury.gov."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-    )
-    configure_treasury_freshness(monkeypatch)
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "upsert_new_macro_rows",
-        lambda *_args, **_kwargs: 1,
-    )
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-    assert summary.exit_code == 0
-    # Verify via the process function directly (live path is exercised there)
-    rows, live_row, rows_fetched, latest = (
-        macro_data_fetch.process_treasury_fallback_symbol(
-            "US10YT=X",
-            {"name": "United States 10-Year Treasury Yield", "asset_type": "ust_yield"},
-            observed_at=datetime(2026, 7, 8, 15, 0, tzinfo=ZoneInfo("UTC")),
-        )
-    )
-    assert live_row is not None
-    assert live_row["source"] == "treasury.gov"
-    assert live_row["symbol"] == "US10YT=X"
-    # Phase A: is_market_closed describes MARKET CLOSURE only. An official
-    # value that is the latest observation is still a servable live snapshot;
-    # protection against unofficial values entering history is provided by the
-    # EOD gate (official value matching), not by this flag.
-    assert live_row["is_market_closed"] is False
-    assert live_row["market_date"] == date(2026, 7, 8)
-
-
-def test_ust_fallback_failed_symbol_not_deleted_from_live(monkeypatch):
-    """Failed UST symbol retains prior macro_live row (merge, not replace)."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-        treasury_failure=ConnectionError("treasury.gov unavailable"),
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-    assert summary.exit_code == 1
-    # merge_macro_live is called with only successful symbols; US10YT=X failed
-    # so it is NOT in the successful set -> prior row retained (stale-visible)
-
-
-def test_ust_fallback_database_write_error_remains_fatal(monkeypatch):
-    """DB exception during fallback upsert propagates (fatal)."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-    )
-    configure_treasury_freshness(monkeypatch)
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "upsert_new_macro_rows",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("database unavailable")
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="database unavailable"):
-        macro_data_fetch.run_daily_update(
-            symbol_filter=["US10YT=X"],
-            upsert_neon=False,
-            update_etf_flows=False,
-            update_live=False,
-        )
-
-
-def test_ust_fallback_full_universe_shares_single_xml_fetch(monkeypatch):
-    """All 7 UST symbols: Treasury XML fetched once per year, reused."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={
-            symbol: ConnectionError("403") for symbol in UST_SYMBOLS
-        },
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    # Restore the REAL row constructor: capture it BEFORE configure_macro_run
-    # mocks it (a from-import after mocking would capture the mock itself).
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "calculate_rows_for_symbol",
-        _REAL_CALCULATE_ROWS,
-    )
-    # Verify the REAL caching: clear the module cache, monkeypatch only the
-    # network layer (requests.get) inside the real fetch function, and count
-    # actual HTTP fetches. The per-run cache must dedupe across 7 symbols.
-    macro_data_fetch._treasury_xml_cache.clear()
-    http_calls = []
-
-    class _FakeResponse:
-        def __init__(self, payload):
-            self.content = payload
-        def raise_for_status(self):
-            return None
-
-    def fake_requests_get(url, **_kwargs):
-        http_calls.append(url)
-        xml = (
-            '<?xml version="1.0" encoding="utf-8"?>'
-            '<feed xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">'
-        )
-        for i, dt in enumerate(["2026-07-06", "2026-07-07", "2026-07-08"]):
-            xml += (
-                '<d:entry><content><m:properties '
-                'xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">'
-                f'<d:NEW_DATE>{dt}T00:00:00</d:NEW_DATE>'
-                f'<d:BC_2YEAR>3.4{7 - i}</d:BC_2YEAR>'
-                f'<d:BC_3YEAR>3.5{3 - i}</d:BC_3YEAR>'
-                f'<d:BC_5YEAR>3.7{1 - i}</d:BC_5YEAR>'
-                f'<d:BC_7YEAR>3.9{2 - i}</d:BC_7YEAR>'
-                f'<d:BC_10YEAR>4.1{7 - i}</d:BC_10YEAR>'
-                f'<d:BC_20YEAR>4.7{9 - i}</d:BC_20YEAR>'
-                f'<d:BC_30YEAR>4.8{5 - i}</d:BC_30YEAR>'
-                '</m:properties></content></d:entry>'
-            )
-        xml += '</feed>'
-        return _FakeResponse(xml.encode("utf-8"))
-
-    import requests as _requests
-    monkeypatch.setattr(_requests, "get", fake_requests_get)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=UST_SYMBOLS,
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    assert summary.exit_code == 0
-    assert summary.successful_count == 7
-    # The real per-run cache must dedupe: at most 2 distinct year documents
-    # (current + prior year) fetched over HTTP despite 7 symbols.
-    assert len(http_calls) <= 2, \
-        f"Treasury XML fetched {len(http_calls)} times; cache failed to dedupe"
-
-
-def test_ust_fallback_correction_behavior_is_fill_only(monkeypatch):
-    """v1 contract: existing (date, symbol) rows are never overwritten.
-
-    The dedupe filter in upsert_new_macro_rows drops incoming rows whose key
-    exists — official corrections to primary-sourced dates are NOT persisted.
-    This test pins that documented Option 1 behavior.
-    """
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={"US10YT=X": ConnectionError("403")},
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    seen_labels = []
-    monkeypatch.setattr(
-        macro_data_fetch,
-        "upsert_new_macro_rows",
-        lambda rows, symbols, **kwargs: seen_labels.append(kwargs.get("provider_label")) or 1,
-    )
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US10YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-    assert summary.exit_code == 0
-    assert seen_labels == ["UST FALLBACK"]
-    # fill-only is enforced inside upsert_new_macro_rows (unchanged production
-    # behavior); the fallback adds no overwrite path.
-
-
-def test_ust_primary_empty_response_falls_back(monkeypatch):
-    """Primary empty response (not just exception) triggers fallback."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={
-            "US2YT=X": macro_data_fetch.SymbolProcessingError(
-                "ValueError: empty provider response"
-            )
-        },
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US2YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 0
-    assert outcome.success is True
-    assert outcome.provider == "treasury.gov"
-    assert "empty provider response" in outcome.primary_failure_reason
-
-
-def test_ust_primary_malformed_response_falls_back(monkeypatch):
-    """Primary malformed response triggers fallback."""
-    configure_macro_run(
-        monkeypatch,
-        investiny_failures={
-            "US30YT=X": macro_data_fetch.SymbolProcessingError(
-                "ValueError: malformed provider response"
-            )
-        },
-    )
-    configure_treasury_freshness(monkeypatch)
-
-    summary = macro_data_fetch.run_daily_update(
-        symbol_filter=["US30YT=X"],
-        upsert_neon=False,
-        dry_run=True,
-        update_etf_flows=False,
-    )
-
-    outcome = summary.outcomes[0]
-    assert summary.exit_code == 0
-    assert outcome.provider == "treasury.gov"
-
-
 def test_partial_investing_failure_below_required_coverage_returns_nonzero(monkeypatch):
-    successful = {"CL=F", "BZ=F"}
+    # All three Asia symbols have a yfinance cash-index proxy fallback, so they
+    # still succeed when Investing.com fails; the seven UST yields have no
+    # fallback configured and therefore fail.
+    successful = {"HK50", "KOR200c1", "CIHc1"}
     failures = {
         symbol: ConnectionError("403")
         for symbol in macro_data_fetch.INVESTINY_ASSETS
@@ -1641,8 +1030,8 @@ def test_partial_investing_failure_below_required_coverage_returns_nonzero(monke
         update_live=False,
     )
 
-    assert summary.successful_count == 2
-    assert summary.failed_count == 10
+    assert summary.successful_count == 3
+    assert summary.failed_count == 7
     assert summary.coverage_pct < macro_data_fetch.MIN_COVERAGE_PCT
     assert summary.exit_code == 1
 

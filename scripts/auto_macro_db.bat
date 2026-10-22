@@ -1,56 +1,25 @@
 @echo off
-call "C:\Users\User\anaconda3\Scripts\activate.bat"
-call conda activate PostgreSQL_db
-for %%I in ("%~dp0..") do set "DB_BUILDER_ROOT=%%~fI"
-cd /d "%DB_BUILDER_ROOT%"
+REM === BOOTSTRAP LOGGING ===
+set "BOOTSTRAP_LOG=C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\logs\auto_macro_bootstrap.log"
+for %%I in ("%~dp0..\") do set "DB_BUILDER_ROOT=%%~fI"
+echo [%date% %time%] BAT_START username=%username% cwd=%cd% >> "%BOOTSTRAP_LOG%"
+echo [%date% %time%] DB_BUILDER_ROOT=%DB_BUILDER_ROOT% >> "%BOOTSTRAP_LOG%"
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference = 'Stop';" ^
-  "$Root = $env:DB_BUILDER_ROOT;" ^
-  "$Python = 'C:\Users\User\anaconda3\envs\PostgreSQL_db\python.exe';" ^
-  "$LogDir = Join-Path $Root 'logs';" ^
-  "New-Item -ItemType Directory -Force -Path $LogDir | Out-Null;" ^
-  "$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss';" ^
-  "$Log = Join-Path $LogDir ('auto_macro_db_' + $Stamp + '.log');" ^
-  "function Write-Log($Level, $Message) { $Line = ('{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message); Add-Content -LiteralPath $Log -Value $Line; Write-Host $Line }" ^
-  "function Get-BlobStatus($RelPath) { $Full = Join-Path $Root $RelPath; if (-not (Test-Path -LiteralPath $Full)) { return 'MISSING' }; $HeadBlob = (& git -C $Root rev-parse ('HEAD:' + $RelPath) 2>$null); if (-not $HeadBlob) { return 'NOBLOB' }; $Diff = (& git -C $Root diff --quiet --ignore-cr-at-eol HEAD -- $RelPath 2>$null); $DiffCode = $LASTEXITCODE; if ($null -eq $DiffCode) { return 'UNKNOWN' }; if ($DiffCode -eq 0) { return 'SYNC' }; return 'LAG' }" ^
-  "$VersionCommit = (& git -C $Root rev-parse HEAD 2>$null); if (-not $VersionCommit) { $VersionCommit = 'UNKNOWN' };" ^
-  "Write-Log 'VERSION' ('commit=' + $VersionCommit + ' macro_data_fetch=' + (Get-BlobStatus 'scripts/macro_data_fetch.py') + ' freshness_check=' + (Get-BlobStatus 'scripts/freshness_check.py'));" ^
-  "function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 600) { for ($Attempt = 1; $Attempt -le 3; $Attempt++) { Write-Log 'START' ($Name + ' attempt ' + $Attempt); $Out = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.out.log'); $Err = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.err.log'); $Cmd = ('/c ""{0}"" ""{1}"" {2} > ""{3}"" 2> ""{4}""' -f $Python, $Script, $Arguments, $Out, $Err); $Psi = [System.Diagnostics.ProcessStartInfo]::new(); $Psi.FileName = 'cmd.exe'; $Psi.Arguments = $Cmd; $Psi.WorkingDirectory = $Root; $Psi.UseShellExecute = $false; $P = [System.Diagnostics.Process]::Start($Psi); $TimeoutMs = [Math]::Max(1, [int]$TimeoutSeconds) * 1000; if (-not $P.WaitForExit($TimeoutMs)) { $null = & taskkill.exe /PID $P.Id /T /F 2>&1; Write-Log 'TIMEOUT' ($Name + ' exceeded ' + $TimeoutSeconds + ' seconds'); if (Test-Path $Out) { Get-Content $Out | Add-Content $Log }; if (Test-Path $Err) { Get-Content $Err | Add-Content $Log }; if ($Attempt -lt 3) { Write-Log 'RETRY' ($Name + ' retrying after timeout in 60 seconds'); Start-Sleep -Seconds 60; continue }; return $false }; $P.WaitForExit(); $ExitCode = $P.ExitCode; if (Test-Path $Out) { Get-Content $Out | Add-Content $Log }; if (Test-Path $Err) { Get-Content $Err | Add-Content $Log }; if ($ExitCode -eq 0) { Write-Log 'SUCCESS' $Name; return $true }; Write-Log 'ERROR' ($Name + ' exited with code ' + $ExitCode); if ($Attempt -lt 3) { Write-Log 'RETRY' ($Name + ' retrying after error in 60 seconds'); Start-Sleep -Seconds 60; continue }; return $false } }" ^
-  "$Mutex = [System.Threading.Mutex]::new($false, 'Local\DBBuilderAutoMacroDb');" ^
-  "$HasMutex = $false;" ^
-  "$ExitCode = 0;" ^
-  "try {" ^
-    "try { $HasMutex = $Mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasMutex = $true };" ^
-    "if (-not $HasMutex) { Write-Log 'SKIP' 'Another auto_macro_db workflow is already running' }" ^
-    "else {" ^
-      "Write-Log 'START' 'auto_macro_db workflow';" ^
-      "if (-not (Invoke-RetryPython 'scripts\\health_check.py' 'health_check.py')) { Write-Log 'ERROR' 'health_check.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\security_classification_fetch.py' 'security_classification_fetch.py' '--upsert-local' 900)) { Write-Log 'ERROR' 'security_classification_fetch.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\macro_data_fetch.py' 'macro_data_fetch.py' '' 1800)) { Write-Log 'ERROR' 'macro_data_fetch.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\finra_short_incremental.py' 'finra_short_incremental.py' '' 1800)) { Write-Log 'ERROR' 'finra_short_incremental.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\short_analytics_latest_sync.py' 'short_analytics_latest_sync.py' '' 1800)) { Write-Log 'ERROR' 'short_analytics_latest_sync.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\economic_data_fetch.py' 'economic_data_fetch.py' '--upsert-local')) { Write-Log 'ERROR' 'economic_data_fetch.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 900)) { Write-Log 'ERROR' 'global_economic_data_fetch.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\rule_based_market_update.py' 'rule_based_market_update.py' '--save --window-hours 24 --publish-dashboard --push-dashboard --notify-telegram' 900)) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "else {" ^
-        "Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation';" ^
-        "$FreshnessArgs = @('scripts\\freshness_check.py','--datasets','Macro (close)','--require-critical');" ^
-        "$FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String);" ^
-        "Add-Content -LiteralPath $Log -Value $FreshnessOutput;" ^
-        "$FreshnessExitCode = $LASTEXITCODE;" ^
-        "if ($FreshnessExitCode -eq 2) { Write-Log 'FRESHNESS FAIL' 'Critical macro data failed freshness check'; $ExitCode = 2 }" ^
-        "elseif ($FreshnessExitCode -eq 3) { Write-Log 'FRESHNESS CONFIG ERROR' 'Freshness invocation/config error (usage or unknown dataset) - NOT stale data'; $ExitCode = 3 }" ^
-        "elseif ($FreshnessExitCode -eq 1) { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS WARN' 'Non-critical freshness warnings detected' }" ^
-        "else { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS OK' 'Macro data passed freshness check' }" ^
-      "}" ^
-    "}" ^
-  "} finally {" ^
-    "if ($HasMutex) { $Mutex.ReleaseMutex() }" ^
-    "$Mutex.Dispose()" ^
-  "}" ^
-  "exit $ExitCode"
+REM === CONFIGURATION ===
+set "PYTHON_EXE=C:\Users\User\anaconda3\envs\PostgreSQL_db\python.exe"
+set "POWERSHELL_EXE=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+set "PS_SCRIPT=%~dp0auto_macro_db.ps1"
+
+echo [%date% %time%] POWERSHELL_LAUNCH ps=%POWERSHELL_EXE% script=%PS_SCRIPT% python=%PYTHON_EXE% >> "%BOOTSTRAP_LOG%"
+
+REM === CHANGE TO PROJECT ROOT ===
+cd /d "%DB_BUILDER_ROOT%"
+echo [%date% %time%] CWD=%cd% >> "%BOOTSTRAP_LOG%"
+
+REM === RUN POWERSHELL WRAPPER ===
+"%POWERSHELL_EXE%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PS_SCRIPT%"
 
 set "WORKFLOW_EXIT_CODE=%ERRORLEVEL%"
+echo [%date% %time%] POWERSHELL_EXIT=%WORKFLOW_EXIT_CODE% >> "%BOOTSTRAP_LOG%"
 if not "%WORKFLOW_EXIT_CODE%"=="0" call "%~dp0telegram_system_alert.bat" "auto_macro_db workflow failed. Check scheduled logs."
 exit /b %WORKFLOW_EXIT_CODE%

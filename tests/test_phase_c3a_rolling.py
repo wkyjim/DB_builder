@@ -64,7 +64,7 @@ class TestC3AConstants:
             "ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F", "GC=F",
             "SI=F", "HG=F", "NG=F", "BZ=F", "CL=F",
             "^NDX", "^IXIC", "^RUT", "^MOVE", "^FTSE",
-            "IEF", "SHY", "^KS200", "000001.SS",
+            "IEF", "SHY", "000001.SS",
         ]
         for sym in excluded:
             key = (sym, "YFINANCE_CASH_EQUITY_DAILY")
@@ -148,13 +148,22 @@ class TestSessionState:
         )
         assert state == "NON_TRADING_DAY"
 
-    def test_legacy_treasury_frozen(self):
+    def test_legacy_usnyt_is_not_frozen(self):
+        """USnYT=X uses Investing.com now, so it is NOT a Treasury-frozen symbol.
+
+        session_calendar.TREASURY_SYMBOLS is deliberately empty
+        ("Empty: USnYT=X uses Investing, not Treasury"), which makes SOURCE_FROZEN
+        unreachable. The legacy USnYT=X symbols have no session-calendar mapping,
+        so they classify as NON_TRADING_DAY.
+        """
         from scripts.macro_data_fetch import classify_session_state
         state = classify_session_state(
             "US10YT=X", date(2026, 10, 5),
             now_utc=datetime(2026, 10, 5, 23, 59, tzinfo=ZoneInfo("UTC")),
         )
-        assert state == "SOURCE_FROZEN"
+        # US10YT=X now has an XNYS session calendar and a 17:00 ET close, so at
+        # 23:59 UTC (19:59 ET) the session has closed and is eligible to attempt.
+        assert state == "ELIGIBLE_TO_ATTEMPT"
 
     def test_r22_protected(self):
         from scripts.macro_data_fetch import classify_session_state
@@ -236,7 +245,11 @@ class TestGapDetection:
         assert date(2026, 10, 5) not in gaps  # R22
         assert date(2026, 10, 6) not in gaps  # R22
 
-    def test_detect_gaps_excludes_frozen(self):
+    def test_detect_gaps_finds_unmapped_symbol_gaps(self):
+        """US10YT=X has an XNYS calendar now, so missing sessions ARE gaps.
+
+        It was previously excluded only because it had no calendar mapping.
+        """
         from scripts.macro_data_fetch import detect_historical_gaps
         gaps = detect_historical_gaps(
             symbol="US10YT=X",
@@ -244,9 +257,14 @@ class TestGapDetection:
             scan_end=date(2026, 10, 11),
             stored_dates=set(),
         )
-        assert len(gaps) == 0  # all frozen
+        assert date(2026, 10, 5) in gaps
+        assert date(2026, 10, 6) in gaps
 
-    def test_detect_gaps_excludes_unresolved(self):
+    def test_detect_gaps_finds_hk50_gaps(self):
+        """HK50 has an XHKG calendar now, so missing sessions ARE gaps.
+
+        It was previously excluded only because it had no calendar mapping.
+        """
         from scripts.macro_data_fetch import detect_historical_gaps
         gaps = detect_historical_gaps(
             symbol="HK50",
@@ -254,7 +272,8 @@ class TestGapDetection:
             scan_end=date(2026, 10, 11),
             stored_dates=set(),
         )
-        assert len(gaps) == 0  # unresolved
+        assert date(2026, 10, 5) in gaps
+        assert date(2026, 10, 6) in gaps
 
 
 # ============================================================

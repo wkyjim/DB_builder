@@ -20,6 +20,15 @@ from sqlalchemy import text
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
 
+class FredUnavailableError(RuntimeError):
+    """FRED is unreachable or serving a non-data page (site maintenance).
+
+    Distinct from a parsing bug: the site returned an HTML maintenance page
+    instead of the CSV payload, so retrying immediately cannot help and the
+    caller should degrade rather than fail the whole pipeline.
+    """
+
+
 @dataclass(frozen=True)
 class EconomicSeries:
     series_id: str
@@ -394,10 +403,28 @@ def is_release_due(release_at: datetime, *, now: datetime | None = None) -> bool
     return _coerce_utc(now) >= _coerce_utc(release_at)
 
 
+def _fred_payload_is_html(payload: str) -> bool:
+    """True when FRED served an HTML page instead of the CSV payload."""
+    head = payload.lstrip()[:512].lower()
+    return head.startswith("<!doctype") or head.startswith("<html") or "<html" in head
+
+
 def fetch_fred_csv(series: EconomicSeries, *, start_date: str | date = "2025-01-01", timeout: int = 30) -> list[dict]:
     response = requests.get(FRED_CSV_URL, params={"id": series.series_id}, timeout=timeout)
+    if response.status_code in (502, 503, 504) or _fred_payload_is_html(response.text):
+        raise FredUnavailableError(
+            f"FRED serving non-CSV payload (HTTP {response.status_code}) for {series.series_id}: "
+            "site maintenance or upstream outage"
+        )
     response.raise_for_status()
-    df = pd.read_csv(StringIO(response.text))
+    try:
+        df = pd.read_csv(StringIO(response.text))
+    except Exception as exc:
+        if _fred_payload_is_html(response.text):
+            raise FredUnavailableError(
+                f"FRED serving non-CSV payload for {series.series_id}: site maintenance or upstream outage"
+            ) from exc
+        raise
     if "observation_date" not in df.columns or series.series_id not in df.columns:
         raise ValueError(f"Unexpected FRED CSV shape for {series.series_id}: {list(df.columns)}")
 

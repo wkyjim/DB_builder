@@ -6,6 +6,7 @@ import _bootstrap  # noqa: F401
 
 from db_builder.config import local_engine
 from db_builder.economic_data import (
+    FredUnavailableError,
     build_derived_inflation_rows,
     create_economic_indicators_table,
     default_release_calendar,
@@ -17,6 +18,11 @@ from db_builder.economic_data import (
     upcoming_release_summary,
     upsert_economic_indicators,
 )
+
+
+# Exit code contract (mirrors news_classify.py):
+#   75 = source unavailable / degraded -> caller continues the rest of the pipeline
+EXIT_DEGRADED = 75
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,16 +71,34 @@ def main() -> None:
         return
 
     all_rows = []
+    fred_unavailable = []
     for series in selected:
         should_fetch, reason = should_fetch_series(engine, series.series_id, force_refresh=args.force_refresh)
         if not should_fetch:
             print(f"[SKIP] {series.series_id} {reason}")
             continue
         print(f"[DUE] {series.series_id} {reason}")
-        rows = fetch_fred_csv(series, start_date=args.start_date)
+        try:
+            rows = fetch_fred_csv(series, start_date=args.start_date)
+        except FredUnavailableError as exc:
+            # FRED site maintenance / upstream outage: degrade, do not fail the cycle.
+            print(f"[DEGRADED] {series.series_id} {exc}")
+            fred_unavailable.append(series.series_id)
+            continue
         all_rows.extend(rows)
         latest = max((row["date"] for row in rows), default="n/a")
         print(f"[FETCHED] {series.series_id} rows={len(rows):,} latest={latest}")
+
+    if fred_unavailable and not all_rows:
+        print(
+            "[FRED UNAVAILABLE] FRED returned a non-CSV payload for "
+            + str(len(fred_unavailable))
+            + " series ("
+            + ", ".join(fred_unavailable[:5])
+            + (", ..." if len(fred_unavailable) > 5 else "")
+            + "). Skipping economic fetch this cycle."
+        )
+        raise SystemExit(EXIT_DEGRADED)
 
     if args.dry_run:
         print(f"[DRY RUN] fetched_rows={len(all_rows):,}; no database writes")

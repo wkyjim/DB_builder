@@ -130,9 +130,9 @@ class TestC2NoFamilyInheritance:
         assert not is_retry_eligible(row, dt.datetime.now(dt.timezone.utc),
                                      anchor_override=override)
 
-    def test_ks11_anchor_does_not_imply_ks200(self):
-        """^KS11 anchor does not make ^KS200 eligible."""
-        row = _make_row("^KS200", dt.date(2026, 10, 8))
+    def test_ks11_anchor_does_not_imply_ndx(self):
+        """^KS11 anchor does not make ^NDX eligible."""
+        row = _make_row("^NDX", dt.date(2026, 10, 8))
         def override(r):
             return r.symbol == "^KS11"
         assert not is_retry_eligible(row, dt.datetime.now(dt.timezone.utc),
@@ -326,15 +326,15 @@ class TestC200001SSBlocked:
 
 
 # ============================================================
-# C2-15: ^KS11 anchor does not trust ^KS200
+# C2-15: ^KS11 anchor does not trust ^NDX
 # ============================================================
 
-class TestC2KS11DoesNotTrustKS200:
-    """C2-15: ^KS11 anchor does not extend to ^KS200."""
+class TestC2KS11DoesNotTrustNDX:
+    """C2-15: ^KS11 anchor does not extend to ^NDX."""
 
-    def test_ks11_anchor_no_ks200(self):
-        """^KS200 is not covered by ^KS11 anchor."""
-        row = _make_row("^KS200", dt.date(2026, 10, 8))
+    def test_ks11_anchor_no_ndx(self):
+        """^NDX is not covered by ^KS11 anchor."""
+        row = _make_row("^NDX", dt.date(2026, 10, 8))
         def override(r):
             return r.symbol == "^KS11"  # Only KS11 has anchor
         assert not is_retry_eligible(row, dt.datetime.now(dt.timezone.utc),

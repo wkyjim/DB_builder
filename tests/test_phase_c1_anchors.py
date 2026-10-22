@@ -71,7 +71,6 @@ NO_ANCHOR_SYMBOLS = {
     # ETF FAIL candidates
     "IEF", "SHY", "TLT", "HYG", "JNK", "LQD", "IWD", "IWF", "RSP",
     # Provider-delisted
-    "^KS200",
 }
 
 

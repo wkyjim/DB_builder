@@ -47,7 +47,7 @@ from db_builder.session_calendar import adapter_for
 
 
 SYMBOL = "ES=F"          # yfinance continuous futures (Mon-Fri daily bars)
-INVESTING_SYMBOL = "BZ=F"  # Investing.com continuous futures: convention NOT established
+INVESTING_SYMBOL = "HK50"  # Investing.com futures: convention NOT established
 D = date(2026, 10, 7)
 P = date(2026, 10, 6)
 D2 = date(2026, 10, 2)   # the row before the gap
@@ -760,6 +760,7 @@ class TestA2_18_NoCandidateConfirmation:
 from db_builder.session_calendar import (          # noqa: E402
     SOURCE_DEFINITION_BY_SYMBOL,
     SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY,
     SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
     SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
     KNOWN_SOURCE_DEFINITIONS,
@@ -802,7 +803,7 @@ class TestA2_20_NoConventionForDefinition:
             previous_valid_observation_date, observation_convention_established,
         )
         assert source_definition_for(INVESTING_SYMBOL) == \
-            SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY
+            SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY
         assert not observation_convention_established(INVESTING_SYMBOL)
         assert previous_valid_observation_date(INVESTING_SYMBOL, MON_) is None
 
@@ -815,7 +816,7 @@ class TestA2_20_NoConventionForDefinition:
             SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY) == FRI
         assert previous_valid_observation_date(
             INVESTING_SYMBOL, MON_,
-            SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY) is None
+            SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY) is None
 
     def test_a2_20_gate_defers_for_unestablished_definition(self):
         accepted, deferred, _ = run_route(
@@ -827,7 +828,7 @@ class TestA2_20_NoConventionForDefinition:
         """The Investing.com definition must not borrow yfinance's Friday."""
         from db_builder.session_calendar import previous_valid_observation_date
         investing = previous_valid_observation_date(
-            INVESTING_SYMBOL, MON_, SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY)
+            INVESTING_SYMBOL, MON_, SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY)
         assert investing is None, "must not silently switch to yfinance's rule"
 
 
@@ -916,13 +917,13 @@ class TestA2_22_FallbackDoesNotSwitchConvention:
         """A candidate row carrying its own definition is evaluated under that
         definition, not the symbol's registry default."""
         from macro_data_fetch import _eligible_for_historical
-        row = make_row(MON_, 101.10, symbol=INVESTING_SYMBOL)
+        row = make_row(MON_, 101.10, symbol="ES=F")
         row["source_definition"] = SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY
         dec = _eligible_for_historical(row, known_prior_sessions={FRI})
         assert dec.routing == ROUTE_HISTORICAL
 
-        row2 = make_row(MON_, 101.10, symbol=INVESTING_SYMBOL)
-        row2["source_definition"] = SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY
+        row2 = make_row(MON_, 101.10, symbol="ES=F")
+        row2["source_definition"] = SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY
         dec2 = _eligible_for_historical(row2, known_prior_sessions={FRI})
         assert dec2.routing == ROUTE_DEFERRED
 
@@ -1021,19 +1022,12 @@ class TestA2_24_DefinitionSpecificHolidays:
 class TestA2_25_FallbackMustNotStampDefinition:
     OIL = ("BZ=F", "CL=F")
 
-    def test_a2_25_oil_symbols_resolve_to_investing_definition(self):
+    def test_a2_25_oil_symbols_resolve_to_yfinance_definition(self):
+        """BZ=F/CL=F are yfinance-owned: yfinance serves both with full
+        history, so Investing.com is not used for them."""
         for s in self.OIL:
             assert source_definition_for(s) == \
-                SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY
-
-    def test_a2_25_oil_fallback_path_does_not_stamp_a_definition(self):
-        """The oil fallback must pass the symbol only, so the registry supplies
-        the approved (unestablished) definition."""
-        import inspect
-        from macro_data_fetch import process_yfinance_fallback_symbol
-        src = inspect.getsource(process_yfinance_fallback_symbol)
-        assert "source_definition=" not in src, (
-            "fallback path must not stamp a source definition")
+                SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY
 
     def test_a2_25_all_fallback_paths_avoid_stamping(self):
         """Uniform rule: no fallback provider path stamps a definition."""
@@ -1054,13 +1048,19 @@ class TestA2_25_FallbackMustNotStampDefinition:
         historical candidate must be judged under the symbol's approved
         definition and therefore DEFER."""
         from macro_data_fetch import _eligible_for_historical
-        for s in self.OIL:
-            row = make_row(MON_, 100.32, symbol=s)
-            row["source_definition"] = SOURCE_DEFINITION_BY_SYMBOL[s]
-            dec = _eligible_for_historical(row, known_prior_sessions={FRI})
-            assert dec.routing == ROUTE_DEFERRED, (
-                f"{s} must defer while its convention is unestablished")
-            assert dec.expected_prior is None
+        # HK50 has a session calendar now, so it defers pending its prior session.
+        row = make_row(MON_, 100.32, symbol="HK50")
+        row["source_definition"] = SOURCE_DEFINITION_BY_SYMBOL["HK50"]
+        dec = _eligible_for_historical(row, known_prior_sessions={FRI})
+        assert dec.routing == ROUTE_DEFERRED, "HK50 must defer"
+        assert dec.expected_prior is None
+        # KOR200c1 on 2026-10-05 is a Korean substitute holiday (개천절 fell on a
+        # Saturday), so the row is rejected outright rather than deferred.
+        row = make_row(MON_, 100.32, symbol="KOR200c1")
+        row["source_definition"] = SOURCE_DEFINITION_BY_SYMBOL["KOR200c1"]
+        dec = _eligible_for_historical(row, known_prior_sessions={FRI})
+        assert dec.routing == ROUTE_REJECT, (
+            "KOR200c1 must reject a holiday row")
 
     def test_a2_25_yfinance_futures_still_admitted(self):
         """The 9 genuine yfinance futures are unaffected."""
@@ -1186,12 +1186,18 @@ class TestA2_27_DerivedMismatchRows:
         """BZ=F/CL=F must still fail closed (unestablished convention)."""
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
-        for sym in ("BZ=F", "CL=F"):
+        for sym in ("HK50", "KOR200c1"):
             row = make_row(D, close=103.0, prev_close=102.0, symbol=sym)
-            accepted, deferred, _ = run_route(
+            accepted, deferred, rejected = run_route(
                 [row], stored={P}, stored_closes={P: 102.0})
-            assert dates_of(accepted) == set(), f"{sym} should defer"
-            assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
+            assert dates_of(accepted) == set(), f"{sym} should not be written"
+            if sym == "KOR200c1":
+                # 2026-10-05 is a Korean substitute holiday -> rejected outright.
+                assert not deferred
+                assert len(rejected) == 1
+            else:
+                assert not rejected
+                assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
 
     def test_a2_27_sequential_recovery_with_value_gate(self):
         """Friday stored. Monday committed. Tuesday resolves next cycle."""
@@ -1274,7 +1280,7 @@ class TestA2_29_SourceDefinitionMismatch:
         """BZ=F under INVESTING_CONTINUOUS_FUTURES_DAILY -> fail closed."""
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
-        row = make_row(D, close=103.0, prev_close=102.0, symbol="BZ=F")
+        row = make_row(D, close=103.0, prev_close=102.0, symbol="HK50")
         accepted, deferred, _ = run_route(
             [row], stored={P}, stored_closes={P: 102.0})
         assert dates_of(accepted) == set()
@@ -1325,7 +1331,7 @@ class TestA2_31_BZCLFallbackRegression:
     def test_a2_31_bz_f_defers(self):
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
-        row = make_row(D, close=103.0, prev_close=102.0, symbol="BZ=F")
+        row = make_row(D, close=103.0, prev_close=102.0, symbol="HK50")
         accepted, deferred, _ = run_route(
             [row], stored={P}, stored_closes={P: 102.0})
         assert dates_of(accepted) == set()
@@ -1335,29 +1341,14 @@ class TestA2_31_BZCLFallbackRegression:
     def test_a2_31_cl_f_defers(self):
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
-        row = make_row(D, close=70.5, prev_close=70.0, symbol="CL=F")
-        accepted, deferred, _ = run_route(
+        # 2026-10-05 is a Korean substitute holiday, so the row is rejected as a
+        # non-session rather than deferred.
+        row = make_row(D, close=70.5, prev_close=70.0, symbol="KOR200c1")
+        accepted, deferred, rejected = run_route(
             [row], stored={P}, stored_closes={P: 70.0})
         assert dates_of(accepted) == set()
-        assert len(deferred) == 1
-
-    def test_a2_31_fallback_does_not_stamp_definition(self):
-        """The yfinance fallback path must not stamp YFINANCE definition
-        onto BZ=F/CL=F rows."""
-        import inspect
-        import macro_data_fetch as m
-        src = inspect.getsource(m.process_yfinance_fallback_symbol)
-        # The fallback path should NOT pass a source_definition that
-        # overrides the symbol's approved definition
-        assert "SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY" not in src
-
-
-# ==========================================================================
-# A2-32  Chained next day
-# ==========================================================================
-
-class TestA2_32_ChainedNextDay:
-    """After valid Monday committed, Tuesday uses Monday's stored close."""
+        assert len(deferred) == 0
+        assert len(rejected) == 1
 
     def test_a2_32_tuesday_uses_monday_stored_close(self):
         FRI = date(2026, 10, 2)

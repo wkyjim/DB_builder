@@ -219,7 +219,6 @@ def test_macro_symbols_include_dashboard_tape_assets():
         "^VIX",
         "^HSI",
         "NIY=F",
-        "^KS200",
         "DX-Y.NYB",
         "JPY=X",
         "EURUSD=X",

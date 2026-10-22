@@ -1,6 +1,11 @@
+import os
+import json
 import time
 import random
 import math
+import re
+import urllib.request
+import urllib.error
 import pandas as pd
 import yfinance as yf
 import argparse
@@ -299,31 +304,22 @@ C3A_APPROVED_ANCHORS: dict = {
 # failures may be accepted, but are reported as PARTIAL FAILURE rather than
 # SUCCESS. Provider fallback is intentionally outside this policy.
 MIN_COVERAGE_PCT = 90.0
-REQUIRED_SYMBOLS = frozenset(
+APPROVED_MACRO_SYMBOLS = frozenset(
     {
-        "^GSPC",
-        "^NDX",
-        "^DJI",
-        "^VIX",
-        "^HSI",
-        "^N225",
-        "^KS11",
-        "GC=F",
-        "CL=F",
-        "BZ=F",
-        "^FVX",
-        "^TNX",
-        "^TYX",
-        "US2YT=X",
-        "US10YT=X",
-        "US30YT=X",
-        "DX-Y.NYB",
-        "EURUSD=X",
-        "JPY=X",
-        "CNY=X",
+        "^GSPC", "^IXIC", "^NDX", "^DJI", "^RUT", "^VIX", "^SKEW", "^HSI",
+        "^N225", "^KS11", "^GDAXI", "^FCHI", "^FTSE", "^MOVE", "000001.SS",
+        "TLT", "HYG", "JNK", "LQD", "IWD", "IWF", "RSP", "IEF", "SHY",
+        "US2YT=X", "US3YT=X", "US5YT=X", "US7YT=X", "US10YT=X", "US20YT=X",
+        "US30YT=X", "US2YT_CMT", "US3YT_CMT", "US5YT_CMT", "US7YT_CMT",
+        "US10YT_CMT", "US20YT_CMT", "US30YT_CMT", "HK50", "KOR200c1",
+        "CIHc1", "ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F", "GC=F", "SI=F",
+        "BRENT_OILPRICE", "WTI_OILPRICE",
+        "HG=F", "NG=F", "BZ=F", "CL=F", "BTC-USD", "ETH-USD", "AUDUSD=X",
+        "CHFUSD=X", "CNY=X", "EURUSD=X", "GBPUSD=X", "HKD=X", "JPY=X",
+        "NZDUSD=X", "SGD=X", "^FVX", "^TNX", "^TYX", "DX-Y.NYB",
     }
 )
-OIL_YFINANCE_FALLBACK_SYMBOLS = frozenset({"CL=F", "BZ=F"})
+REQUIRED_SYMBOLS = APPROVED_MACRO_SYMBOLS
 
 # Asia futures fallback: Investing.com is the primary source for HK50
 # (Hang Seng futures), KOR200c1 (KOSPI 200 futures) and CIHc1 (SSE 50
@@ -338,32 +334,30 @@ ASIA_INDEX_YFINANCE_FALLBACK_MAP = {
 }
 ASIA_INDEX_YFINANCE_FALLBACK_SYMBOLS = frozenset(ASIA_INDEX_YFINANCE_FALLBACK_MAP)
 
+# OilPriceAPI spot/indicative series. Deliberately a SEPARATE provider phase:
+# these are spot indicative USD/barrel quotes, NOT futures settlement prices, so
+# they must never be mixed with BZ=F / CL=F (yfinance futures).
+OILPRICEAPI_MAPPING = {
+    "BRENT_OILPRICE": "BRENT_CRUDE_USD",
+    "WTI_OILPRICE": "WTI_USD",
+}
+OILPRICEAPI_ASSETS = frozenset(OILPRICEAPI_MAPPING)
+OILPRICEAPI_BASE_URL = "https://api.oilpriceapi.com/v1"
+OILPRICEAPI_RATE_LIMIT_SECONDS = 2.0
+
 # P1B: U.S. Treasury official par-yield fallback.
 # Canonical DB symbols map to Treasury XML BC_*YEAR elements. The Treasury
 # par-yield curve is built from the most recently auctioned 2Y/3Y/5Y/7Y/10Y/
 # 20Y/30Y securities, so every tenor below has a direct on-the-run input.
 UST_TREASURY_FALLBACK_SYMBOLS = frozenset(
     {
-        "US2YT=X",
-        "US3YT=X",
-        "US5YT=X",
-        "US7YT=X",
-        "US10YT=X",
-        "US20YT=X",
-        "US30YT=X",
+        # USnYT=X series are owned ONLY by Investing.com market yield.
+        # Treasury.gov fallback is exclusively for CMT symbols.
     }
 ) | CMT_SYMBOLS
+# Treasury XML element map: ONLY CMT symbols.
+# USnYT=X series are owned by Investing.com and must never use Treasury.gov.
 TREASURY_XML_ELEMENT_MAP = {
-    "US2YT=X": "BC_2YEAR",
-    "US3YT=X": "BC_3YEAR",
-    "US5YT=X": "BC_5YEAR",
-    "US7YT=X": "BC_7YEAR",
-    "US10YT=X": "BC_10YEAR",
-    "US20YT=X": "BC_20YEAR",
-    "US30YT=X": "BC_30YEAR",
-}
-# Official CMT series: same tenor elements, distinct symbol identity.
-TREASURY_XML_ELEMENT_MAP.update({
     "US2YT_CMT": "BC_2YEAR",
     "US3YT_CMT": "BC_3YEAR",
     "US5YT_CMT": "BC_5YEAR",
@@ -371,7 +365,7 @@ TREASURY_XML_ELEMENT_MAP.update({
     "US10YT_CMT": "BC_10YEAR",
     "US20YT_CMT": "BC_20YEAR",
     "US30YT_CMT": "BC_30YEAR",
-})
+}
 TREASURY_XML_URL_TEMPLATE = (
     "https://home.treasury.gov/resource-center/data-chart-center/"
     "interest-rates/pages/xml?data=daily_treasury_yield_curve"
@@ -418,7 +412,6 @@ ASSETS = [
     ("^HSI", "HANG SENG INDEX", "stock_index"),
     ("^N225", "Nikkei 225", "stock_index"),
     ("^KS11", "KOSPI Composite Index", "stock_index"),
-    ("^KS200", "KOSPI 200 Index", "stock_index"),
     ("000001.SS", "SSE Composite Index", "stock_index"),
     ("^FTSE", "FTSE 100", "stock_index"),
     ("^GDAXI", "DAX", "stock_index"),
@@ -438,6 +431,10 @@ ASSETS = [
     ("HG=F", "Copper Future", "futures"),
     ("SI=F", "Silver Future", "futures"),
     ("NG=F", "Natural Gas Future", "futures"),
+
+    # OilPriceAPI spot/indicative series (distinct from the futures symbols above).
+    ("BRENT_OILPRICE", "Brent Crude Oil Spot (OilPriceAPI)", "oil_price"),
+    ("WTI_OILPRICE", "WTI Crude Oil Spot (OilPriceAPI)", "oil_price"),
 
     ("^FVX", "Treasury Yield 5 Years", "ust_yield"),
     ("^TNX", "Treasury Yield 10 Years", "ust_yield"),
@@ -500,6 +497,12 @@ class SymbolFetchOutcome:
     primary_failure_reason: str | None = None
     fallback_provider: str | None = None
     fallback_failure_reason: str | None = None
+    # Data freshness state (independent of provider coverage)
+    # Valid values: CURRENT, CURRENT_FOR_PROVIDER, CURRENT_BUT_PROVIDER_UNAVAILABLE,
+    #               STALE, UNCONFIRMED, BLOCKED, WRONG_SOURCE, PROVIDER_DATA_INSUFFICIENT
+    data_freshness_state: str | None = None
+    # Whether Local data is acceptably current even if provider fetch failed
+    local_is_current: bool = False
 
 
 @dataclass(frozen=True)
@@ -541,13 +544,11 @@ INVESTINY_ASSETS = {
     # Investing.com continuous front-contract instruments. The public source
     # labels currently display as LCOV6 (Brent) and OIL (WTI), while the
     # canonical database symbols remain BZ=F and CL=F for API compatibility.
-    "BZ=F": 8833,
-    "CL=F": 8849,
 }
 
 INVESTING_SOURCE_SYMBOLS = {
-    "BZ=F": "LCOV6",
-    "CL=F": "OIL",
+    # BZ=F / CL=F are yfinance-owned (yfinance serves both with full
+    # history), so they no longer map to an Investing.com source symbol.
 }
 
 
@@ -565,7 +566,6 @@ SYMBOL_CLOSE_MAP = {
     "^HSI": {"tz": "Asia/Hong_Kong", "close_time": "16:10"},
     "^IXIC": {"tz": "America/New_York", "close_time": "16:00"},
     "^KS11": {"tz": "Asia/Seoul", "close_time": "15:30"},
-    "^KS200": {"tz": "Asia/Seoul", "close_time": "15:30"},
     "^N225": {"tz": "Asia/Tokyo", "close_time": "15:30"},
     "^RUT": {"tz": "America/New_York", "close_time": "16:00"},
     "^VIX": {"tz": "America/Chicago", "close_time": "15:15"},
@@ -578,9 +578,9 @@ SYMBOL_CLOSE_MAP = {
     "YM=F": {"tz": "America/New_York", "close_time": "17:00"},
     "RTY=F": {"tz": "America/New_York", "close_time": "17:00"},
     "NIY=F": {"tz": "America/Chicago", "close_time": "16:00"},
-    "KOR200c1": {"tz": "Asia/Seoul", "close_time": "15:45"},
-    "HK50": {"tz": "Asia/Hong_Kong", "close_time": "16:30"},
-    "CIHc1": {"tz": "Asia/Shanghai", "close_time": "15:15"},
+    "KOR200c1": {"tz": "Asia/Seoul", "close_time": "06:00"},
+    "HK50": {"tz": "Asia/Hong_Kong", "close_time": "03:00"},
+    "CIHc1": {"tz": "Asia/Shanghai", "close_time": "15:00"},
     "GC=F": {"tz": "America/New_York", "close_time": "17:00"},
     "CL=F": {"tz": "America/New_York", "close_time": "17:00"},
     "BZ=F": {"tz": "America/New_York", "close_time": "17:00"},
@@ -588,16 +588,22 @@ SYMBOL_CLOSE_MAP = {
     "SI=F": {"tz": "America/New_York", "close_time": "17:00"},
     "NG=F": {"tz": "America/New_York", "close_time": "17:00"},
 
+    # OilPriceAPI is an indicative spot quote, not an exchange-traded session;
+    # US/Eastern is used only as the reference for "is the quote current".
+    "BRENT_OILPRICE": {"tz": "America/New_York", "close_time": "17:00"},
+    "WTI_OILPRICE": {"tz": "America/New_York", "close_time": "17:00"},
+
     "^FVX": {"tz": "America/New_York", "close_time": "16:00"},
     "^TNX": {"tz": "America/New_York", "close_time": "16:00"},
     "^TYX": {"tz": "America/New_York", "close_time": "16:00"},
-    "US2YT=X": {"tz": "America/New_York", "close_time": "16:00"},
-    "US3YT=X": {"tz": "America/New_York", "close_time": "16:00"},
-    "US5YT=X": {"tz": "America/New_York", "close_time": "16:00"},
-    "US7YT=X": {"tz": "America/New_York", "close_time": "16:00"},
-    "US10YT=X": {"tz": "America/New_York", "close_time": "16:00"},
-    "US20YT=X": {"tz": "America/New_York", "close_time": "16:00"},
-    "US30YT=X": {"tz": "America/New_York", "close_time": "16:00"},
+    # US Treasury yields (Investing.com): daily market close 17:00 ET.
+    "US2YT=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "US3YT=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "US5YT=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "US7YT=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "US10YT=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "US20YT=X": {"tz": "America/New_York", "close_time": "17:00"},
+    "US30YT=X": {"tz": "America/New_York", "close_time": "17:00"},
 
     # Official CMT series: same US business-day/16:00 ET reference as the
     # legacy symbols. Session confirmation still comes from the actual
@@ -750,8 +756,34 @@ def _macro_live_upsert_sql():
     """)
 
 
+def _validate_macro_live_source(rows):
+    """Reject wrong-source live rows for USnYT=X symbols.
+
+    USnYT=X series are owned ONLY by Investing.com market yield.
+    Treasury.gov, CMT, ^TNX, ^TYX, or any other non-Investing source
+    must be rejected at the write boundary.
+    """
+    usnyt_pattern = re.compile(r'^US(?:[2357]|10|20|30)YT=X$')
+    rejected = []
+    for row in rows:
+        symbol = row.get('symbol', '')
+        source = row.get('source', '')
+        if usnyt_pattern.match(symbol):
+            if source not in ('investing.com', 'INVESTING', 'investing'):
+                rejected.append((symbol, source))
+                print(f"[WRONG_SOURCE_LIVE_REJECTED] {symbol} source={source}")
+    return rejected
+
+
 def replace_macro_live(engine, rows):
     """Atomically replace a complete transient intraday snapshot."""
+    # Hard write-time guard: reject wrong-source USnYT=X live rows
+    rejected = _validate_macro_live_source(rows)
+    if rejected:
+        raise ValueError(
+            f"Wrong-source live rows rejected for USnYT=X: {rejected}"
+        )
+
     df = _prepare_macro_live_rows(rows)
 
     with engine.begin() as conn:
@@ -768,6 +800,13 @@ def merge_macro_live(engine, rows, successful_symbols):
     symbols = sorted(set(successful_symbols))
     if not symbols:
         return
+
+    # Hard write-time guard: reject wrong-source USnYT=X live rows
+    rejected = _validate_macro_live_source(rows)
+    if rejected:
+        raise ValueError(
+            f"Wrong-source live rows rejected for USnYT=X: {rejected}"
+        )
 
     df = _prepare_macro_live_rows(rows)
     with engine.begin() as conn:
@@ -1717,6 +1756,216 @@ def symbol_date_has_closed(symbol, bar_date, now=None):
     return now_local >= bar_close_dt
 
 
+def validate_provider_bar_completeness(bar):
+    """Check if a provider bar has all required OHLC fields valid.
+
+    Returns:
+      True if bar is complete and valid
+      False if any required field is missing or invalid
+    """
+    import math as _math
+    for field in ("Open", "High", "Low", "Close"):
+        val = bar.get(field)
+        if val is None:
+            return False
+        try:
+            if pd.isna(val):
+                return False
+        except Exception:
+            pass
+        try:
+            if not _math.isfinite(float(val)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    # Validate OHLC relationship
+    o, h, l, c = float(bar["Open"]), float(bar["High"]), float(bar["Low"]), float(bar["Close"])
+    if not (h >= l and h >= o and h >= c and l <= o and l <= c):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# macro_live source validation for USnYT=X symbols
+# ---------------------------------------------------------------------------
+#
+# USnYT=X symbols (US2YT=X ... US30YT=X) must only contain Investing.com
+# market-yield data in macro_live. Treasury.gov CMT data belongs exclusively
+# to USnYT_CMT symbols and must never appear under USnYT=X.
+
+_US_YIELD_LIVE_SYMBOLS = frozenset(
+    symbol for symbol in TREASURY_SYMBOLS
+    if symbol.endswith("YT=X")
+)
+
+_VALID_US_YIELD_LIVE_SOURCES = frozenset({"investing.com"})
+
+_WRONG_SOURCE_LIVE_PATTERNS = (
+    "treasury",
+    "cmt",
+    "tnx",
+    "tyx",
+)
+
+
+def validate_macro_live_source(symbol, source):
+    """Validate that a macro_live row for USnYT=X has the correct source.
+
+    USnYT=X symbols must only contain Investing.com market-yield data.
+    Treasury.gov, CMT, ^TNX, ^TYX, and other source families are rejected.
+
+    Args:
+      symbol: The macro symbol (e.g. "US30YT=X").
+      source: The source string stored in macro_live.
+
+    Returns:
+      (True, "OK") if the source is valid for this symbol.
+      (False, reason) if the source is rejected.
+    """
+    if symbol not in _US_YIELD_LIVE_SYMBOLS:
+        # Not a USnYT=X symbol — no restriction.
+        return True, "OK (not USnYT=X)"
+
+    source_lower = str(source).lower() if source else ""
+
+    # Explicit allow-list first.
+    if source_lower in _VALID_US_YIELD_LIVE_SOURCES:
+        return True, "OK"
+
+    # Reject known wrong-source families.
+    for pattern in _WRONG_SOURCE_LIVE_PATTERNS:
+        if pattern in source_lower:
+            return False, (
+                f"REJECTED: source '{source}' contains forbidden pattern "
+                f"'{pattern}' for {symbol}"
+            )
+
+    # Reject anything that is not explicitly allowed.
+    return False, (
+        f"REJECTED: source '{source}' is not in the allowed set "
+        f"{sorted(_VALID_US_YIELD_LIVE_SOURCES)} for {symbol}"
+    )
+
+
+def auto_clean_wrong_source_live_rows(engine):
+    """Remove wrong-source macro_live rows for all USnYT=X symbols.
+
+    For each USnYT=X symbol, if macro_live contains a row from the wrong
+    source family (treasury.gov, CMT, etc.), remove it. This prevents
+    stale wrong-source rows from surviving indefinitely.
+
+    Args:
+      engine: A SQLAlchemy engine connected to the local database.
+
+    Returns:
+      list of (symbol, old_source) tuples for each row that was removed.
+    """
+    removed = []
+    with engine.connect() as conn:
+        for symbol in sorted(_US_YIELD_LIVE_SYMBOLS):
+            row = conn.execute(
+                text("SELECT source FROM macro_live WHERE symbol = :sym"),
+                {"sym": symbol},
+            ).fetchone()
+            if row is None:
+                continue
+            old_source = row[0]
+            valid, reason = validate_macro_live_source(symbol, old_source)
+            if not valid:
+                conn.execute(
+                    text("DELETE FROM macro_live WHERE symbol = :sym"),
+                    {"sym": symbol},
+                )
+                removed.append((symbol, old_source))
+                print(
+                    f"[MACRO_LIVE AUTO-CLEAN] {symbol}: "
+                    f"removed wrong-source row (source={old_source}) | {reason}"
+                )
+        conn.commit()
+    return removed
+
+
+def classify_market_session(symbol, provider_session_date, now=None, provider_bar=None):
+    """Universal market-data finalization classifier.
+
+    Returns one of:
+      LIVE                — session is still open; write/update macro_live
+      FINALIZED_EOD       — session has ended + buffer; write/update public.macro
+      SOURCE_BLOCKED      — symbol is R22-protected or otherwise blocked
+      NOT_AVAILABLE       — unknown symbol or future date
+      PROVIDER_BAR_INCOMPLETE — session finalized but provider bar has missing/invalid OHLC
+
+    Universal rule:
+      FINALIZED_AT = PRODUCT_DAY_END + 30 minutes (GLOBAL_BUFFER_MINUTES)
+
+    This is the single canonical classifier. All ingestion paths (normal
+    ingestion, EOD refresh, Investing fetch, Yahoo fetch, Market Tape
+    selection) must call this function. No path may implement its own
+    finalization logic.
+    """
+    # Handle string dates
+    if isinstance(provider_session_date, str):
+        try:
+            provider_session_date = date.fromisoformat(provider_session_date)
+        except ValueError:
+            return "NOT_AVAILABLE"
+
+    # R22-protected symbols are source-blocked
+    if _is_r22_protected(symbol, provider_session_date):
+        return "SOURCE_BLOCKED"
+
+    # 24/7 crypto sessions use UTC daily-session boundary
+    if is_24_7_daily_session(symbol):
+        current_utc = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
+        today_utc = current_utc.date()
+        if provider_session_date > today_utc:
+            return "NOT_AVAILABLE"
+        if provider_session_date < today_utc:
+            return "FINALIZED_EOD"
+        session_end = session_end_utc(symbol, provider_session_date)
+        return "FINALIZED_EOD" if current_utc >= session_end + timedelta(minutes=GLOBAL_BUFFER_MINUTES) else "LIVE"
+
+    # Unknown symbols are not available
+    try:
+        cfg = get_close_config(symbol)
+    except (KeyError, ValueError):
+        return "NOT_AVAILABLE"
+
+    # Use the symbol's local date for the future check
+    tz = ZoneInfo(cfg["tz"])
+    now_local = (now or datetime.now(ZoneInfo("UTC"))).astimezone(tz)
+    today = now_local.date()
+
+    # Future dates are not available
+    if provider_session_date > today:
+        return "NOT_AVAILABLE"
+
+    # Previous day sessions are always finalized (provider returned the data)
+    if provider_session_date < today:
+        # Check completeness if provider bar is provided
+        if provider_bar is not None and not validate_provider_bar_completeness(provider_bar):
+            return "PROVIDER_BAR_INCOMPLETE"
+        return "FINALIZED_EOD"
+
+    # Same-day session: check close time
+    close_time = cfg["close_time"]
+    close_hour, close_minute = map(int, close_time.split(":"))
+    session_end_local = datetime(provider_session_date.year, provider_session_date.month, provider_session_date.day, close_hour, close_minute, tzinfo=tz)
+    session_end_as_utc = session_end_local.astimezone(ZoneInfo("UTC"))
+    finalized_at = session_end_as_utc + timedelta(minutes=GLOBAL_BUFFER_MINUTES)
+
+    current_utc = now_local.astimezone(ZoneInfo("UTC"))
+    is_finalized = current_utc >= finalized_at
+    
+    if is_finalized:
+        # Check completeness if provider bar is provided
+        if provider_bar is not None and not validate_provider_bar_completeness(provider_bar):
+            return "PROVIDER_BAR_INCOMPLETE"
+        return "FINALIZED_EOD"
+    else:
+        return "LIVE"
+
+
 def _is_r22_protected(symbol, session_date):
     """Check if (symbol, date) is R22-protected.
 
@@ -1743,7 +1992,6 @@ def classify_session_state(symbol, session_date, *, now_utc=None):
       CLOSED_WAITING_FINALIZATION_DELAY — closed but < +30m
       ELIGIBLE_TO_ATTEMPT           — closed >= +30m, provider fetch may be attempted
       NON_TRADING_DAY               — weekend/holiday for this symbol
-      SOURCE_FROZEN                 — legacy frozen (e.g. USnYT=X)
       SOURCE_UNRESOLVED             — no approved source definition
       R22_PROTECTED                  — R22-withdrawn date
     """
@@ -1752,10 +2000,6 @@ def classify_session_state(symbol, session_date, *, now_utc=None):
     # Check if trading day
     if not adapter_for(symbol).is_trading_day(session_date):
         return "NON_TRADING_DAY"
-
-    # Check if frozen
-    if symbol in TREASURY_SYMBOLS:
-        return "SOURCE_FROZEN"
 
     # Check R22 protection — MUST precede source/gap eligibility
     if _is_r22_protected(symbol, session_date):
@@ -3095,9 +3339,17 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
         if prev_close is None and not allow_missing_prior:
             # D-1 missing (or calendar unavailable). Never use an older
             # positional value -- this is the confirmed incident.
-            _report_prev_session_unconfirmed(symbol, latest_date, expected_prior,
-                                             defer_callback)
-            continue
+            # Phase 6: Check trusted committed Local P before deferring.
+            if expected_prior is not None:
+                local_prev_close = _get_trusted_local_close(symbol, expected_prior)
+                if local_prev_close is not None:
+                    prev_close = local_prev_close
+                    print(f"[PREVIOUS_SESSION_CONFIRMED_FROM_LOCAL] {symbol} {latest_date}: "
+                          f"using trusted Local close for {expected_prior}")
+            if prev_close is None:
+                _report_prev_session_unconfirmed(symbol, latest_date, expected_prior,
+                                                 defer_callback)
+                continue
 
         open_price = latest.get("Open")
         high = latest.get("High")
@@ -3140,6 +3392,28 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
         })
 
     return rows
+
+
+def _get_trusted_local_close(symbol, expected_prior):
+    """Query trusted committed Local close for symbol at expected_prior date.
+
+    Returns the close value if a committed row exists in public.macro for the
+    exact (symbol, expected_prior) key. Returns None if no such row exists or
+    the value is null/invalid. Never synthesizes or estimates a value.
+    """
+    try:
+        from db_builder.db import get_local_engine
+        engine = get_local_engine()
+        with engine.connect() as conn:
+            row = conn.execute(
+                "SELECT close FROM public.macro WHERE symbol = %s AND date = %s",
+                (symbol, expected_prior)
+            ).fetchone()
+        if row and row[0] is not None:
+            return float(row[0])
+    except Exception as exc:
+        print(f"[TRUSTED_LOCAL_CLOSE_ERROR] {symbol} {expected_prior}: {exc}")
+    return None
 
 
 def _report_prev_session_unconfirmed(symbol, session_date, expected_prior,
@@ -3263,76 +3537,85 @@ def _investiny_date(value):
 
 
 # ============================================================
-# INVESTING.COM PROVIDER CIRCUIT BREAKER
+# INVESTING.COM PER-SYMBOL CIRCUIT BREAKER
 # ============================================================
 # Repeated HTTP 403 responses from Investing.com previously caused
 # 20+ minutes of per-symbol exponential backoff across 12 symbols.
 # After at most INVESTINY_CIRCUIT_BREAKER_TRIPS consecutive 403
-# responses, the provider is marked unavailable for the remainder of
-# the current cycle: no further Investing.com requests are attempted,
-# and every remaining Investing.com-routed symbol goes straight to its
-# fallback (Treasury.gov XML for UST, yfinance for oil, yfinance index
-# proxies for Asia futures). Symbols with no fallback are recorded as
-# DEGRADED in cycle metadata rather than silently dropped.
+# responses for a SPECIFIC symbol, only that symbol's breaker opens.
+# Other Investing.com symbols continue fetching normally.
+#
+# BREAKER KEY = (provider, canonical_symbol)
+# Example: ("investing.com", "BZ=F")
+# Example: ("investing.com", "US2YT=X")
+#
+# This prevents one symbol's 403 from blocking unrelated symbols.
 INVESTINY_CIRCUIT_BREAKER_TRIPS = 1
 
-# Provider-level circuit breaker state (shared across all symbols in a cycle)
-_provider_breaker_open = False
-_provider_breaker_reason = None
-_provider_breaker_tripped_at = None
+# Per-symbol circuit breaker state
+# Key: (provider, symbol) -> {"open": bool, "reason": str, "tripped_at": datetime}
+_symbol_breakers: dict[tuple[str, str], dict] = {}
 _provider_requests_count = 0
 _provider_failure_count = 0
 
 
-def is_investiny_provider_available():
-    """Check if Investing.com provider is available for the current cycle.
+def is_investiny_symbol_available(symbol: str) -> bool:
+    """Check if Investing.com is available for a specific symbol.
     
-    Returns True if the provider breaker is closed (available).
-    Returns False if the provider breaker is open (unavailable).
+    Returns True if the symbol's breaker is closed (available).
+    Returns False if the symbol's breaker is open (unavailable).
     """
-    return not _provider_breaker_open
+    key = ("investing.com", symbol)
+    return not _symbol_breakers.get(key, {}).get("open", False)
 
 
 def get_investiny_provider_state():
-    """Return the current provider breaker state dict for cycle metadata."""
+    """Return the current per-symbol breaker state dict for cycle metadata."""
+    open_symbols = [
+        {"symbol": key[1], "reason": state.get("reason"), "tripped_at": state.get("tripped_at").isoformat() if state.get("tripped_at") else None}
+        for key, state in _symbol_breakers.items()
+        if state.get("open")
+    ]
     return {
-        "provider_available": not _provider_breaker_open,
-        "breaker_tripped": _provider_breaker_open,
-        "reason": _provider_breaker_reason,
-        "tripped_at": _provider_breaker_tripped_at.isoformat() if _provider_breaker_tripped_at else None,
+        "provider_available": len(open_symbols) == 0,
+        "breaker_tripped": len(open_symbols) > 0,
+        "open_symbols": open_symbols,
         "requests_made": _provider_requests_count,
         "failures": _provider_failure_count,
     }
 
 
-def record_investiny_provider_failure(reason: str):
-    """Record a provider-level failure and open the breaker if threshold reached.
+def record_investiny_symbol_failure(symbol: str, reason: str):
+    """Record a per-symbol failure and open the symbol's breaker if threshold reached.
     
-    This is called by the run_daily_update loop when a symbol encounter
-    a provider-wide error (403, 429, 5xx, connection failure).
+    This is called by the run_daily_update loop when a symbol encounters
+    a provider error (403, 429, 5xx, connection failure).
+    
+    Only the specific symbol's breaker is opened. Other symbols continue normally.
     """
-    global _provider_breaker_open, _provider_breaker_reason, _provider_breaker_tripped_at, _provider_failure_count
+    global _provider_failure_count, _provider_requests_count
     _provider_failure_count += 1
     _provider_requests_count += 1
     
-    # Check if this is a provider-wide error (403/429/5xx/connection)
+    # Check if this is a provider error (403/429/5xx/connection)
     is_provider_error = any(code in str(reason) for code in ["403", "429", "500", "502", "503", "504", "Connection", "SSL", "DNS", "timeout"])
     
     if is_provider_error:
-        _provider_breaker_open = True
-        _provider_breaker_reason = str(reason)
-        _provider_breaker_tripped_at = datetime.now(ZoneInfo("UTC"))
-        print(f"[INVESTINY PROVIDER BREAKER OPEN] {_provider_breaker_reason}")
-        return True  # Breaker opened
+        key = ("investing.com", symbol)
+        _symbol_breakers[key] = {
+            "open": True,
+            "reason": str(reason),
+            "tripped_at": datetime.now(ZoneInfo("UTC")),
+        }
+        print(f"[INVESTINY SYMBOL BREAKER OPEN] provider=investing.com symbol={symbol} reason={reason}")
+        return True  # Breaker opened for this symbol
     return False  # Transient error, breaker not opened
 
 
 def reset_investiny_provider_state():
-    """Reset provider breaker state for a new cycle."""
-    global _provider_breaker_open, _provider_breaker_reason, _provider_breaker_tripped_at, _provider_requests_count, _provider_failure_count
-    _provider_breaker_open = False
-    _provider_breaker_reason = None
-    _provider_breaker_tripped_at = None
+    """Reset all per-symbol breaker states for a new cycle."""
+    global _provider_requests_count, _provider_failure_count
+    _symbol_breakers.clear()
     _provider_requests_count = 0
     _provider_failure_count = 0
 
@@ -3646,90 +3929,10 @@ def fetch_yfinance_daily_frame(symbols, *, start_date=None):
     return frames, target_start_date
 
 
-def process_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_at=None):
-    """Fetch and transform one oil symbol through the guarded yfinance fallback."""
-    if symbol not in OIL_YFINANCE_FALLBACK_SYMBOLS:
-        raise ValueError(f"yfinance fallback is not enabled for {symbol}")
-    rows_fetched = 0
-    latest_observation = None
-    try:
-        batch_df, target_start_date = download_recent_batch(
-            [symbol],
-            start_date=start_date,
-        )
-        symbol_df = extract_symbol_df_from_batch(batch_df, symbol)
-        rows_fetched = len(symbol_df)
-        symbol_df, rows_fetched, latest_observation = validate_fallback_observations(
-            symbol_df
-        )
-
-        required_latest = latest_completed_nyse_session_date(now=observed_at)
-        if latest_observation < required_latest:
-            raise ValueError(
-                "stale fallback response: "
-                f"latest observation {latest_observation} is before required {required_latest}"
-            )
-
-        print(
-            f"[YF FALLBACK DATES RAW] {symbol} | "
-            f"{pd.to_datetime(symbol_df['Date']).dt.date.tolist()}"
-        )
-        print(
-            f"[YF FALLBACK FRESHNESS OK] {symbol} | "
-            f"latest={latest_observation} required={required_latest}"
-        )
-
-        live_row = extract_latest_unfinished_row(
-            df=symbol_df,
-            symbol=symbol,
-            name=meta["name"],
-            asset_type=meta["asset_type"],
-            observed_at=observed_at,
-        )
-
-        finished_df = remove_unfinished_bars(symbol_df, symbol)
-        if finished_df.empty:
-            print(f"[YF FALLBACK NO FINISHED BARS] {symbol}")
-            return [], live_row, rows_fetched, latest_observation
-
-        # The candidate's HISTORICAL source definition is the symbol's approved
-        # definition (e.g. BZ=F/CL=F -> INVESTING_CONTINUOUS_FUTURES_DAILY),
-        # NOT this fallback provider. A successful fallback must never change
-        # the observation-date convention used for the historical dependency;
-        # passing the symbol lets the registry supply the approved definition,
-        # so an unestablished definition still fails closed.
-        rows = calculate_rows_for_symbol(
-            df=finished_df,
-            symbol=symbol,
-            name=meta["name"],
-            asset_type=meta["asset_type"],
-        )
-        rows = filter_rows_to_target_window(
-            rows=rows,
-            target_start_date=target_start_date,
-        )
-        if rows:
-            print(f"[YF FALLBACK ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
-        else:
-            print(f"[YF FALLBACK NO VALID ROWS IN TARGET WINDOW] {symbol}")
-        return rows, live_row, rows_fetched, latest_observation
-    except Exception as exc:
-        raise SymbolProcessingError(
-            f"{type(exc).__name__}: {exc}",
-            rows_fetched=rows_fetched,
-            latest_observation=latest_observation,
-        ) from exc
-
-
-# ----------------------------------------------------------------------------
-# Asia index yfinance fallback (cash-index proxies for Investing.com futures)
-# ----------------------------------------------------------------------------
-
-
 def process_asia_index_yfinance_fallback_symbol(symbol, meta, *, start_date=None, observed_at=None):
     """Fetch one Asia futures symbol via its yfinance cash-index proxy.
 
-    HK50 -> ^HSI (Hang Seng Index), KOR200c1 -> ^KS200 (KOSPI 200),
+    HK50 -> ^HSI (Hang Seng Index), KOR200c1 -> ^KS11 (KOSPI),
     CIHc1 -> 000016.SS (SSE 50). The proxy is a CASH INDEX, not a futures
     contract: level/direction/trend are representative but basis/spread
     versus the futures are not comparable. Rows are written under the
@@ -4059,6 +4262,121 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
 def provider_for_symbol(symbol):
     if symbol in CMT_SYMBOLS:
         return "treasury.gov"
+    if symbol in OILPRICEAPI_ASSETS:
+        return "oilpriceapi.com"
+    return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
+
+
+def fetch_oilpriceapi_history(commodity_code, pages=8):
+    """Fetch daily spot prices for one OilPriceAPI commodity.
+
+    Only /prices/past_year is deep enough to be useful; the API caps history at
+    ~365 days, so the earliest available observation bounds what can be stored.
+    Returns a list of (as_of_date, price) sorted ascending.
+    """
+    api_key = os.getenv("OIL_PRICE_API_KEY", "")
+    if not api_key:
+        raise ValueError("OIL_PRICE_API_KEY is not set")
+
+    out = []
+    for page in range(1, pages + 1):
+        url = (
+            f"{OILPRICEAPI_BASE_URL}/prices/past_year"
+            f"?by_code={commodity_code}&per_page=100&page={page}"
+        )
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Token {api_key}"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            raise ValueError(
+                f"OilPriceAPI HTTP {exc.code} for {commodity_code} page {page}"
+            ) from exc
+        prices = (payload.get("data") or {}).get("prices") or []
+        if not prices:
+            break
+        for item in prices:
+            as_of = item.get("as_of") or item.get("observed_at")
+            price = item.get("price")
+            if as_of is None or price is None:
+                continue
+            out.append((as_of[:10], float(price)))
+        if len(prices) < 100:
+            break
+        time.sleep(OILPRICEAPI_RATE_LIMIT_SECONDS)
+    out.sort()
+    return out
+
+
+def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=None):
+    """Fetch and transform one OilPriceAPI spot-price symbol.
+
+    Rows are SYNTHETIC single-point observations, not true OHLC bars:
+    open = high = low = close = spot price, volume = NULL.
+    """
+    if symbol not in OILPRICEAPI_ASSETS:
+        raise ValueError(f"oilpriceapi provider is not enabled for {symbol}")
+
+    commodity_code = OILPRICEAPI_MAPPING[symbol]
+    rows_fetched = 0
+    latest_observation = None
+    try:
+        observations = fetch_oilpriceapi_history(commodity_code)
+        if not observations:
+            raise ValueError(f"empty OilPriceAPI response for {commodity_code}")
+        rows_fetched = len(observations)
+        latest_observation = date.fromisoformat(observations[-1][0])
+
+        symbol_df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime([obs[0] for obs in observations]),
+                "Open": [obs[1] for obs in observations],
+                "High": [obs[1] for obs in observations],
+                "Low": [obs[1] for obs in observations],
+                "Close": [obs[1] for obs in observations],
+                "Adj Close": [obs[1] for obs in observations],
+                "Volume": [None] * len(observations),
+            }
+        )
+        symbol_df = remove_unfinished_bars(symbol_df, symbol)
+
+        target_start = start_date or (
+            (observed_at or datetime.now(ZoneInfo("UTC"))).date()
+            - timedelta(days=LOOKBACK_DAYS + CALC_BUFFER_DAYS)
+        )
+        rows = calculate_rows_for_symbol(
+            df=symbol_df,
+            symbol=symbol,
+            name=meta["name"],
+            asset_type=meta["asset_type"],
+        )
+        rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start)
+        if rows:
+            print(
+                f"[OILPRICEAPI ROW DATES TARGET] {symbol} | "
+                f"{rows[0]['date']} .. {rows[-1]['date']} ({len(rows)} rows)"
+            )
+        else:
+            print(f"[OILPRICEAPI NO VALID ROWS IN TARGET WINDOW] {symbol}")
+
+        live_row = None
+        if rows:
+            latest = dict(rows[-1])
+            latest["market_date"] = latest.pop("date")
+            latest["observed_at"] = observed_at or datetime.now(ZoneInfo("UTC"))
+            latest["is_market_closed"] = False
+            latest["source"] = "oilpriceapi.com"
+            live_row = latest
+
+        return rows, live_row, rows_fetched, latest_observation
+    except Exception as exc:
+        raise SymbolProcessingError(
+            f"{type(exc).__name__}: {exc}",
+            rows_fetched=rows_fetched,
+            latest_observation=latest_observation,
+        ) from exc
     return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
 
 
@@ -4099,6 +4417,8 @@ def summarize_outcomes(outcomes, minimum_coverage_pct=MIN_COVERAGE_PCT):
         failure_count = 0
         for item in ordered:
             if item.primary_provider:
+                # Count provider failures even when success=True (e.g., CURRENT_BUT_PROVIDER_UNAVAILABLE)
+                # because the provider did fail; the symbol was covered by existing Local data.
                 failure_count += int(
                     item.primary_provider == provider
                     and item.primary_failure_reason is not None
@@ -4275,6 +4595,59 @@ def run_etf_flow_update_after_macro(*, start_date=None, tickers=None, dry_run=Fa
     return result
 
 
+def _check_local_current_for_provider_outage(symbol: str, meta: dict) -> bool:
+    """Check if Local data is still current for a symbol whose provider fetch failed.
+    
+    Returns True if:
+    - Local has previously validated canonical data for this symbol
+    - No newer finalized session is expected per market calendar
+    - The latest Local finalized date matches the expected latest finalized date
+    
+    Returns False if:
+    - No Local data exists
+    - A newer finalized session should exist but Local is behind
+    """
+    try:
+        from db_builder.config import local_engine
+        from sqlalchemy import text
+        
+        with local_engine().connect() as conn:
+            result = conn.execute(
+                text("""
+                    SELECT MAX(session_date) as latest_date
+                    FROM public.macro
+                    WHERE symbol = :symbol
+                """),
+                {"symbol": symbol}
+            )
+            row = result.fetchone()
+            if row is None or row[0] is None:
+                return False
+            
+            local_latest = row[0]
+            
+            # Check if we expect a newer finalized session
+            # For most symbols, if Local has data within the last 1-2 business days,
+            # it's considered current (market may not have produced a new session yet)
+            from datetime import date, timedelta
+            today = date.today()
+            
+            # Allow 2 business days of grace period
+            # If local_latest is within 2 business days of today, consider it current
+            business_days_back = 0
+            check_date = today
+            while business_days_back < 2:
+                check_date -= timedelta(days=1)
+                if check_date.weekday() < 5:  # Monday=0, Friday=4
+                    business_days_back += 1
+            
+            return local_latest >= check_date
+            
+    except Exception as e:
+        print(f"[LOCAL CURRENT CHECK ERROR] {symbol}: {e}")
+        return False
+
+
 def _process_investiny_fallback_for_symbol(
     *,
     symbol,
@@ -4290,21 +4663,19 @@ def _process_investiny_fallback_for_symbol(
 ):
     """Route one Investing.com-routed symbol to its fallback provider.
 
-    Fallback order (mirrors the existing per-symbol logic, now shared by the
-    circuit-breaker path):
-      - CL=F / BZ=F            -> yfinance (existing OIL fallback)
-      - US*YT=X                -> Treasury.gov par-yield XML (existing UST fallback)
-      - HK50/KOR200c1/CIHc1    -> yfinance cash-index proxy (new Asia fallback)
+    Fallback order:
+      - US*YT_CMT              -> Treasury.gov par-yield XML
+      - HK50/KOR200c1/CIHc1    -> yfinance cash-index proxy (Asia fallback)
       - anything else          -> recorded as failed (DEGRADED) — never silently
                                    dropped; the outcome carries the provider
                                    failure reason for cycle metadata.
+
+    USnYT=X is deliberately absent: it is an Investing.com-only series and must
+    never cross into Treasury.gov (which owns the US*YT_CMT series).
     """
     fallback_fn = None
     fallback_provider = None
-    if symbol in OIL_YFINANCE_FALLBACK_SYMBOLS:
-        fallback_fn = process_yfinance_fallback_symbol
-        fallback_provider = "yfinance"
-    elif symbol in UST_TREASURY_FALLBACK_SYMBOLS:
+    if symbol in UST_TREASURY_FALLBACK_SYMBOLS:
         fallback_fn = process_treasury_fallback_symbol
         fallback_provider = "treasury.gov"
     elif symbol in ASIA_INDEX_YFINANCE_FALLBACK_SYMBOLS:
@@ -4312,26 +4683,53 @@ def _process_investiny_fallback_for_symbol(
         fallback_provider = "yfinance (cash index proxy)"
 
     if fallback_fn is None:
-        print(
-            f"[INVESTINY FALLBACK NONE] {symbol} | no fallback configured; "
-            f"recording as DEGRADED | primary_failure={primary_failure_reason}"
-        )
-        outcomes[symbol] = SymbolFetchOutcome(
-            symbol=symbol,
-            name=meta["name"],
-            provider="investing.com",
-            required=symbol in REQUIRED_SYMBOLS,
-            success=False,
-            rows_fetched=0,
-            latest_observation=None,
-            failure_reason=(
-                f"primary investing.com: {primary_failure_reason}; "
-                f"no fallback source configured"
-            ),
-            primary_provider="investing.com",
-            primary_failure_reason=primary_failure_reason,
-        )
-        return False
+        # No fallback configured. Check if Local data is still current.
+        # If Local retains previously validated canonical data and no newer
+        # finalized session is expected, classify as CURRENT_BUT_PROVIDER_UNAVAILABLE.
+        local_is_current = _check_local_current_for_provider_outage(symbol, meta)
+        if local_is_current:
+            print(
+                f"[INVESTINY FALLBACK NONE] {symbol} | no fallback configured; "
+                f"Local data still current | primary_failure={primary_failure_reason}"
+            )
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="investing.com",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=True,  # Coverage passes because Local is current
+                rows_fetched=0,
+                latest_observation=None,
+                failure_reason=None,
+                primary_provider="investing.com",
+                primary_failure_reason=primary_failure_reason,
+                data_freshness_state="CURRENT_BUT_PROVIDER_UNAVAILABLE",
+                local_is_current=True,
+            )
+            return True
+        else:
+            print(
+                f"[INVESTINY FALLBACK NONE] {symbol} | no fallback configured; "
+                f"Local data stale or unconfirmed | primary_failure={primary_failure_reason}"
+            )
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="investing.com",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=False,
+                rows_fetched=0,
+                latest_observation=None,
+                failure_reason=(
+                    f"primary investing.com: {primary_failure_reason}; "
+                    f"no fallback source configured; Local data stale or unconfirmed"
+                ),
+                primary_provider="investing.com",
+                primary_failure_reason=primary_failure_reason,
+                data_freshness_state="STALE_OR_UNCONFIRMED_PROVIDER_OUTAGE",
+                local_is_current=False,
+            )
+            return False
 
     print(
         f"[INVESTINY FALLBACK ATTEMPT] {symbol} -> {fallback_provider} | "
@@ -4899,12 +5297,29 @@ def run_daily_update(
             raise ValueError(f"Unknown macro symbols requested: {unknown}")
         symbols = [symbol for symbol in symbols if symbol in requested]
 
+    # ------------------------------------------------------------------
+    # macro_live source guard: remove any wrong-source rows for USnYT=X
+    # symbols before the scheduled pipeline writes new live rows. This
+    # prevents stale Treasury.gov/CMT rows from surviving indefinitely
+    # under USnYT=X symbols.
+    # ------------------------------------------------------------------
+    if not dry_run:
+        removed_live = auto_clean_wrong_source_live_rows(local_engine)
+        if removed_live:
+            print(
+                f"[MACRO_LIVE SOURCE GUARD] Removed "
+                f"{len(removed_live)} wrong-source live rows: "
+                f"{[s for s, _ in removed_live]}"
+            )
+
     # Phase A (additive): the official CMT series is fetched from Treasury.gov
     # only, so it is excluded from both the yfinance batch and the
     # Investing.com loop and handled by its own phase below.
     yfinance_symbols = [
         symbol for symbol in symbols
-        if symbol not in INVESTINY_ASSETS and symbol not in CMT_SYMBOLS
+        if symbol not in INVESTINY_ASSETS
+        and symbol not in CMT_SYMBOLS
+        and symbol not in OILPRICEAPI_ASSETS
     ]
     investiny_symbols = [
         symbol for symbol in symbols
@@ -5071,31 +5486,25 @@ def run_daily_update(
 
         time.sleep(random.uniform(1.0, 3.0))
 
-    investiny_provider_unavailable = False
-    investiny_403_streak = 0
-    investiny_provider_failure_reason = None
     if investiny_symbols:
         print(f"\n[INVESTING.COM SYMBOLS] {investiny_symbols}")
     for symbol in investiny_symbols:
         meta = asset_map[symbol]
 
         # ------------------------------------------------------------------
-        # Provider circuit breaker: once Investing.com is marked unavailable
-        # for this cycle, do NOT attempt further provider requests. Route
-        # every remaining symbol directly to its fallback (or DEGRADED).
+        # Per-symbol circuit breaker: check if THIS symbol's breaker is open.
+        # Other symbols continue fetching normally even if this symbol is blocked.
         # ------------------------------------------------------------------
-        if investiny_provider_unavailable:
+        if not is_investiny_symbol_available(symbol):
             print(
-                f"[INVESTINY CIRCUIT BREAKER OPEN] {symbol} | "
-                f"skipping Investing.com; routing to fallback | "
-                f"provider_failure={investiny_provider_failure_reason}"
+                f"[INVESTINY CIRCUIT BREAKER OPEN] provider=investing.com symbol={symbol} | "
+                f"skipping Investing.com; routing to fallback"
             )
             rows = live_row = None
             rows_fetched = 0
             latest_observation = None
             primary_failure_reason = (
-                f"investing.com provider unavailable (circuit breaker): "
-                f"{investiny_provider_failure_reason}"
+                f"investing.com provider unavailable (per-symbol circuit breaker)"
             )
             _process_investiny_fallback_for_symbol(
                 symbol=symbol,
@@ -5107,39 +5516,9 @@ def run_daily_update(
                 all_live_rows=all_live_rows,
                 upsert_neon=upsert_neon,
                 dry_run=dry_run,
-            deferred_store=deferred_store,
+                deferred_store=deferred_store,
             )
             continue
-
-            # Check provider availability BEFORE attempting any request
-            # If the provider breaker is already open from a previous symbol,
-            # skip immediately — no sleep, no retry, just route to fallback.
-            if not is_investiny_provider_available():
-                print(
-                    f"[INVESTINY PROVIDER UNAVAILABLE] {symbol} | ",
-                    f"skipping Investing.com; routing to fallback | ",
-                    f"reason={_provider_breaker_reason}"
-                )
-                rows = live_row = None
-                rows_fetched = 0
-                latest_observation = None
-                primary_failure_reason = (
-                    f"investing.com provider unavailable (circuit breaker): "
-                    f"{_provider_breaker_reason}"
-                )
-                _process_investiny_fallback_for_symbol(
-                    symbol=symbol,
-                    meta=meta,
-                    primary_failure_reason=primary_failure_reason,
-                    start_date=start_date,
-                    observed_at=observed_at,
-                    outcomes=outcomes,
-                    all_live_rows=all_live_rows,
-                    upsert_neon=upsert_neon,
-                    dry_run=dry_run,
-                deferred_store=deferred_store,
-                )
-                continue
 
         try:
             print(f"[PROCESS INVESTING.COM] {symbol}")
@@ -5151,26 +5530,16 @@ def run_daily_update(
             )
             investiny_403_streak = 0
         except InvestinyProviderUnavailable as e:
-            # Provider-level 403: count the trip, and open the breaker once
-            # the configured number of consecutive trips is reached.
-            investiny_403_streak += 1
-            print(
-                f"[INVESTINY 403 STREAK] {investiny_403_streak}/"
-                f"{INVESTINY_CIRCUIT_BREAKER_TRIPS} | {symbol}: {e}"
-            )
-            if investiny_403_streak >= INVESTINY_CIRCUIT_BREAKER_TRIPS:
-                investiny_provider_unavailable = True
-                investiny_provider_failure_reason = str(e)
-                print(
-                    "[INVESTINY CIRCUIT BREAKER TRIPPED] "
-                    "Investing.com marked unavailable for the remainder of this "
-                    "cycle; all remaining Investing.com symbols route to fallbacks."
-                )
+            # Per-symbol 403: open this symbol's breaker only.
+            # Other Investing.com symbols continue fetching normally.
+            # Use current symbol name, not the exception message which may
+            # reference a different symbol from a prior 403.
+            record_investiny_symbol_failure(symbol, f"HTTP 403 for {symbol}")
             rows = live_row = None
             rows_fetched = 0
             latest_observation = None
             primary_failure_reason = (
-                f"investing.com provider blocked (HTTP 403): {e}"
+                f"investing.com provider blocked (HTTP 403) for {symbol}"
             )
             _process_investiny_fallback_for_symbol(
                 symbol=symbol,
@@ -5182,7 +5551,7 @@ def run_daily_update(
                 all_live_rows=all_live_rows,
                 upsert_neon=upsert_neon,
                 dry_run=dry_run,
-            deferred_store=deferred_store,
+                deferred_store=deferred_store,
             )
             continue
         except Exception as e:
@@ -5195,184 +5564,46 @@ def run_daily_update(
                 else f"{type(e).__name__}: {e}"
             )
 
-            if symbol in OIL_YFINANCE_FALLBACK_SYMBOLS:
-                print(
-                    f"[YF FALLBACK ATTEMPT] {symbol} | "
-                    f"primary_failure={primary_failure_reason}"
-                )
-                try:
-                    rows, live_row, rows_fetched, latest_observation = (
-                        process_yfinance_fallback_symbol(
-                            symbol,
-                            meta,
-                            start_date=start_date,
-                            observed_at=observed_at,
-                        )
-                    )
-                except Exception as fallback_error:
-                    print(f"[YF FALLBACK ERROR] {symbol}: {fallback_error}")
-                    rows_fetched = getattr(fallback_error, "rows_fetched", 0)
-                    latest_observation = getattr(
-                        fallback_error,
-                        "latest_observation",
-                        None,
-                    )
-                    fallback_failure_reason = (
-                        str(fallback_error)
-                        if isinstance(fallback_error, SymbolProcessingError)
-                        else f"{type(fallback_error).__name__}: {fallback_error}"
-                    )
-                    outcomes[symbol] = SymbolFetchOutcome(
-                        symbol=symbol,
-                        name=meta["name"],
-                        provider="investing.com",
-                        required=symbol in REQUIRED_SYMBOLS,
-                        success=False,
-                        rows_fetched=rows_fetched,
-                        latest_observation=latest_observation,
-                        failure_reason=(
-                            f"primary investing.com: {primary_failure_reason}; "
-                            f"fallback yfinance: {fallback_failure_reason}"
-                        ),
-                        primary_provider="investing.com",
-                        primary_failure_reason=primary_failure_reason,
-                        fallback_provider="yfinance",
-                        fallback_failure_reason=fallback_failure_reason,
-                    )
-                    time.sleep(random.uniform(2.0, 5.0))
-                    continue
-
-                if live_row:
-                    all_live_rows.append(live_row)
-                    print(
-                        f"[YF FALLBACK LIVE SNAPSHOT] {symbol} | "
-                        f"market_date={live_row['market_date']} close={live_row['close']}"
-                    )
-                # Keep database errors fatal, as in both primary provider paths.
-                upsert_new_macro_rows(
-                    rows,
-                    [symbol],
+            # Shared fallback dispatch. OIL -> yfinance, UST/CMT -> treasury.gov,
+            # Asia -> yfinance cash-index proxy. Runs on ANY primary failure, not
+            # only HTTP 403 (the 403 path is handled above via
+            # InvestinyProviderUnavailable). This replaces the three per-provider
+            # copies of the same logic that used to live here.
+            if (symbol in UST_TREASURY_FALLBACK_SYMBOLS
+                    or symbol in ASIA_INDEX_YFINANCE_FALLBACK_SYMBOLS):
+                _process_investiny_fallback_for_symbol(
+                    symbol=symbol,
+                    meta=meta,
+                    primary_failure_reason=primary_failure_reason,
+                    start_date=start_date,
+                    observed_at=observed_at,
+                    outcomes=outcomes,
+                    all_live_rows=all_live_rows,
                     upsert_neon=upsert_neon,
                     dry_run=dry_run,
-                    provider_label="YF FALLBACK",
                     deferred_store=deferred_store,
                 )
+                continue
+            else:
+                # No fallback is configured for this symbol. Record the primary
+                # failure and skip the success path -- otherwise `live_row` is
+                # unbound here (the primary raised before producing one).
                 outcomes[symbol] = SymbolFetchOutcome(
                     symbol=symbol,
                     name=meta["name"],
-                    provider="yfinance",
+                    provider="investing.com",
                     required=symbol in REQUIRED_SYMBOLS,
-                    success=True,
+                    success=False,
                     rows_fetched=rows_fetched,
                     latest_observation=latest_observation,
+                    failure_reason=primary_failure_reason,
                     primary_provider="investing.com",
                     primary_failure_reason=primary_failure_reason,
-                    fallback_provider="yfinance",
                 )
-                print(
-                    f"[YF FALLBACK OK] {symbol} | "
-                    f"latest_observation={latest_observation}"
-                )
+                print(f"[MACRO SYMBOL FAILED] symbol={symbol} provider=investing.com "
+                      f"rows_fetched={rows_fetched} reason={primary_failure_reason}")
                 time.sleep(random.uniform(2.0, 5.0))
                 continue
-
-            if symbol in UST_TREASURY_FALLBACK_SYMBOLS:
-                print(
-                    f"[UST FALLBACK ATTEMPT] {symbol} | "
-                    f"primary_failure={primary_failure_reason}"
-                )
-                try:
-                    rows, live_row, rows_fetched, latest_observation = (
-                        process_treasury_fallback_symbol(
-                            symbol,
-                            meta,
-                            start_date=start_date,
-                            observed_at=observed_at,
-                        )
-                    )
-                except Exception as fallback_error:
-                    print(f"[UST FALLBACK ERROR] {symbol}: {fallback_error}")
-                    rows_fetched = getattr(fallback_error, "rows_fetched", 0)
-                    latest_observation = getattr(
-                        fallback_error,
-                        "latest_observation",
-                        None,
-                    )
-                    fallback_failure_reason = (
-                        str(fallback_error)
-                        if isinstance(fallback_error, SymbolProcessingError)
-                        else f"{type(fallback_error).__name__}: {fallback_error}"
-                    )
-                    outcomes[symbol] = SymbolFetchOutcome(
-                        symbol=symbol,
-                        name=meta["name"],
-                        provider="investing.com",
-                        required=symbol in REQUIRED_SYMBOLS,
-                        success=False,
-                        rows_fetched=rows_fetched,
-                        latest_observation=latest_observation,
-                        failure_reason=(
-                            f"primary investing.com: {primary_failure_reason}; "
-                            f"fallback treasury.gov: {fallback_failure_reason}"
-                        ),
-                        primary_provider="investing.com",
-                        primary_failure_reason=primary_failure_reason,
-                        fallback_provider="treasury.gov",
-                        fallback_failure_reason=fallback_failure_reason,
-                    )
-                    time.sleep(random.uniform(2.0, 5.0))
-                    continue
-
-                if live_row:
-                    all_live_rows.append(live_row)
-                    print(
-                        f"[UST FALLBACK LIVE SNAPSHOT] {symbol} | "
-                        f"market_date={live_row.get('market_date')} "
-                        f"close={live_row.get('close')} "
-                        f"source={live_row.get('source')}"
-                    )
-                # Keep database errors fatal, as in both primary provider paths.
-                upsert_new_macro_rows(
-                    rows,
-                    [symbol],
-                    upsert_neon=upsert_neon,
-                    dry_run=dry_run,
-                    provider_label="UST FALLBACK",
-                    deferred_store=deferred_store,
-                )
-                outcomes[symbol] = SymbolFetchOutcome(
-                    symbol=symbol,
-                    name=meta["name"],
-                    provider="treasury.gov",
-                    required=symbol in REQUIRED_SYMBOLS,
-                    success=True,
-                    rows_fetched=rows_fetched,
-                    latest_observation=latest_observation,
-                    primary_provider="investing.com",
-                    primary_failure_reason=primary_failure_reason,
-                    fallback_provider="treasury.gov",
-                )
-                print(
-                    f"[UST FALLBACK OK] {symbol} | "
-                    f"latest_observation={latest_observation} synthetic_ohlc=point"
-                )
-                time.sleep(random.uniform(2.0, 5.0))
-                continue
-
-            outcomes[symbol] = SymbolFetchOutcome(
-                symbol=symbol,
-                name=meta["name"],
-                provider="investing.com",
-                required=symbol in REQUIRED_SYMBOLS,
-                success=False,
-                rows_fetched=rows_fetched,
-                latest_observation=latest_observation,
-                failure_reason=primary_failure_reason,
-                primary_provider="investing.com",
-                primary_failure_reason=primary_failure_reason,
-            )
-            time.sleep(random.uniform(2.0, 5.0))
-            continue
 
         if live_row:
             all_live_rows.append(live_row)
@@ -5468,6 +5699,68 @@ def run_daily_update(
             print(f"[CMT ERROR] {symbol}: {cmt_error}")
         time.sleep(random.uniform(0.5, 1.5))
 
+    # --------------------------------------------------------------------------
+    # OilPriceAPI spot/indicative series. Fetched only from OilPriceAPI; neither
+    # yfinance nor Investing.com is consulted for these symbols.
+    # --------------------------------------------------------------------------
+    oilpriceapi_symbols = [s for s in symbols if s in OILPRICEAPI_ASSETS]
+    if oilpriceapi_symbols:
+        print(f"\n[OILPRICEAPI SPOT SERIES] {oilpriceapi_symbols}")
+    for symbol in oilpriceapi_symbols:
+        meta = asset_map[symbol]
+        try:
+            rows, live_row, rows_fetched, latest_observation = (
+                process_oilpriceapi_symbol(
+                    symbol, meta, start_date=start_date, observed_at=observed_at)
+            )
+            if live_row:
+                all_live_rows.append(live_row)
+                print(
+                    f"[OILPRICEAPI LIVE SNAPSHOT] {symbol} | "
+                    f"market_date={live_row.get('market_date')} "
+                    f"close={live_row.get('close')} source=oilpriceapi.com"
+                )
+            upsert_new_macro_rows(
+                rows,
+                [symbol],
+                upsert_neon=upsert_neon,
+                dry_run=dry_run,
+                provider_label="OILPRICEAPI",
+                deferred_store=deferred_store,
+            )
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="oilpriceapi.com",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=True,
+                rows_fetched=rows_fetched,
+                latest_observation=latest_observation,
+                primary_provider="oilpriceapi.com",
+                fallback_provider=None,
+            )
+            print(f"[OILPRICEAPI OK] {symbol} | latest_observation={latest_observation}")
+        except Exception as oil_error:
+            rows_fetched = getattr(oil_error, "rows_fetched", 0)
+            latest_observation = getattr(oil_error, "latest_observation", None)
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="oilpriceapi.com",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=False,
+                rows_fetched=rows_fetched,
+                latest_observation=latest_observation,
+                failure_reason=(
+                    str(oil_error)
+                    if isinstance(oil_error, SymbolProcessingError)
+                    else f"{type(oil_error).__name__}: {oil_error}"
+                ),
+                primary_provider="oilpriceapi.com",
+            )
+            print(f"[OILPRICEAPI ERROR] {symbol}: {oil_error}")
+        time.sleep(OILPRICEAPI_RATE_LIMIT_SECONDS)
+
     for symbol in symbols:
         if symbol not in outcomes:
             meta = asset_map[symbol]
@@ -5531,8 +5824,11 @@ def run_daily_update(
     try:
         eod_symbols = [
             s for s in symbols
-            if (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in C3A_APPROVED_ANCHORS
-            or (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in SOURCE_DEFINITION_TRUST_START
+            if s not in CMT_SYMBOLS
+            and (
+                (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in C3A_APPROVED_ANCHORS
+                or (s, SOURCE_DEFINITION_BY_SYMBOL.get(s, "")) in SOURCE_DEFINITION_TRUST_START
+            )
         ]
         if eod_symbols:
             # Canonical provider route — the SAME fetch normal ingestion uses.

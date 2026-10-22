@@ -47,7 +47,7 @@ EXCLUDED_REPORT_ONLY_SYMBOLS: Set[str] = {
     "HK50", "KOR200c1", "CIHc1",
     "GC=F", "SI=F", "HG=F", "CL=F", "BZ=F", "NG=F", "NIY=F",
     "ES=F", "NQ=F", "YM=F", "RTY=F",
-    "^MOVE", "^KS200",
+    "^MOVE",
 }
 
 # ---------------------------------------------------------------------------

@@ -619,7 +619,7 @@ class TestC2WiringRegressionGuard:
         resolver = m._build_anchor_provenance_lookup(FakeEngine())
         assert resolver(FakeEngine(), "NOT_AN_ANCHORED_SYMBOL", P, D) == set()
         # A real symbol WITHOUT an explicit C.1 anchor entry also resolves empty.
-        assert resolver(FakeEngine(), "^KS200", P, D) == set()
+        assert resolver(FakeEngine(), "^NDX", P, D) == set()
 
 
 # ============================================================

@@ -59,8 +59,13 @@ EXCHANGE_BY_SYMBOL: Dict[str, str] = {
     "^RUT": "XNYS",
     "IEF": "XNYS", "SHY": "XNYS", "TLT": "XNYS", "HYG": "XNYS",
     "JNK": "XNYS", "LQD": "XNYS", "IWD": "XNYS", "IWF": "XNYS", "RSP": "XNYS",
-    "^HSI": "XHKG", "^KS11": "XKRX", "^KS200": "XKRX", "000001.SS": "XSHG",
+    "^HSI": "XHKG", "^KS11": "XKRX", "000001.SS": "XSHG",
     "^N225": "XTKS", "^FTSE": "XLON", "^GDAXI": "XETR", "^FCHI": "XPAR",
+    # Investing.com HTML-crawler symbols. They mirror the cash-index proxies
+    # above: US yields on XNYS, HK50 on XHKG, KOR200c1 on XKRX, CIHc1 on XSHG.
+    "US2YT=X": "XNYS", "US3YT=X": "XNYS", "US5YT=X": "XNYS", "US7YT=X": "XNYS",
+    "US10YT=X": "XNYS", "US20YT=X": "XNYS", "US30YT=X": "XNYS",
+    "HK50": "XHKG", "KOR200c1": "XKRX", "CIHc1": "XSHG",
 }
 
 # CBOE / ICE indices: they follow the NYSE trading-day calendar; the precise
@@ -69,16 +74,16 @@ EXCHANGE_BY_SYMBOL: Dict[str, str] = {
 CBOE_ICE_SYMBOLS: Set[str] = {"^VIX", "^SKEW", "^MOVE", "^FVX", "^TNX", "^TYX"}
 
 CRYPTO_SYMBOLS: Set[str] = {"BTC-USD", "ETH-USD"}
+OILPRICEAPI_SYMBOLS: Set[str] = {"BRENT_OILPRICE", "WTI_OILPRICE"}
 
 FX_SYMBOLS: Set[str] = {
     "AUDUSD=X", "CHFUSD=X", "CNY=X", "EURUSD=X", "GBPUSD=X",
     "HKD=X", "JPY=X", "NZDUSD=X", "SGD=X", "DX-Y.NYB",
 }
 
-TREASURY_SYMBOLS: Set[str] = {
-    "US2YT=X", "US3YT=X", "US5YT=X", "US7YT=X",
-    "US10YT=X", "US20YT=X", "US30YT=X",
-}
+# USnYT=X series are owned ONLY by Investing.com market yield.
+# Treasury.gov CMT series are the separate USnYT_CMT symbols below.
+TREASURY_SYMBOLS: Set[str] = set()  # Empty: USnYT=X uses Investing, not Treasury
 
 # Phase A (additive): the official Treasury.gov constant-maturity par-yield
 # series, kept separate from the legacy Investing.com-fed ``USnYT=X`` symbols.
@@ -145,12 +150,25 @@ GLOBEX_SYMBOLS: Set[str] = {
 # construction) -- not a vague provider name. A single provider may legitimately
 # carry more than one definition.
 SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY = "INVESTING_CONTINUOUS_FUTURES_DAILY"
+SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY = "INVESTING_HK40_FUTURES_DAILY"
+SOURCE_DEF_INVESTING_KOSPI200_FUTURES_DAILY = "INVESTING_KOSPI200_FUTURES_DAILY"
+SOURCE_DEF_INVESTING_SSE50_FUTURES_DAILY = "INVESTING_SSE50_FUTURES_DAILY"
+# USnYT=X series are owned ONLY by Investing.com market yield.
+SOURCE_DEF_INVESTING_US2Y_BOND_YIELD_DAILY = "INVESTING_US2Y_BOND_YIELD_DAILY"
+SOURCE_DEF_INVESTING_US3Y_BOND_YIELD_DAILY = "INVESTING_US3Y_BOND_YIELD_DAILY"
+SOURCE_DEF_INVESTING_US5Y_BOND_YIELD_DAILY = "INVESTING_US5Y_BOND_YIELD_DAILY"
+SOURCE_DEF_INVESTING_US7Y_BOND_YIELD_DAILY = "INVESTING_US7Y_BOND_YIELD_DAILY"
+SOURCE_DEF_INVESTING_US10Y_BOND_YIELD_DAILY = "INVESTING_US10Y_BOND_YIELD_DAILY"
+SOURCE_DEF_INVESTING_US20Y_BOND_YIELD_DAILY = "INVESTING_US20Y_BOND_YIELD_DAILY"
+SOURCE_DEF_INVESTING_US30Y_BOND_YIELD_DAILY = "INVESTING_US30Y_BOND_YIELD_DAILY"
 SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY = "YFINANCE_CONTINUOUS_FUTURES_DAILY"
 SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY = "YFINANCE_CASH_INDEX_DAILY"
 SOURCE_DEF_TREASURY_GOV_PAR_YIELD = "TREASURY_GOV_PAR_YIELD_DAILY"
 SOURCE_DEF_CRYPTO_24_7_DAILY = "CRYPTO_24_7_DAILY"
 SOURCE_DEF_YFINANCE_FX_DAILY = "YFINANCE_FX_DAILY"
 SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY = "YFINANCE_CASH_EQUITY_DAILY"
+SOURCE_DEF_MASSIVE_UST_EOD = "MASSIVE_UST_EOD"
+SOURCE_DEF_OILPRICEAPI_SPOT = "OILPRICEAPI_SPOT_INDICATIVE_USD_PER_BARREL"
 
 # Per-symbol *primary* historical source definition. This records which source
 # definition the stored series belongs to; it is not itself the convention.
@@ -158,8 +176,8 @@ SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY = "YFINANCE_CASH_EQUITY_DAILY"
 # than silently defaulting.
 SOURCE_DEFINITION_BY_SYMBOL: Dict[str, str] = {
     # Investing.com continuous front-contract futures (ids 8833/8849).
-    "BZ=F": SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
-    "CL=F": SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    "BZ=F": SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
+    "CL=F": SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
     # yfinance continuous futures.
     **{s: SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY
        for s in ("ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F",
@@ -171,6 +189,28 @@ SOURCE_DEFINITION_BY_SYMBOL: Dict[str, str] = {
     **{s: SOURCE_DEF_YFINANCE_FX_DAILY for s in FX_SYMBOLS},
     **{s: SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY
        for s in CBOE_ICE_SYMBOLS | set(EXCHANGE_BY_SYMBOL)},
+    # Special Investing.com futures (HK50, KOR200c1, CIHc1).
+    "HK50": SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY,
+    "KOR200c1": SOURCE_DEF_INVESTING_KOSPI200_FUTURES_DAILY,
+    "CIHc1": SOURCE_DEF_INVESTING_SSE50_FUTURES_DAILY,
+    # USnYT=X series are owned ONLY by Investing.com market yield.
+    "US2YT=X": SOURCE_DEF_INVESTING_US2Y_BOND_YIELD_DAILY,
+    "US3YT=X": SOURCE_DEF_INVESTING_US3Y_BOND_YIELD_DAILY,
+    "US5YT=X": SOURCE_DEF_INVESTING_US5Y_BOND_YIELD_DAILY,
+    "US7YT=X": SOURCE_DEF_INVESTING_US7Y_BOND_YIELD_DAILY,
+    "US10YT=X": SOURCE_DEF_INVESTING_US10Y_BOND_YIELD_DAILY,
+    "US20YT=X": SOURCE_DEF_INVESTING_US20Y_BOND_YIELD_DAILY,
+    "US30YT=X": SOURCE_DEF_INVESTING_US30Y_BOND_YIELD_DAILY,
+    # New independent Massive UST EOD series (additive, not replacement)
+    # Only 4 tenors available from Massive Economy API: 2Y, 5Y, 10Y, 30Y
+    # 3Y, 7Y, 20Y are NOT available in Massive response — registrations removed
+    "US2YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
+    "US5YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
+    "US10YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
+    "US30YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
+    # New independent OilPriceAPI spot price series (additive, not replacement)
+    "BRENT_OILPRICE": SOURCE_DEF_OILPRICEAPI_SPOT,
+    "WTI_OILPRICE": SOURCE_DEF_OILPRICEAPI_SPOT,
 }
 
 # Every source definition this build recognises. A candidate carrying an
@@ -178,12 +218,17 @@ SOURCE_DEFINITION_BY_SYMBOL: Dict[str, str] = {
 # definition must never inherit another definition's convention.
 KNOWN_SOURCE_DEFINITIONS: Set[str] = {
     SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_KOSPI200_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_SSE50_FUTURES_DAILY,
     SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
     SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
     SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
     SOURCE_DEF_CRYPTO_24_7_DAILY,
     SOURCE_DEF_YFINANCE_FX_DAILY,
     SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY,
+    SOURCE_DEF_MASSIVE_UST_EOD,
+    SOURCE_DEF_OILPRICEAPI_SPOT,
 }
 
 # Definitions whose daily bars are explicitly known to be labelled by session
@@ -200,6 +245,10 @@ SESSION_DATE_LABELLED_DEFINITIONS: Set[str] = {
     SOURCE_DEF_YFINANCE_FX_DAILY,
     SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY,
     SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
+    # OilPriceAPI daily_average bars carry a US-business-day date label (0 weekend
+    # rows across 261 observations; it does publish on US market holidays, so the
+    # previous observation for any row is the previous NYSE session).
+    SOURCE_DEF_OILPRICEAPI_SPOT,
 }
 
 # An *explicitly established* observation convention, keyed by source
@@ -245,7 +294,7 @@ OBSERVATION_CONVENTION_EVIDENCE: Dict[str, Dict[str, str]] = {
 # Investing.com continuous futures whose identity/source definition is
 # unresolved. Historical writes for these symbols are deferred; the EOD gate
 # is never bypassed for them.
-SOURCE_DEFINITION_UNRESOLVED: Set[str] = {"HK50", "KOR200c1", "CIHc1"}
+SOURCE_DEFINITION_UNRESOLVED: Set[str] = set()
 
 # Treasury par yields publish on the US business-day calendar. XNYS is used as
 # the session-day approximation; the *authoritative* confirmation is the actual
@@ -574,6 +623,8 @@ def adapter_for(symbol: str) -> CalendarAdapter:
         elif symbol in FX_SYMBOLS:
             adapter = FxCalendarAdapter()
         elif symbol in CBOE_ICE_SYMBOLS:
+            adapter = ExchangeCalendarAdapter("XNYS")
+        elif symbol in OILPRICEAPI_SYMBOLS:
             adapter = ExchangeCalendarAdapter("XNYS")
         elif symbol in GLOBEX_SYMBOLS:
             adapter = GlobexCalendarAdapter()
