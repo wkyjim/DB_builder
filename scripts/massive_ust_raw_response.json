@@ -1,0 +1,111 @@
+{
+  "http_status": 200,
+  "request_timestamp_utc": "2026-10-19T07:16:06.078221+00:00",
+  "response_timestamp_utc": "2026-10-19T07:16:19.121308+00:00",
+  "request_id": "f833c1dc98474a8eb72b5197ba0e7c7f",
+  "status": "OK",
+  "results_count": 10,
+  "has_next_url": true,
+  "results": [
+    {
+      "date": "2026-10-15",
+      "yield_1_month": 4.17,
+      "yield_3_month": 4.28,
+      "yield_1_year": 4.49,
+      "yield_2_year": 4.77,
+      "yield_5_year": 4.91,
+      "yield_10_year": 5.1,
+      "yield_30_year": 5.43
+    },
+    {
+      "date": "2026-10-14",
+      "yield_1_month": 4.11,
+      "yield_3_month": 4.28,
+      "yield_1_year": 4.53,
+      "yield_2_year": 4.82,
+      "yield_5_year": 5.0,
+      "yield_10_year": 5.19,
+      "yield_30_year": 5.52
+    },
+    {
+      "date": "2026-10-13",
+      "yield_1_month": 4.1,
+      "yield_3_month": 4.26,
+      "yield_1_year": 4.48,
+      "yield_2_year": 4.79,
+      "yield_5_year": 5.0,
+      "yield_10_year": 5.21,
+      "yield_30_year": 5.56
+    },
+    {
+      "date": "2026-10-09",
+      "yield_1_month": 4.13,
+      "yield_3_month": 4.25,
+      "yield_1_year": 4.47,
+      "yield_2_year": 4.8,
+      "yield_5_year": 5.02,
+      "yield_10_year": 5.24,
+      "yield_30_year": 5.6
+    },
+    {
+      "date": "2026-10-08",
+      "yield_1_month": 4.14,
+      "yield_3_month": 4.23,
+      "yield_1_year": 4.44,
+      "yield_2_year": 4.75,
+      "yield_5_year": 4.99,
+      "yield_10_year": 5.22,
+      "yield_30_year": 5.6
+    },
+    {
+      "date": "2026-10-07",
+      "yield_1_month": 4.07,
+      "yield_3_month": 4.22,
+      "yield_1_year": 4.42,
+      "yield_2_year": 4.77,
+      "yield_5_year": 5.03,
+      "yield_10_year": 5.28,
+      "yield_30_year": 5.67
+    },
+    {
+      "date": "2026-10-06",
+      "yield_1_month": 4.06,
+      "yield_3_month": 4.21,
+      "yield_1_year": 4.46,
+      "yield_2_year": 4.79,
+      "yield_5_year": 5.03,
+      "yield_10_year": 5.27,
+      "yield_30_year": 5.64
+    },
+    {
+      "date": "2026-10-05",
+      "yield_1_month": 4.05,
+      "yield_3_month": 4.22,
+      "yield_1_year": 4.47,
+      "yield_2_year": 4.84,
+      "yield_5_year": 5.06,
+      "yield_10_year": 5.31,
+      "yield_30_year": 5.66
+    },
+    {
+      "date": "2026-10-02",
+      "yield_1_month": 4.04,
+      "yield_3_month": 4.19,
+      "yield_1_year": 4.46,
+      "yield_2_year": 4.83,
+      "yield_5_year": 5.06,
+      "yield_10_year": 5.28,
+      "yield_30_year": 5.63
+    },
+    {
+      "date": "2026-10-01",
+      "yield_1_month": 4.06,
+      "yield_3_month": 4.17,
+      "yield_1_year": 4.44,
+      "yield_2_year": 4.78,
+      "yield_5_year": 5.01,
+      "yield_10_year": 5.24,
+      "yield_30_year": 5.61
+    }
+  ]
+}
