@@ -172,19 +172,18 @@ def test_replace_macro_live_deduplicates_symbols_before_insert():
 
 
 def test_fetch_investiny_symbol_df_normalizes_historical_payload(monkeypatch):
-    def fake_historical_data(*, investing_id, from_date, to_date, interval):
-        assert investing_id == macro_data_fetch.INVESTINY_ASSETS["US10YT=X"]
-        assert interval == "D"
-        return {
-            "date": ["07/01/2026", "07/02/2026"],
-            "open": [4.4, 4.5],
-            "high": [4.6, 4.7],
-            "low": [4.3, 4.4],
-            "close": [4.55, 4.65],
-        }
+    """The Investing.com path is HTML-only: the scraper returns
+    {date, price, open, high, low} and the pipeline normalizes it to the
+    standard frame (Date/Open/High/Low/Close/Adj Close/Volume)."""
 
-    fake_module = types.SimpleNamespace(historical_data=fake_historical_data)
-    monkeypatch.setitem(sys.modules, "investiny", fake_module)
+    def fake_fetch(symbol, timeout=45):
+        assert symbol == "US10YT=X"
+        return [
+            {"date": "2026-07-01", "price": 4.55, "open": 4.4, "high": 4.6, "low": 4.3},
+            {"date": "2026-07-02", "price": 4.65, "open": 4.5, "high": 4.7, "low": 4.4},
+        ]
+
+    monkeypatch.setattr(macro_data_fetch._investing_html, "fetch_historical_data", fake_fetch)
     monkeypatch.setattr(macro_data_fetch.time, "sleep", lambda *_args, **_kwargs: None)
 
     df, target_start = macro_data_fetch.fetch_investiny_symbol_df(
@@ -200,17 +199,15 @@ def test_fetch_investiny_symbol_df_normalizes_historical_payload(monkeypatch):
 
 
 def test_fetch_investiny_symbol_df_drops_weekend_rows(monkeypatch):
-    def fake_historical_data(*, investing_id, from_date, to_date, interval):
-        return {
-            "date": ["07/03/2026", "07/05/2026", "07/06/2026"],
-            "open": [4.4, 4.5, 4.6],
-            "high": [4.6, 4.7, 4.8],
-            "low": [4.3, 4.4, 4.5],
-            "close": [4.55, 4.65, 4.75],
-        }
+    def fake_fetch(symbol, timeout=45):
+        # 2026-07-05 is a Sunday
+        return [
+            {"date": "2026-07-03", "price": 4.55, "open": 4.4, "high": 4.6, "low": 4.3},
+            {"date": "2026-07-05", "price": 4.65, "open": 4.5, "high": 4.7, "low": 4.4},
+            {"date": "2026-07-06", "price": 4.75, "open": 4.6, "high": 4.8, "low": 4.5},
+        ]
 
-    fake_module = types.SimpleNamespace(historical_data=fake_historical_data)
-    monkeypatch.setitem(sys.modules, "investiny", fake_module)
+    monkeypatch.setattr(macro_data_fetch._investing_html, "fetch_historical_data", fake_fetch)
     monkeypatch.setattr(macro_data_fetch.time, "sleep", lambda *_args, **_kwargs: None)
 
     df, _ = macro_data_fetch.fetch_investiny_symbol_df(
@@ -229,22 +226,22 @@ def test_investiny_403_uses_exponential_cooldown(monkeypatch):
     assert macro_data_fetch._investiny_retry_delay("HTTP 403", 4) == 60.0
 
 
-def test_fetch_investiny_symbol_df_403_trips_provider_breaker(monkeypatch):
-    """A provider-level 403 must raise InvestinyProviderUnavailable on the
-    FIRST attempt (no exponential-backoff burn) so the cycle-level circuit
-    breaker can route the symbol to its fallback provider."""
+def test_fetch_investiny_symbol_df_hard_failure_raises_after_retries(monkeypatch):
+    """A provider-level failure (the HTML page never returns usable rows) must
+    surface as InvestinyProviderUnavailable after the retry budget is spent, so
+    the cycle-level circuit breaker can route the symbol to its fallback provider.
+
+    The old 403-specific fast path is gone: the HTML scraper uses a browser TLS
+    fingerprint, so Investing.com no longer answers with HTTP 403. A blocked or
+    empty page now looks like any other hard fetch failure."""
     attempts = []
     sleeps = []
 
-    def fake_historical_data(**_kwargs):
+    def fake_fetch(symbol, timeout=45):
         attempts.append(1)
-        raise ConnectionError("Request failed with error code: 403")
+        raise ConnectionError("provider unavailable")
 
-    monkeypatch.setitem(
-        sys.modules,
-        "investiny",
-        types.SimpleNamespace(historical_data=fake_historical_data),
-    )
+    monkeypatch.setattr(macro_data_fetch._investing_html, "fetch_historical_data", fake_fetch)
     monkeypatch.setattr(macro_data_fetch.time, "sleep", sleeps.append)
     monkeypatch.setattr(macro_data_fetch.random, "uniform", lambda *_args: 0.0)
 
@@ -254,35 +251,26 @@ def test_fetch_investiny_symbol_df_403_trips_provider_breaker(monkeypatch):
             start_date=date(2026, 7, 1),
         )
 
-    # Exactly one provider call, and only the single pre-call jitter sleep —
-    # no exponential-backoff cooldowns: the breaker trips immediately instead
-    # of burning the old 8s/16s/32s/60s chain.
-    assert len(attempts) == 1
-    assert sleeps == [0.0]
+    # Retry budget is honoured (default max_retries=2), then it raises.
+    # Sleeps = 2 pre-call jitter + 1 inter-attempt cooldown.
+    assert len(attempts) == 2
+    assert len(sleeps) == 3
 
 
 def test_fetch_investiny_symbol_df_recovers_after_transient_error(monkeypatch):
-    """Non-403 transient errors still retry (max 2 attempts) and recover."""
+    """Transient errors still retry (max 2 attempts) and recover."""
     attempts = []
     sleeps = []
 
-    def fake_historical_data(**_kwargs):
+    def fake_fetch(symbol, timeout=45):
         attempts.append(1)
         if len(attempts) < 2:
             raise ConnectionError("timed out")
-        return {
-            "date": ["07/01/2026"],
-            "open": [4.4],
-            "high": [4.6],
-            "low": [4.3],
-            "close": [4.55],
-        }
+        return [
+            {"date": "2026-07-01", "price": 4.55, "open": 4.4, "high": 4.6, "low": 4.3},
+        ]
 
-    monkeypatch.setitem(
-        sys.modules,
-        "investiny",
-        types.SimpleNamespace(historical_data=fake_historical_data),
-    )
+    monkeypatch.setattr(macro_data_fetch._investing_html, "fetch_historical_data", fake_fetch)
     monkeypatch.setattr(macro_data_fetch.time, "sleep", sleeps.append)
     monkeypatch.setattr(macro_data_fetch.random, "uniform", lambda *_args: 0.0)
 

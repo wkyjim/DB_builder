@@ -17,6 +17,14 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 import _bootstrap  # noqa: F401
+
+# Investing.com market data is HTML-only. The Investing.com JSON API
+# (api.investing.com, used by the `investiny` package) is blocked for this
+# project: it returns HTTP 403 and is explicitly out of scope. All
+# Investing.com series are therefore fetched by scraping the public
+# historical-data HTML pages with a browser TLS fingerprint.
+import investing_html_scraper as _investing_html
+
 from db_builder.config import MACRO_TABLE, local_engine as make_local_engine
 from db_builder.config import neon_engine as make_neon_engine
 from db_builder.trading_calendar import latest_completed_nyse_session_date
@@ -3644,65 +3652,77 @@ def _investiny_retry_delay(error, attempt):
 
 
 def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=2):
-    investing_id = INVESTINY_ASSETS[symbol]
+    """Fetch one Investing.com symbol by scraping its historical-data HTML page.
+
+    HTML-only by design: the Investing.com JSON API is blocked for this project
+    (HTTP 403) and is explicitly out of scope. The scraper uses a browser TLS
+    fingerprint that passes Investing.com's WAF.
+
+    Returns the same frame shape as the rest of the pipeline:
+        Date, Open, High, Low, Close, Adj Close, Volume
+
+    Volume is never fabricated - the public HTML page does not expose a
+    trustworthy per-day volume for these instruments, so it is left NULL.
+    """
     source_symbol = INVESTING_SOURCE_SYMBOLS.get(symbol, symbol)
     target_start_date = start_date or (datetime.now().date() - timedelta(days=LOOKBACK_DAYS))
     fetch_start_date = target_start_date - timedelta(days=CALC_BUFFER_DAYS)
     fetch_end_date = end_date or (datetime.now().date() + timedelta(days=1))
 
-    from_date = fetch_start_date.strftime("%m/%d/%Y")
-    to_date = fetch_end_date.strftime("%m/%d/%Y")
     print(
         f"[INVESTING.COM FETCH WINDOW] {symbol} source_symbol={source_symbol} "
-        f"id={investing_id} "
-        f"fetch_start={from_date} | target_start={target_start_date} | end={to_date}"
+        f"mode=html-scrape "
+        f"target_start={target_start_date} | end={fetch_end_date}"
     )
 
+    last_error: BaseException | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            from investiny import historical_data
-
             time.sleep(random.uniform(0.8, 2.0))
-            payload = historical_data(
-                investing_id=investing_id,
-                from_date=from_date,
-                to_date=to_date,
-                interval="D",
-            )
-            df = pd.DataFrame(payload)
-            if df.empty:
-                return pd.DataFrame(), target_start_date
+            rows = _investing_html.fetch_historical_data(symbol)
+            if not rows:
+                # Empty page: retry once through the loop, then surface it.
+                raise RuntimeError(
+                    f"Investing.com HTML returned no rows for {symbol}"
+                )
 
+            df = pd.DataFrame(rows)
             df = df.rename(
                 columns={
                     "date": "Date",
+                    "price": "Close",
                     "open": "Open",
                     "high": "High",
                     "low": "Low",
-                    "close": "Close",
-                    "volume": "Volume",
                 }
             )
-            df["Date"] = df["Date"].map(_investiny_date)
+            # The HTML scraper emits ISO date strings; the pipeline needs
+            # datetimes for the weekday filter and downstream date math.
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
             df["Adj Close"] = df["Close"]
-            if "Volume" not in df.columns:
-                df["Volume"] = None
+            # Volume is deliberately NULL: never fabricated.
+            df["Volume"] = None
             df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
             df = df[df["Date"].dt.weekday < 5].copy()
             return df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]], target_start_date
         except Exception as e:
+            last_error = e
             print(f"[INVESTINY RETRY {attempt}/{max_retries}] {symbol}: {e}")
-            if _is_investiny_403(e):
-                # Provider-level block: trip the circuit breaker immediately
-                # instead of burning through per-symbol exponential backoff.
-                raise InvestinyProviderUnavailable(
-                    f"Investing.com provider blocked (HTTP 403) for {symbol}: {e}"
-                ) from e
             if attempt == max_retries:
-                raise
+                # Surface as a provider-level failure so the caller can open this
+                # symbol's circuit breaker and route to its fallback provider.
+                raise InvestinyProviderUnavailable(
+                    f"Investing.com unavailable for {symbol} after "
+                    f"{max_retries} attempts: {e}"
+                ) from e
             delay = _investiny_retry_delay(e, attempt)
             print(f"[INVESTINY COOLDOWN] {symbol}: {delay:.1f}s")
             time.sleep(delay)
+    if last_error:
+        raise InvestinyProviderUnavailable(
+            f"Investing.com unavailable for {symbol}: {last_error}"
+        ) from last_error
+    return pd.DataFrame(), target_start_date
 
 
 def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None):

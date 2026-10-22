@@ -2,7 +2,6 @@ pandas
 numpy
 requests
 yfinance
-investiny
 sqlalchemy
 psycopg2-binary
 python-dotenv
