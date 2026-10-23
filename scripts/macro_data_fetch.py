@@ -276,6 +276,11 @@ _BOUNDARY_WINDOW_TOLERANCE_DAYS = 0
 
 # Target window to insert/update
 LOOKBACK_DAYS = 5
+# Write-window size expressed in *market sessions*, not calendar days.
+# A calendar-day lookback silently advances past sessions a market did
+# not trade (holiday weeks, long weekends), so the window is measured on
+# each symbol's own exchange calendar instead.
+LOOKBACK_SESSIONS = 5
 
 # Extra days to fetch before the target window so the first target day
 # can calculate prev_close/change/pct_chg/amplitude correctly.
@@ -3437,11 +3442,80 @@ def _report_prev_session_unconfirmed(symbol, session_date, expected_prior,
                   f"{session_date}: {exc}")
 
 
+def _session_window_start(symbol, dates, fallback_start):
+    """Earliest write-window session date for ``symbol``.
+
+    ``dates`` are the candidate session dates for the symbol. Returns the date
+    of the ``LOOKBACK_SESSIONS``-th previous *market session* relative to the
+    latest candidate, resolved on the symbol's own exchange calendar.
+
+    Falls back to the calendar-day ``fallback_start`` when the calendar cannot
+    resolve a boundary -- the previous behaviour, which is safe (it never drops
+    a session the calendar would have kept) but coarser.
+    """
+    if not dates:
+        return fallback_start
+    current = max(dates)
+    for _ in range(LOOKBACK_SESSIONS):
+        previous = previous_valid_session(symbol, current)
+        if previous is None:
+            return fallback_start
+        current = previous
+    return current
+
+
 def filter_rows_to_target_window(rows, target_start_date):
-    return [
-        row for row in rows
-        if row["date"] >= target_start_date
-    ]
+    """Select the rows that belong to this cycle's write window.
+
+    Two rules, both required for correctness:
+
+    1. **Market-session boundary.** ``target_start_date`` is a *fallback*
+       computed as ``today - LOOKBACK_DAYS`` calendar days. A calendar-day
+       boundary is wrong for any market that was closed during the lookback: the
+       window then silently advances past sessions the pipeline has not written
+       yet. The boundary is therefore computed per symbol as the
+       ``LOOKBACK_SESSIONS``-th previous market session on that symbol's own
+       exchange calendar.
+
+    2. **Prior sessions are kept.** The historical gate requires D's previous
+       session P to be *stored* before D may be written. Dropping P would make
+       any hole in storage permanent -- P could never be written (it is outside
+       the window) and D could never be written either. Keeping the priors of
+       the kept rows lets the pipeline heal such holes.
+    """
+    if not rows:
+        return rows
+
+    by_key = {(row["symbol"], row["date"]): row for row in rows}
+
+    # Rule 1: per-symbol market-session boundary.
+    dates_by_symbol = {}
+    for symbol, _date in by_key:
+        dates_by_symbol.setdefault(symbol, set()).add(_date)
+    keep = set()
+    for symbol, dates in dates_by_symbol.items():
+        start = _session_window_start(symbol, dates, target_start_date)
+        for date in dates:
+            if date >= start:
+                keep.add((symbol, date))
+
+    # Rule 2: keep the previous session of every kept row, transitively, so a
+    # hole in storage can be healed instead of becoming permanent.
+    changed = True
+    while changed:
+        changed = False
+        for symbol, date in list(keep):
+            row = by_key[(symbol, date)]
+            previous = previous_valid_observation_date(
+                symbol, date, row.get("source_definition"))
+            if (previous is not None
+                    and (symbol, previous) in by_key
+                    and (symbol, previous) not in keep):
+                keep.add((symbol, previous))
+                changed = True
+
+    # Preserve the caller's row order.
+    return [row for row in rows if (row["symbol"], row["date"]) in keep]
 
 
 def filter_duplicate_symbol_dates(rows, existing_df):

@@ -1150,3 +1150,99 @@ def test_cli_main_propagates_coverage_exit_code(monkeypatch, exit_code):
     )
 
     assert macro_data_fetch.main(["--skip-etf-flows", "--skip-live-replace"]) == exit_code
+
+
+# ==========================================================================
+# Write window: market sessions, not calendar days
+# ==========================================================================
+
+class TestWriteWindowUsesMarketSessions:
+    """The write window must be measured in *market sessions* on each symbol's
+    own exchange calendar, and must keep the prior session of every kept row.
+
+    A calendar-day window silently advances past sessions a market did not
+    trade (holiday weeks, long weekends). The historical gate requires D's
+    previous session P to be stored before D may be written, so dropping P
+    makes any hole in storage permanent -- P can never be written (it is
+    outside the window) and D can never be written either.
+    """
+
+    # XSHG (000001.SS) was closed 2026-10-05..07 for National Day.
+    SYMBOL = "000001.SS"
+    # Sessions from 2026-10-08 onward, skipping the holiday and the weekend.
+    SESSIONS = [date(2026, 10, 8), date(2026, 10, 9), date(2026, 10, 12),
+                date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15),
+                date(2026, 10, 16), date(2026, 10, 19), date(2026, 10, 20),
+                date(2026, 10, 21), date(2026, 10, 22), date(2026, 10, 23)]
+
+    def _rows(self):
+        return [{"symbol": self.SYMBOL, "date": d} for d in self.SESSIONS]
+
+    def test_window_boundary_is_a_market_session_not_a_calendar_day(self):
+        """Five sessions back from 2026-10-23 on XSHG is 2026-10-16, not the
+        calendar-day 2026-10-18. The calendar-day value would have excluded
+        10-15/10-16 -- the very sessions the missing rows need."""
+        from db_builder.session_calendar import previous_valid_session
+
+        start = macro_data_fetch._session_window_start(
+            self.SYMBOL, set(self.SESSIONS), date(2026, 10, 18))
+
+        assert start == date(2026, 10, 16), (
+            "window boundary must be the 5th previous XSHG session")
+        # and the calendar-day fallback really is coarser
+        assert start < date(2026, 10, 18)
+        assert previous_valid_session(self.SYMBOL, date(2026, 10, 19)) == \
+            date(2026, 10, 16)
+
+    def test_window_keeps_the_prior_of_its_earliest_row(self):
+        """A row whose prior is dropped can never be written: the gate requires
+        the prior to be stored, and the prior can never be stored because it is
+        outside the window. The window must therefore keep priors."""
+        kept = macro_data_fetch.filter_rows_to_target_window(
+            self._rows(), date(2026, 10, 18))
+        kept_dates = {r["date"] for r in kept}
+
+        # the window's earliest session and its prior are both kept
+        assert date(2026, 10, 16) in kept_dates
+        assert date(2026, 10, 15) in kept_dates
+        # and the chain walks back to the frame's oldest session
+        assert date(2026, 10, 8) in kept_dates
+
+    def test_window_heals_a_storage_hole(self):
+        """Reproduce the 000001.SS deadlock: storage holds 10-08 and 10-14 but
+        nothing between, and the window must still surface 10-09 and 10-15 --
+        the two rows whose priors ARE stored, so the gate accepts them."""
+        stored = {date(2026, 10, 8), date(2026, 10, 14)}
+        from db_builder.session_calendar import previous_valid_observation_date
+
+        kept = macro_data_fetch.filter_rows_to_target_window(
+            self._rows(), date(2026, 10, 18))
+
+        accepted = []
+        for row in kept:
+            prior = previous_valid_observation_date(self.SYMBOL, row["date"])
+            if prior is not None and prior in stored:
+                accepted.append(row["date"])
+
+        assert date(2026, 10, 9) in accepted, "10-09's prior (10-08) is stored"
+        assert date(2026, 10, 15) in accepted, "10-15's prior (10-14) is stored"
+
+    def test_window_preserves_caller_row_order(self):
+        kept = macro_data_fetch.filter_rows_to_target_window(
+            self._rows(), date(2026, 10, 18))
+        dates = [r["date"] for r in kept]
+        assert dates == sorted(dates), "row order must be preserved"
+
+    def test_window_falls_back_to_calendar_boundary_without_a_calendar(self):
+        """A symbol whose calendar cannot resolve must keep the previous
+        calendar-day behaviour rather than dropping everything."""
+        rows = [{"symbol": "NO_SUCH_SYMBOL", "date": d}
+                for d in (date(2026, 10, 19), date(2026, 10, 20))]
+        kept = macro_data_fetch.filter_rows_to_target_window(
+            rows, date(2026, 10, 18))
+        assert {r["date"] for r in kept} == {date(2026, 10, 19),
+                                            date(2026, 10, 20)}
+
+    def test_empty_rows_are_returned_unchanged(self):
+        assert macro_data_fetch.filter_rows_to_target_window(
+            [], date(2026, 10, 18)) == []
