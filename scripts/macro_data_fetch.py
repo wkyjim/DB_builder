@@ -3410,12 +3410,11 @@ def _get_trusted_local_close(symbol, expected_prior):
     the value is null/invalid. Never synthesizes or estimates a value.
     """
     try:
-        from db_builder.db import get_local_engine
-        engine = get_local_engine()
+        engine = make_local_engine()
         with engine.connect() as conn:
             row = conn.execute(
-                "SELECT close FROM public.macro WHERE symbol = %s AND date = %s",
-                (symbol, expected_prior)
+                text("SELECT close FROM public.macro WHERE symbol = :sym AND date = :dt"),
+                {"sym": symbol, "dt": expected_prior},
             ).fetchone()
         if row and row[0] is not None:
             return float(row[0])

@@ -221,6 +221,13 @@ KNOWN_SOURCE_DEFINITIONS: Set[str] = {
     SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY,
     SOURCE_DEF_INVESTING_KOSPI200_FUTURES_DAILY,
     SOURCE_DEF_INVESTING_SSE50_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_US2Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US3Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US5Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US7Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US10Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US20Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US30Y_BOND_YIELD_DAILY,
     SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
     SOURCE_DEF_YFINANCE_CASH_INDEX_DAILY,
     SOURCE_DEF_TREASURY_GOV_PAR_YIELD,
@@ -249,6 +256,26 @@ SESSION_DATE_LABELLED_DEFINITIONS: Set[str] = {
     # rows across 261 observations; it does publish on US market holidays, so the
     # previous observation for any row is the previous NYSE session).
     SOURCE_DEF_OILPRICEAPI_SPOT,
+    # Investing.com daily bars are session-date-labelled.
+    #
+    # Established empirically 2026-10-23 against the live Investing.com
+    # historical-data HTML pages: for all 10 Investing.com symbols, every date in
+    # the provider frame resolves to previous_valid_session() being present in that
+    # same frame (210/221 exact matches; the 11 exceptions are frame-edge rows whose
+    # prior session lies outside the scraped window, not convention violations).
+    # Investing.com therefore publishes no Sunday-labelled daily bar for these
+    # series, so the previous session IS the previous observation.
+    SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_KOSPI200_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_SSE50_FUTURES_DAILY,
+    SOURCE_DEF_INVESTING_US2Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US3Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US5Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US7Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US10Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US20Y_BOND_YIELD_DAILY,
+    SOURCE_DEF_INVESTING_US30Y_BOND_YIELD_DAILY,
 }
 
 # An *explicitly established* observation convention, keyed by source
@@ -747,7 +774,18 @@ def observation_convention_established(
         symbol: str,
         source_definition: Optional[str] = None,
 ) -> bool:
-    return observation_adapter_for(symbol, source_definition) is not None
+    """True when the symbol's daily observation convention is established.
+
+    A convention is established either by an explicit observation adapter or by
+    the definition being in SESSION_DATE_LABELLED_DEFINITIONS. Both paths are
+    consulted so this stays consistent with previous_valid_observation_date():
+    reporting "not established" for a definition that the historical gate
+    actually resolves would hide a real convention from callers.
+    """
+    if observation_adapter_for(symbol, source_definition) is not None:
+        return True
+    definition = source_definition_for(symbol, source_definition)
+    return definition is not None and definition in SESSION_DATE_LABELLED_DEFINITIONS
 
 
 def register_observation_convention(source_definition: str,

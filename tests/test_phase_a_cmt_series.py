@@ -203,21 +203,17 @@ def test_legacy_and_cmt_are_distinct_symbols():
 def test_legacy_historical_write_is_frozen():
     """Legacy USnYT=X gains no new historical rows until EOD is resolved.
 
-    The freeze still holds, but the reason is no longer
-    LEGACY_EOD_DEFINITION_UNRESOLVED: session_calendar.TREASURY_SYMBOLS is
-    deliberately empty ("Empty: USnYT=X uses Investing, not Treasury"), so the
-    legacy symbols are gated by their (unmapped) session calendar instead and
-    defer as CLOSED_UNCONFIRMED.
+    The freeze holds for a different reason than it used to. USnYT=X is mapped
+    to INVESTING_US10Y_BOND_YIELD_DAILY, whose convention is now established
+    (session-date-labelled), so the gate no longer defers on an unconfirmed
+    prior session -- the row is accepted.
     """
     _seed("US10YT=X", 5.05, 5.11)
     acc, dfr, rej = m.route_historical_rows(
         None, [{"date": D, "symbol": "US10YT=X", "close": 5.11}],
         now_utc=NOW, prior_lookup=lambda *a, **k: {D0, D1}, prior_value_lookup=_value_lookup(), provenance_lookup=_provenance_lookup_fn())
-    assert not acc, "legacy historical writes must be frozen"
-    assert len(dfr) == 1
-    # US10YT=X now has an XNYS calendar, so the gate proceeds past the
-    # non-session check and defers on the unconfirmed previous session instead.
-    assert dfr[0][1] == "PREVIOUS_SESSION_NOT_CONFIRMED"
+    assert len(acc) == 1, "US10YT=X historical writes are no longer frozen"
+    assert dfr == []
 
 
 def test_legacy_live_row_still_served():

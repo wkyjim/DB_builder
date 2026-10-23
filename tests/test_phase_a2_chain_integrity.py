@@ -47,7 +47,9 @@ from db_builder.session_calendar import adapter_for
 
 
 SYMBOL = "ES=F"          # yfinance continuous futures (Mon-Fri daily bars)
-INVESTING_SYMBOL = "HK50"  # Investing.com futures: convention NOT established
+INVESTING_SYMBOL = "HK50"  # Investing.com futures
+# Genuinely unestablished definition (still fails closed):
+UNESTABLISHED_SYMBOL = "US10YT_MASSIVE"
 D = date(2026, 10, 7)
 P = date(2026, 10, 6)
 D2 = date(2026, 10, 2)   # the row before the gap
@@ -291,8 +293,20 @@ class TestA2_7_CalendarGap:
         from db_builder.session_calendar import (
             previous_valid_observation_date, observation_convention_established,
         )
-        assert not observation_convention_established(INVESTING_SYMBOL)
-        assert previous_valid_observation_date(INVESTING_SYMBOL, MON) is None
+        assert not observation_convention_established(UNESTABLISHED_SYMBOL)
+        assert previous_valid_observation_date(UNESTABLISHED_SYMBOL, MON) is None
+
+    def test_a2_7d_investing_convention_is_established(self):
+        """Investing.com daily bars are session-date-labelled (established
+        empirically 2026-10-23 against the live provider pages), so the
+        Investing.com definitions resolve through the session calendar."""
+        from db_builder.session_calendar import (
+            previous_valid_observation_date, previous_valid_session,
+            observation_convention_established,
+        )
+        assert observation_convention_established(INVESTING_SYMBOL)
+        assert (previous_valid_observation_date(INVESTING_SYMBOL, MON)
+                == previous_valid_session(INVESTING_SYMBOL, MON))
 
     def test_a2_7d_session_date_labelled_definition_uses_session(self):
         """A recognised definition whose bars are labelled by session date
@@ -804,32 +818,39 @@ class TestA2_20_NoConventionForDefinition:
         )
         assert source_definition_for(INVESTING_SYMBOL) == \
             SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY
-        assert not observation_convention_established(INVESTING_SYMBOL)
-        assert previous_valid_observation_date(INVESTING_SYMBOL, MON_) is None
+        assert observation_convention_established(INVESTING_SYMBOL)
+        assert previous_valid_observation_date(INVESTING_SYMBOL, MON_) == FRI
 
     def test_a2_20_same_symbol_two_definitions_differ(self):
         """BZ=F under the yfinance definition resolves; under its own
-        (unestablished) Investing.com definition it fails closed."""
+        Investing.com definition it resolves the same way (both are
+        session-date-labelled) -- and an unestablished definition still fails
+        closed."""
         from db_builder.session_calendar import previous_valid_observation_date
         assert previous_valid_observation_date(
             INVESTING_SYMBOL, MON_,
             SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY) == FRI
         assert previous_valid_observation_date(
             INVESTING_SYMBOL, MON_,
-            SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY) is None
+            SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY) == FRI
+        assert previous_valid_observation_date(
+            UNESTABLISHED_SYMBOL, MON_) is None
 
     def test_a2_20_gate_defers_for_unestablished_definition(self):
         accepted, deferred, _ = run_route(
-            [make_row(MON_, 101.10, symbol=INVESTING_SYMBOL)], stored={FRI})
+            [make_row(MON_, 101.10, symbol=UNESTABLISHED_SYMBOL)], stored={FRI})
         assert accepted == [], "unestablished definition must never write"
         assert dates_of([r for r, _ in deferred]) == {MON_}
 
     def test_a2_20_never_inherits_the_other_definition_convention(self):
-        """The Investing.com definition must not borrow yfinance's Friday."""
+        """The Investing.com definition must not borrow yfinance's rule: it
+        resolves through its OWN session calendar."""
         from db_builder.session_calendar import previous_valid_observation_date
         investing = previous_valid_observation_date(
             INVESTING_SYMBOL, MON_, SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY)
-        assert investing is None, "must not silently switch to yfinance's rule"
+        assert investing == FRI
+        assert previous_valid_observation_date(
+            UNESTABLISHED_SYMBOL, MON_) is None
 
 
 # --------------------------------------------------------------------------
@@ -904,8 +925,8 @@ class TestA2_22_FallbackDoesNotSwitchConvention:
             SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY) == FRI
         assert source_definition_for(INVESTING_SYMBOL) == before, \
             "fallback must not rewrite the historical source definition"
-        # the symbol's own definition is still unestablished -> fail closed
-        assert previous_valid_observation_date(INVESTING_SYMBOL, MON_) is None
+        # an unestablished definition still fails closed after a fallback
+        assert previous_valid_observation_date(UNESTABLISHED_SYMBOL, MON_) is None
 
     def test_a2_22_definition_is_stable_across_repeated_calls(self):
         from db_builder.session_calendar import previous_valid_observation_date
@@ -1048,12 +1069,13 @@ class TestA2_25_FallbackMustNotStampDefinition:
         historical candidate must be judged under the symbol's approved
         definition and therefore DEFER."""
         from macro_data_fetch import _eligible_for_historical
-        # HK50 has a session calendar now, so it defers pending its prior session.
+        # HK50's convention is now established, so the gate resolves the prior
+        # session and accepts the row when that prior session is known.
         row = make_row(MON_, 100.32, symbol="HK50")
         row["source_definition"] = SOURCE_DEFINITION_BY_SYMBOL["HK50"]
         dec = _eligible_for_historical(row, known_prior_sessions={FRI})
-        assert dec.routing == ROUTE_DEFERRED, "HK50 must defer"
-        assert dec.expected_prior is None
+        assert dec.routing != ROUTE_DEFERRED, "HK50 must not defer"
+        assert dec.expected_prior == FRI
         # KOR200c1 on 2026-10-05 is a Korean substitute holiday (개천절 fell on a
         # Saturday), so the row is rejected outright rather than deferred.
         row = make_row(MON_, 100.32, symbol="KOR200c1")
@@ -1183,21 +1205,21 @@ class TestA2_27_DerivedMismatchRows:
             assert written["change"] == round(written["close"] - stored_p_close, 4)
 
     def test_a2_27_bz_f_cl_f_still_defer(self):
-        """BZ=F/CL=F must still fail closed (unestablished convention)."""
+        """The Investing.com symbols now resolve; KOR200c1 on 2026-10-05 is a
+        Korean substitute holiday -> rejected outright."""
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
         for sym in ("HK50", "KOR200c1"):
             row = make_row(D, close=103.0, prev_close=102.0, symbol=sym)
             accepted, deferred, rejected = run_route(
                 [row], stored={P}, stored_closes={P: 102.0})
-            assert dates_of(accepted) == set(), f"{sym} should not be written"
             if sym == "KOR200c1":
-                # 2026-10-05 is a Korean substitute holiday -> rejected outright.
+                assert dates_of(accepted) == set(), f"{sym} should not be written"
                 assert not deferred
                 assert len(rejected) == 1
             else:
                 assert not rejected
-                assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
+                assert len(accepted) == 1, f"{sym} should now be written"
 
     def test_a2_27_sequential_recovery_with_value_gate(self):
         """Friday stored. Monday committed. Tuesday resolves next cycle."""
@@ -1277,14 +1299,15 @@ class TestA2_29_SourceDefinitionMismatch:
         assert len(deferred) == 1
 
     def test_a2_29_bz_f_investing_def_fails_closed(self):
-        """BZ=F under INVESTING_CONTINUOUS_FUTURES_DAILY -> fail closed."""
+        """An unestablished definition fails closed even when the symbol has a
+        session calendar and a known prior session."""
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
-        row = make_row(D, close=103.0, prev_close=102.0, symbol="HK50")
+        row = make_row(D, close=103.0, prev_close=102.0, symbol=UNESTABLISHED_SYMBOL)
         accepted, deferred, _ = run_route(
             [row], stored={P}, stored_closes={P: 102.0})
         assert dates_of(accepted) == set()
-        assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
+        assert len(deferred) == 1
 
 
 # ==========================================================================
@@ -1331,12 +1354,11 @@ class TestA2_31_BZCLFallbackRegression:
     def test_a2_31_bz_f_defers(self):
         D = date(2026, 10, 5)
         P = date(2026, 10, 2)
-        row = make_row(D, close=103.0, prev_close=102.0, symbol="HK50")
+        row = make_row(D, close=103.0, prev_close=102.0, symbol=UNESTABLISHED_SYMBOL)
         accepted, deferred, _ = run_route(
             [row], stored={P}, stored_closes={P: 102.0})
         assert dates_of(accepted) == set()
         assert len(deferred) == 1
-        assert "PREVIOUS_SESSION_NOT_CONFIRMED" in deferred[0][1]
 
     def test_a2_31_cl_f_defers(self):
         D = date(2026, 10, 5)
