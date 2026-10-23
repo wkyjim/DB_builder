@@ -182,44 +182,58 @@ def _stored_trusted_provenance_dates(
     min_date,
     max_date,
 ) -> set:
-    """ANCHOR_DERIVED_PROVENANCE: dates with verified same-definition provenance.
+    """STORED_PROVENANCE: stored dates whose own source definition matches.
 
-    Backed by SOURCE_DEFINITION_TRUST_START. Returns stored dates that satisfy
-    the anchor boundary. Only explicit (symbol, source_definition) entries
-    qualify. No family inheritance. No DB source-definition column assumed.
+    Provenance is read from the ``public.macro.source_definition`` column, which
+    is written on every insert. A stored row is trusted for ``symbol`` when its
+    source definition equals the candidate's -- that is the whole claim the gate
+    needs: D's ``prev_close`` is recomputed from a P that came from the same
+    source, so the delta is meaningful.
 
-    If max_date is None, the query returns all stored dates >= effective_min.
+    This replaces ANCHOR_DERIVED_PROVENANCE, which could only answer the question
+    from the hardcoded ``(symbol, source_definition)`` trust-start map. That map
+    was a workaround for the missing column: 45 of 73 symbols had no entry, so
+    their trusted set was empty and every row deferred with
+    PRIOR_PROVENANCE_UNVERIFIED. The column makes the answer auditable from the
+    database itself.
+
+    Value *correctness* is a separate question and remains guarded by the
+    trust-start boundary in the routing gate (PRIOR_BEFORE_TRUST_START).
     """
-    from datetime import date as _date
+    from datetime import date as _date, datetime as _datetime
 
-    trust_start = _resolve_trust_start(symbol, source_definition)
-    if trust_start is None:
+    if source_definition is None:
         return set()
-    effective_min = max(trust_start, min_date) if min_date is not None else trust_start
+
+    clauses = [
+        "symbol = :symbol",
+        "source_definition = :source_definition",
+    ]
+    params = {
+        "symbol": symbol,
+        "source_definition": source_definition,
+    }
+    if min_date is not None:
+        clauses.append("date >= :min_date")
+        params["min_date"] = min_date
     if max_date is not None:
-        if effective_min > max_date:
-            return set()
-        sql = text(
-            "SELECT date FROM public.macro "
-            "WHERE symbol = :symbol AND date >= :effective_min AND date <= :max_date"
-        )
-        params = {
-            "symbol": symbol,
-            "effective_min": effective_min,
-            "max_date": max_date,
-        }
-    else:
-        sql = text(
-            "SELECT date FROM public.macro "
-            "WHERE symbol = :symbol AND date >= :effective_min"
-        )
-        params = {"symbol": symbol, "effective_min": effective_min}
+        clauses.append("date <= :max_date")
+        params["max_date"] = max_date
+
+    sql = text("SELECT date FROM public.macro WHERE " + " AND ".join(clauses))
     try:
         with engine.begin() as conn:
-            df = pd.read_sql(sql, conn, params=params)
+            rows = conn.execute(sql, params).fetchall()
     except Exception:
         return set()
-    return {pd.to_datetime(v).date() for v in df["date"]}
+
+    trusted = set()
+    for row in rows:
+        value = row[0]
+        if isinstance(value, _datetime):
+            value = value.date()
+        trusted.add(value)
+    return trusted
 
 
 def _build_anchor_provenance_lookup(engine):
@@ -677,6 +691,9 @@ def create_macro_table(engine):
             change NUMERIC(20,4),
             pct_chg NUMERIC(20,4),
             amplitude NUMERIC(20,4),
+
+            source TEXT,
+            source_definition TEXT,
 
             PRIMARY KEY (date, symbol)
         );
@@ -1631,12 +1648,14 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
         INSERT INTO public.macro (
             date, symbol, name, asset_type,
             open, high, low, close, adj_close, volume,
-            prev_close, change, pct_chg, amplitude
+            prev_close, change, pct_chg, amplitude,
+            source, source_definition
         )
         VALUES (
             :date, :symbol, :name, :asset_type,
             :open, :high, :low, :close, :adj_close, :volume,
-            :prev_close, :change, :pct_chg, :amplitude
+            :prev_close, :change, :pct_chg, :amplitude,
+            :source, :source_definition
         )
         ON CONFLICT (date, symbol)
         DO UPDATE SET
@@ -1651,7 +1670,9 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
             prev_close = EXCLUDED.prev_close,
             change = EXCLUDED.change,
             pct_chg = EXCLUDED.pct_chg,
-            amplitude = EXCLUDED.amplitude;
+            amplitude = EXCLUDED.amplitude,
+            source = EXCLUDED.source,
+            source_definition = EXCLUDED.source_definition;
     """)
 
     with engine.begin() as conn:
@@ -2562,12 +2583,14 @@ def run_eod_5session_refresh(
                     with _engine.begin() as conn:
                         conn.execute(
                             text("""
-                                INSERT INTO public.macro (date, symbol, open, high, low, close, adj_close, volume, prev_close, change, pct_chg, amplitude)
-                                VALUES (:d, :s, :o, :h, :l, :c, :ac, :v, :pc, :ch, :pct, :amp)
+                                INSERT INTO public.macro (date, symbol, open, high, low, close, adj_close, volume, prev_close, change, pct_chg, amplitude, source, source_definition)
+                                VALUES (:d, :s, :o, :h, :l, :c, :ac, :v, :pc, :ch, :pct, :amp, :src, :sd)
                             """),
                             {"d": d, "s": symbol, "o": open_, "h": high, "l": low, "c": close,
                              "ac": adj_close, "v": volume, "pc": p_close, "ch": change,
-                             "pct": pct_chg, "amp": amplitude},
+                             "pct": pct_chg, "amp": amplitude,
+                             "src": provider_for_symbol(symbol),
+                             "sd": SOURCE_DEFINITION_BY_SYMBOL.get(symbol)},
                         )
                 counters["rows_inserted"] += 1
 
@@ -2779,7 +2802,8 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
             text("""
                 SELECT date, symbol, name, asset_type,
                        open, high, low, close, adj_close, volume,
-                       prev_close, change, pct_chg, amplitude
+                       prev_close, change, pct_chg, amplitude,
+                       source, source_definition
                 FROM (
                     SELECT m.*,
                            row_number() OVER (
@@ -2804,7 +2828,8 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
         local_rows.append({k: r[k] for k in (
             "date", "symbol", "name", "asset_type",
             "open", "high", "low", "close", "adj_close", "volume",
-            "prev_close", "change", "pct_chg", "amplitude")})
+            "prev_close", "change", "pct_chg", "amplitude",
+            "source", "source_definition")})
 
     counters["candidate_rows"] = len(local_rows)
     if local_rows:
@@ -2895,12 +2920,14 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                         INSERT INTO public.macro (
                             date, symbol, name, asset_type,
                             open, high, low, close, adj_close, volume,
-                            prev_close, change, pct_chg, amplitude
+                            prev_close, change, pct_chg, amplitude,
+                            source, source_definition
                         )
                         VALUES (
                             :date, :symbol, :name, :asset_type,
                             :open, :high, :low, :close, :adj_close, :volume,
-                            :prev_close, :change, :pct_chg, :amplitude
+                            :prev_close, :change, :pct_chg, :amplitude,
+                            :source, :source_definition
                         )
                         ON CONFLICT (date, symbol)
                         DO UPDATE SET
@@ -2915,7 +2942,9 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                             prev_close = EXCLUDED.prev_close,
                             change = EXCLUDED.change,
                             pct_chg = EXCLUDED.pct_chg,
-                            amplitude = EXCLUDED.amplitude
+                            amplitude = EXCLUDED.amplitude,
+                            source = EXCLUDED.source,
+                            source_definition = EXCLUDED.source_definition
                     """),
                     to_submit,
                 )

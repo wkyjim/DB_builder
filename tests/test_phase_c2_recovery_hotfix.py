@@ -612,14 +612,61 @@ class TestC2WiringRegressionGuard:
             "resolver does not return the trusted P for the anchor-covered "
             "symbol")
 
-    def test_no_anchor_symbol_resolves_empty(self):
-        """No family inheritance: an unanchored symbol resolves to empty."""
+    def test_mismatched_source_definition_resolves_empty(self):
+        """Provenance now comes from the stored source_definition column.
+
+        A stored row satisfies the candidate only when its own source definition
+        matches the candidate's. This replaces the old rule -- "a symbol with no
+        hardcoded trust-start entry resolves empty" -- which left 45 of 73
+        symbols (000001.SS among them) permanently unable to write history.
+        """
         import macro_data_fetch as m
 
-        resolver = m._build_anchor_provenance_lookup(FakeEngine())
-        assert resolver(FakeEngine(), "NOT_AN_ANCHORED_SYMBOL", P, D) == set()
-        # A real symbol WITHOUT an explicit C.1 anchor entry also resolves empty.
-        assert resolver(FakeEngine(), "^NDX", P, D) == set()
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        class _Conn:
+            def __init__(self, store):
+                self._store = store
+
+            def execute(self, sql, params=None):
+                # honour the source_definition predicate, as the real query does
+                return _Result(
+                    self._store.get((params or {}).get("source_definition"), []))
+
+        class _Ctx:
+            def __init__(self, store):
+                self._store = store
+
+            def __enter__(self):
+                return _Conn(self._store)
+
+            def __exit__(self, *a):
+                return False
+
+        class _Engine:
+            def __init__(self, store):
+                self._store = store
+
+            def begin(self):
+                return _Ctx(self._store)
+
+        gspc_sd = m.SOURCE_DEFINITION_BY_SYMBOL["^GSPC"]
+
+        # matching definition -> P is trusted
+        eng = _Engine({gspc_sd: [(P,)]})
+        assert m._stored_trusted_provenance_dates(eng, "^GSPC", gspc_sd, P, D) == {P}
+
+        # the stored row carries a different definition -> empty
+        eng = _Engine({"SOME_OTHER_SOURCE_DEFINITION": [(P,)]})
+        assert m._stored_trusted_provenance_dates(eng, "^GSPC", gspc_sd, P, D) == set()
+
+        # unknown source definition -> empty (fail closed)
+        assert m._stored_trusted_provenance_dates(eng, "^GSPC", None, P, D) == set()
 
 
 # ============================================================
