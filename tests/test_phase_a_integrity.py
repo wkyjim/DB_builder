@@ -209,12 +209,18 @@ def test_a5b_crypto_weekend_prev_session_is_previous_calendar_day():
         == dt.date(2026, 9, 12)
 
 
-def test_weekend_globex_sunday_is_a_legitimate_session():
-    """Globex has a real Sunday session -- must not be treated as corruption."""
+def test_weekend_globex_sunday_is_not_a_daily_session():
+    """Globex Sunday is not a daily-bar session.
+
+    Globex trades Sunday 17:00 ET in real life, but yfinance's continuous
+    futures publish Monday-Friday daily bars only. Treating Sunday as a session
+    queued a bar that can never exist (2026-10-18 for the nine yfinance-sourced
+    equity/index futures).
+    """
     sun = dt.date(2026, 9, 13)
     now = dt.datetime(2026, 9, 20, tzinfo=dt.timezone.utc)
-    assert sc.session_status("ES=F", sun, now) == sc.SessionStatus.CONFIRMED_COMPLETED
-    assert sc.adapter_for("ES=F").is_trading_day(sun) is True
+    assert sc.session_status("ES=F", sun, now) == sc.SessionStatus.NON_TRADING_DAY
+    assert sc.adapter_for("ES=F").is_trading_day(sun) is False
 
 
 def test_weekend_saturday_futures_is_non_trading():
@@ -250,7 +256,10 @@ def test_classify_weekend_rows_never_repairs_or_deletes():
     assert fx[dt.date(2026, 9, 13)] == "WEEKEND_SESSION_REVIEW_REQUIRED"
 
     futures = sc.classify_weekend_rows("ES=F", dates)
-    assert futures[dt.date(2026, 9, 13)] == "LEGITIMATE_WEEKEND_SESSION"
+    # ES=F daily bars are Monday-Friday: neither Saturday nor Sunday is a
+    # session, so both are reported for review rather than accepted.
+    assert futures[dt.date(2026, 9, 13)] == "WEEKEND_SESSION_REVIEW_REQUIRED"
+    assert futures[dt.date(2026, 9, 12)] == "WEEKEND_SESSION_REVIEW_REQUIRED"
 
 
 # =============================================================== A6 / A7
@@ -415,7 +424,10 @@ def test_t_rec_2_permanently_missing_data_escalates_and_is_retained():
 
     store = MemoryDeferredStore()
     eng = FakeEngine()
-    d = dt.date(2026, 8, 1)
+    # A real session: 2026-08-03 is a Monday. (2026-08-01 is a Saturday --
+    # not a session for ^GSPC at all, so it is reconciled as "no bar can ever
+    # exist" rather than escalated as missing data.)
+    d = dt.date(2026, 8, 3)
     now = dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc)
 
     def fetch(symbol, dates):

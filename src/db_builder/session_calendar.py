@@ -18,6 +18,7 @@ absence is fail-closed (every historical write defers) rather than fatal.
 
 from __future__ import annotations
 
+import calendar as _cal
 import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
@@ -99,6 +100,30 @@ TENOR_BY_CMT_SYMBOL: Dict[str, str] = {
     "US30YT_CMT": "30Y",
 }
 CMT_SYMBOLS: Set[str] = set(TENOR_BY_CMT_SYMBOL)
+
+# ---------------------------------------------------------------------------
+# US bond-market (SIFMA) holidays
+#
+# NYSE is OPEN on Columbus Day and Veterans Day, but the US bond market is
+# CLOSED -- and every series below follows the bond market, not the equity
+# exchange: Treasury.gov par yields publish nothing, Investing.com's US
+# Treasury yields publish nothing, and the ICE/CBOE Treasury indices publish
+# nothing. Modelling those dates as sessions made the gate treat the next
+# session's absent prior as a storage hole and defer it forever.
+#
+# Note the contrast with CBOE_ICE_SYMBOLS: ^VIX and ^SKEW are equity-volatility
+# indices that DO trade on NYSE sessions, so they are deliberately excluded.
+# ---------------------------------------------------------------------------
+
+US_TREASURY_YIELD_X_SYMBOLS: Set[str] = {
+    f"US{t}YT=X" for t in (2, 3, 5, 7, 10, 20, 30)
+}
+
+BOND_MARKET_SYMBOLS: Set[str] = (
+    US_TREASURY_YIELD_X_SYMBOLS
+    | set(CMT_SYMBOLS)
+    | {"^MOVE", "^FVX", "^TNX", "^TYX"}
+)
 
 # Reserved: the proposed 17:00 ET market reference series. NOT enabled; no rows
 # are produced for these symbols, so nothing is ever enqueued for them.
@@ -490,6 +515,39 @@ class ExchangeCalendarAdapter(CalendarAdapter):
             return None
 
 
+class BondMarketCalendarAdapter(ExchangeCalendarAdapter):
+    """US bond-market sessions: the XNYS calendar minus SIFMA full holidays.
+
+    The equity exchange is open on Columbus Day and Veterans Day; the bond
+    market is not. Every series routed here publishes no daily bar on a
+    bond-market holiday, so those dates must not be sessions -- otherwise the
+    next session's absent prior is read as a storage hole and deferred forever.
+    """
+
+    name = "bond-market-us"
+
+    def __init__(self, exchange: str = _TREASURY_APPROX_EXCHANGE):
+        super().__init__(exchange)
+        # ExchangeCalendarAdapter.__init__ sets ``self.name`` to the exchange
+        # code; the bond-market calendar is a distinct, narrower calendar.
+        self.name = "bond-market-us"
+
+    def is_trading_day(self, d: dt.date) -> bool:
+        if is_bond_market_holiday(d):
+            return False
+        return super().is_trading_day(d)
+
+    def previous_valid_session(self, d: dt.date) -> Optional[dt.date]:
+        current = d
+        for _ in range(10):                # covers a multi-day holiday cluster
+            current = super().previous_valid_session(current)
+            if current is None:
+                return None
+            if not is_bond_market_holiday(current):
+                return current
+        return None
+
+
 class CryptoCalendarAdapter(CalendarAdapter):
     """24x7 UTC. Every calendar day is a session, weekends included."""
 
@@ -548,32 +606,42 @@ class FxCalendarAdapter(CalendarAdapter):
 
 
 class GlobexCalendarAdapter(CalendarAdapter):
-    """Globex futures: Sunday-Friday, 17:00 ET session boundary.
+    """Globex futures daily bars: Monday-Friday.
 
-    Sunday IS a legitimate session (weekly open), so it is a trading day here --
-    unlike FX, where Sunday is only the roll into Monday.
+    Globex genuinely trades Sunday 17:00 ET through Friday, so the *live*
+    session boundary is Sun-Fri. But every daily bar these series are sourced
+    from is labelled Monday-Friday: the Sunday-evening session rolls into
+    Monday's bar, so no provider ever publishes a Sunday-labelled daily bar
+    (yfinance relabels it away once the session closes; Investing.com's
+    continuous futures never carry one).
+
+    Treating Sunday as a session made the historical gate read the following
+    Monday's absent prior as a storage hole and defer it forever -- 2026-10-18
+    for the nine yfinance-sourced equity/index futures. The daily-bar calendar
+    is therefore Mon-Fri, matching the source definition's own observation
+    convention (``us_futures``), which already excludes the Sunday session.
     """
 
-    name = "globex-sun-fri"
+    name = "globex-daily-mon-fri"
 
     def is_trading_day(self, d: dt.date) -> bool:
-        return d.weekday() != 5                   # everything but Saturday
+        return d.weekday() < 5                     # Monday-Friday
 
     def previous_valid_session(self, d: dt.date) -> Optional[dt.date]:
         cur = d - dt.timedelta(days=1)
         for _ in range(7):
-            if cur.weekday() != 5:
+            if cur.weekday() < 5:
                 return cur
             cur -= dt.timedelta(days=1)
         return None
 
     def session_close_utc(self, d: dt.date) -> Optional[dt.datetime]:
-        if d.weekday() == 5:
+        if d.weekday() >= 5:
             return None
         return dt.datetime.combine(d, dt.time(17, 0), tzinfo=_ET).astimezone(_UTC)
 
     def session_status(self, d: dt.date, now_utc: dt.datetime) -> SessionStatus:
-        if d.weekday() == 5:
+        if d.weekday() >= 5:
             return SessionStatus.NON_TRADING_DAY
         close = self.session_close_utc(d)
         if now_utc >= close + dt.timedelta(minutes=CALENDAR_CLOSE_BUFFER_MINUTES):
@@ -581,44 +649,22 @@ class GlobexCalendarAdapter(CalendarAdapter):
         return SessionStatus.OPEN
 
 
-class TreasuryCalendarAdapter(CalendarAdapter):
+class TreasuryCalendarAdapter(BondMarketCalendarAdapter):
     """Official Treasury par yields.
 
-    Session-day test uses the US business-day calendar (XNYS approximation).
-    ``requires_publication_confirmation`` is True: the caller must additionally
-    confirm that the Treasury.gov publication for *this specific session* is
-    available. An unavailable calendar fails closed.
+    Session-day test uses the US bond-market calendar (XNYS minus SIFMA
+    holidays): Treasury.gov publishes on the bond market's schedule, not the
+    equity exchange's. ``requires_publication_confirmation`` is True: the caller
+    must additionally confirm that the Treasury.gov publication for *this
+    specific session* is available. An unavailable calendar fails closed.
     """
 
     name = "treasury-publication"
     requires_publication_confirmation = True
 
     def __init__(self):
-        if _xc is None:
-            raise CalendarUnavailable(
-                f"exchange_calendars unavailable: {_XC_IMPORT_ERROR!r}")
-        try:
-            self._cal = _xc.get_calendar(_TREASURY_APPROX_EXCHANGE)
-        except Exception as exc:
-            raise CalendarUnavailable(
-                f"{_TREASURY_APPROX_EXCHANGE}: {exc}") from exc
-
-    def is_trading_day(self, d: dt.date) -> bool:
-        try:
-            return bool(self._cal.is_session(d))
-        except Exception:
-            return False
-
-    def previous_valid_session(self, d: dt.date) -> Optional[dt.date]:
-        try:
-            return _as_date(self._cal.previous_session(d))
-        except Exception:
-            pass
-        try:
-            anchor = _pd.Timestamp(d) - _pd.Timedelta(days=1)
-            return _as_date(self._cal.date_to_session(anchor, direction="previous"))
-        except Exception:
-            return None
+        super().__init__(_TREASURY_APPROX_EXCHANGE)
+        self.name = "treasury-publication"
 
     def session_close_utc(self, d: dt.date) -> Optional[dt.datetime]:
         # Official par-yield publication lands mid-afternoon ET. 21:30 UTC is a
@@ -645,6 +691,8 @@ def adapter_for(symbol: str) -> CalendarAdapter:
             adapter = UnknownCalendarAdapter("SOURCE_DEFINITION_UNRESOLVED")
         elif symbol in TREASURY_PUBLICATION_SYMBOLS:
             adapter = TreasuryCalendarAdapter()
+        elif symbol in BOND_MARKET_SYMBOLS:
+            adapter = BondMarketCalendarAdapter("XNYS")
         elif symbol in CRYPTO_SYMBOLS:
             adapter = CryptoCalendarAdapter()
         elif symbol in FX_SYMBOLS:
@@ -820,6 +868,92 @@ def register_symbol_source_definition(symbol: str,
 
 # ---------------------------------------------------------------- helpers
 
+def _easter_sunday(year: int) -> dt.date:
+    """Anonymous Gregorian algorithm (Meeus/Jones/Butcher)."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return dt.date(year, month, day + 1)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> dt.date:
+    first = dt.date(year, month, 1)
+    return first + dt.timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> dt.date:
+    last = _cal.monthrange(year, month)[1]
+    d = dt.date(year, month, last)
+    return d - dt.timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def _sifma_observed(d: dt.date, *, skip_saturday: bool = False) -> Optional[dt.date]:
+    """SIFMA observance rule: Saturday -> Friday, Sunday -> Monday.
+
+    New Year's Day is the exception: when it falls on a Saturday the market is
+    open on the preceding Friday, so no holiday is observed in that year.
+    """
+    if d.weekday() == 5:
+        if skip_saturday:
+            return None
+        return d - dt.timedelta(days=1)
+    if d.weekday() == 6:
+        return d + dt.timedelta(days=1)
+    return d
+
+
+_BOND_HOLIDAY_CACHE: Dict[int, frozenset] = {}
+
+
+def bond_market_holidays(year: int) -> frozenset:
+    """US bond-market (SIFMA) full holidays for ``year``.
+
+    NYSE stays open on Columbus Day and Veterans Day; the bond market does not.
+    """
+    cached = _BOND_HOLIDAY_CACHE.get(year)
+    if cached is not None:
+        return cached
+
+    out: Set[dt.date] = set()
+
+    def add(observed: Optional[dt.date]) -> None:
+        if observed is not None:
+            out.add(observed)
+
+    add(_sifma_observed(dt.date(year, 1, 1), skip_saturday=True))   # New Year
+    out.add(_nth_weekday(year, 1, 0, 3))                            # MLK
+    out.add(_nth_weekday(year, 2, 0, 3))                            # Washington
+    out.add(_easter_sunday(year) - dt.timedelta(days=2))            # Good Friday
+    out.add(_last_weekday(year, 5, 0))                              # Memorial Day
+    add(_sifma_observed(dt.date(year, 6, 19)))                      # Juneteenth
+    add(_sifma_observed(dt.date(year, 7, 4)))                       # Independence
+    out.add(_nth_weekday(year, 9, 0, 1))                            # Labor Day
+    out.add(_nth_weekday(year, 10, 0, 2))                           # Columbus Day
+    add(_sifma_observed(dt.date(year, 11, 11)))                     # Veterans Day
+    out.add(_nth_weekday(year, 11, 3, 4))                           # Thanksgiving
+    out.add(_nth_weekday(year, 11, 3, 4) + dt.timedelta(days=1))    # day after
+    add(_sifma_observed(dt.date(year, 12, 25)))                     # Christmas
+
+    result = frozenset(out)
+    _BOND_HOLIDAY_CACHE[year] = result
+    return result
+
+
+def is_bond_market_holiday(d: dt.date) -> bool:
+    """True when ``d`` is a US bond-market (SIFMA) holiday."""
+    d = _as_date(d)
+    if d is None:
+        return False
+    return d in bond_market_holidays(d.year)
+
+
 def session_status(symbol: str, d: dt.date,
                    now_utc: Optional[dt.datetime] = None) -> SessionStatus:
     return adapter_for(symbol).session_status(
@@ -947,8 +1081,10 @@ def classify_weekend_rows(
 ) -> Dict[dt.date, str]:
     """Classify weekend-dated rows without repairing or deleting anything.
 
-    Legitimate weekend sessions (crypto; Globex Sunday) are *not* corruption.
-    Uncertain ones are reported as WEEKEND_SESSION_REVIEW_REQUIRED.
+    Legitimate weekend sessions (crypto) are *not* corruption. Uncertain ones
+    are reported as WEEKEND_SESSION_REVIEW_REQUIRED. A series whose daily bars
+    are Monday-Friday (yfinance-sourced Globex futures) has no weekend session
+    at all, so its weekend rows are reported the same way.
     """
     out: Dict[dt.date, str] = {}
     adapter = adapter_for(symbol)

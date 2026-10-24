@@ -208,6 +208,11 @@ def is_provider_error(error_text: str) -> bool:
 # ---------------------------------------------------------------------
 TRANSIENT_REASONS = frozenset({
     "CLOSED_UNCONFIRMED",
+    # SESSION_OPEN is transient by nature: the session is still running, so the
+    # bar is simply not final yet. It resolves on its own once the session
+    # closes. Defaulting it to MANUAL_REVIEW_REQUIRED pinned every such row
+    # forever -- 2026-10-18 for the nine yfinance-sourced equity/index futures.
+    "SESSION_OPEN",
     "PREVIOUS_SESSION_NOT_CONFIRMED",
     "PREVIOUS_SESSION_OFFICIAL_NOT_CONFIRMED",
     "TREASURY_PUBLICATION_NOT_CONFIRMED",

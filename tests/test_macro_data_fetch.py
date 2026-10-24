@@ -176,7 +176,7 @@ def test_fetch_investiny_symbol_df_normalizes_historical_payload(monkeypatch):
     {date, price, open, high, low} and the pipeline normalizes it to the
     standard frame (Date/Open/High/Low/Close/Adj Close/Volume)."""
 
-    def fake_fetch(symbol, timeout=45):
+    def fake_fetch(symbol, timeout=45, start_date=None, end_date=None):
         assert symbol == "US10YT=X"
         return [
             {"date": "2026-07-01", "price": 4.55, "open": 4.4, "high": 4.6, "low": 4.3},
@@ -199,7 +199,7 @@ def test_fetch_investiny_symbol_df_normalizes_historical_payload(monkeypatch):
 
 
 def test_fetch_investiny_symbol_df_drops_weekend_rows(monkeypatch):
-    def fake_fetch(symbol, timeout=45):
+    def fake_fetch(symbol, timeout=45, start_date=None, end_date=None):
         # 2026-07-05 is a Sunday
         return [
             {"date": "2026-07-03", "price": 4.55, "open": 4.4, "high": 4.6, "low": 4.3},
@@ -237,7 +237,7 @@ def test_fetch_investiny_symbol_df_hard_failure_raises_after_retries(monkeypatch
     attempts = []
     sleeps = []
 
-    def fake_fetch(symbol, timeout=45):
+    def fake_fetch(symbol, timeout=45, start_date=None, end_date=None):
         attempts.append(1)
         raise ConnectionError("provider unavailable")
 
@@ -262,7 +262,7 @@ def test_fetch_investiny_symbol_df_recovers_after_transient_error(monkeypatch):
     attempts = []
     sleeps = []
 
-    def fake_fetch(symbol, timeout=45):
+    def fake_fetch(symbol, timeout=45, start_date=None, end_date=None):
         attempts.append(1)
         if len(attempts) < 2:
             raise ConnectionError("timed out")
@@ -1246,3 +1246,5 @@ class TestWriteWindowUsesMarketSessions:
     def test_empty_rows_are_returned_unchanged(self):
         assert macro_data_fetch.filter_rows_to_target_window(
             [], date(2026, 10, 18)) == []
+
+

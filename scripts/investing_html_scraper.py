@@ -1,10 +1,18 @@
-"""Investing.com HTML scraper adapter for historical data extraction.
+"""Investing.com historical-data adapter.
 
-HTML-ONLY. Investing.com market data must be fetched by scraping the historical-data
-HTML pages. The JSON API at api.investing.com is NOT used - it is blocked and is
-explicitly out of scope for this project.
+Two access paths, both public and both HTML-origin:
 
-Access notes (verified 2026-10-21):
+  1. The historical-data page itself, scraped as HTML
+     (`fetch_investing_html` / `extract_historical_data`).
+  2. The date-range endpoint those pages use to render their own table
+     (`fetch_instrument_range`). The page only ever shows the most recent
+     ~20 rows, so an explicit `start-date` / `end-date` is the only way to reach
+     older history - the pages expose no URL parameter for it.
+
+The `investiny` package and its Python JSON API client are NOT used - it is
+blocked (HTTP 403) and explicitly out of scope for this project.
+
+Access notes (verified 2026-10-21, re-verified 2026-10-25):
   * plain httpx / requests  -> HTTP 403 (Cloudflare WAF)
   * curl_cffi impersonate="chrome"      -> HTTP 403
   * curl_cffi impersonate="safari17_0"  -> HTTP 200  <-- the working fingerprint
@@ -54,10 +62,50 @@ INVESTING_URLS = {
     "CIHc1": "https://au.investing.com/indices/sse-50-futures-historical-data",
 }
 
+# Instrument ids read out of the historical-data pages (confirmed 2026-10-25).
+# Used as a fallback when the id cannot be read out of the page HTML itself.
+INVESTING_INSTRUMENT_IDS = {
+    "BZ=F": "8833",
+    "CIHc1": "1115062",
+    "CL=F": "8849",
+    "ES=F": "8839",
+    "GC=F": "8830",
+    "HG=F": "8831",
+    "HK50": "8984",
+    "KOR200c1": "8987",
+    "NG=F": "8862",
+    "NIY=F": "8859",
+    "NQ=F": "8874",
+    "RTY=F": "8864",
+    "SI=F": "8836",
+    "US10YT=X": "23705",
+    "US20YT=X": "1161827",
+    "US2YT=X": "23701",
+    "US30YT=X": "23706",
+    "US3YT=X": "23702",
+    "US5YT=X": "23703",
+    "US7YT=X": "23704",
+    "YM=F": "8873",
+}
+
+# The historical-data pages load their table through this endpoint; it accepts
+# start-date / end-date, which is how history older than the page's default
+# ~20-row window is retrieved.
+HISTORICAL_RANGE_URL = (
+    "https://api.investing.com/api/financialdata/historical/{instrument_id}"
+)
+
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+_API_HEADERS = dict(HEADERS)
+_API_HEADERS["Accept"] = "application/json"
+_API_HEADERS["domain-id"] = "www"
+
+# The page embeds its own instrument id in the Next.js payload.
+_INSTRUMENT_ID_RE = re.compile(r'"instrumentId":"(\d+)"')
 
 _MONTHS = {m: i + 1 for i, m in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
@@ -78,7 +126,7 @@ def parse_date(date_str: str) -> Optional[str]:
     """
     if not date_str:
         return None
-    s = date_str.strip()
+    s = str(date_str).strip()
     m = _ISO.match(s)
     if m:
         return s
@@ -105,6 +153,40 @@ def parse_price(price_str: str) -> Optional[float]:
         return float(s)
     except ValueError:
         return None
+
+
+def extract_instrument_id(html: str) -> Optional[str]:
+    """Read the instrument id out of a historical-data page."""
+    if not html:
+        return None
+    m = _INSTRUMENT_ID_RE.search(html)
+    return m.group(1) if m else None
+
+
+def parse_instrument_row(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Convert one date-range row into the scraper's record shape.
+
+    The endpoint emits strings like "2,733.00" for prices and an ISO-ish
+    timestamp for the date; both go through the same parsers as the HTML path.
+    """
+    if not isinstance(rec, dict):
+        return None
+    iso = rec.get("rowDateTimestamp")
+    if not iso:
+        return None
+    d = parse_date(str(iso)[:10])
+    if not d:
+        return None
+    price = parse_price(rec.get("last_close"))
+    if price is None:
+        return None
+    return {
+        "date": d,
+        "price": price,
+        "open": parse_price(rec.get("last_open")),
+        "high": parse_price(rec.get("last_max")),
+        "low": parse_price(rec.get("last_min")),
+    }
 
 
 def fetch_investing_html(symbol: str, timeout: int = 45) -> Optional[str]:
@@ -164,18 +246,86 @@ def extract_historical_data(html: str) -> List[Dict[str, Any]]:
     return []
 
 
-def fetch_historical_data(symbol: str, timeout: int = 45) -> List[Dict[str, Any]]:
-    """Fetch + parse historical data for one symbol."""
+def fetch_instrument_range(
+    symbol: str,
+    start_date: Any = None,
+    end_date: Any = None,
+    timeout: int = 45,
+) -> Optional[List[Dict[str, Any]]]:
+    """Fetch an explicit date range through the page's own date-range endpoint.
+
+    The historical-data page renders only its most recent ~20 rows and exposes
+    no URL parameter for a wider window, so this endpoint is the only way to
+    reach older history. Returns a date-ascending list of records, or None when
+    the range cannot be served (unknown symbol, blocked response, unparsable
+    payload) so callers can fall back to the default HTML page.
+    """
+    if not INVESTING_URLS.get(symbol):
+        return None
+
+    instrument_id = INVESTING_INSTRUMENT_IDS.get(symbol)
+    if not instrument_id:
+        page = fetch_investing_html(symbol, timeout=timeout)
+        instrument_id = extract_instrument_id(page) if page else None
+    if not instrument_id:
+        return None
+
+    params = {
+        "start-date": getattr(start_date, "isoformat", lambda: "")(),
+        "end-date": getattr(end_date, "isoformat", lambda: "")(),
+        "time-frame": "Daily",
+        "add-missing-rows": "false",
+    }
+    try:
+        resp = _http.get(
+            HISTORICAL_RANGE_URL.format(instrument_id=instrument_id),
+            params=params, headers=_API_HEADERS, impersonate=IMPERSONATE,
+            timeout=timeout, allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+    except Exception:
+        return None
+
+    data = (payload or {}).get("data") or []
+    rows = [r for r in (parse_instrument_row(x) for x in data) if r]
+    rows.sort(key=lambda r: r["date"])
+    return rows or None
+
+
+def fetch_historical_data(
+    symbol: str,
+    timeout: int = 45,
+    start_date: Any = None,
+    end_date: Any = None,
+) -> List[Dict[str, Any]]:
+    """Fetch + parse historical data for one symbol.
+
+    With start_date/end_date the page's own date-range endpoint is used so
+    history older than the page's default ~20-row window can be retrieved;
+    without them the plain historical-data page is scraped. Both paths return
+    the same record shape and both fall through to the HTML page when the
+    range endpoint is unavailable.
+    """
+    if start_date is not None or end_date is not None:
+        ranged = fetch_instrument_range(
+            symbol, start_date=start_date, end_date=end_date, timeout=timeout
+        )
+        if ranged:
+            return ranged
+
     html = fetch_investing_html(symbol, timeout=timeout)
     return extract_historical_data(html) if html else []
 
 
 if __name__ == "__main__":
     print("=" * 88)
-    print("INVESTING.COM HTML SCRAPER - self test")
+    print("INVESTING.COM HISTORICAL-DATA SCRAPER - self test")
     print("=" * 88)
     print("  fingerprint: {}".format(IMPERSONATE))
     print("  symbols in map: {}".format(len(INVESTING_URLS)))
+    print("  instrument ids mapped: {}".format(len(INVESTING_INSTRUMENT_IDS)))
     print()
 
     ok = 0

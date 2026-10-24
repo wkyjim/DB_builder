@@ -43,7 +43,10 @@ from macro_data_fetch import (
     _PHASE_A_DEFERRED_COUNT,
     _PHASE_A_BOUNDARY_DEFERRED_COUNT,
 )
-from db_builder.session_calendar import adapter_for
+from db_builder.session_calendar import (
+    SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY,
+    adapter_for,
+)
 
 
 SYMBOL = "ES=F"          # yfinance continuous futures (Mon-Fri daily bars)
@@ -265,14 +268,14 @@ class TestA2_6_NoPositionalFallback:
 # --------------------------------------------------------------------------
 class TestA2_7_CalendarGap:
     def test_a2_7_sunday_is_not_a_daily_observation(self):
-        """Globex Sunday is a real trading SESSION but not a published daily
-        bar, so Monday's previous observation is Friday."""
+        """Globex Sunday is not a published daily bar, so Monday's previous
+        observation is Friday -- and Sunday is not a session for this series
+        either (yfinance publishes Monday-Friday daily bars only)."""
         from db_builder.session_calendar import (
             previous_valid_observation_date, previous_valid_session,
         )
         assert previous_valid_observation_date(SYMBOL, MON) == D2
-        # the session calendar still reports Sunday (unchanged semantics)
-        assert previous_valid_session(SYMBOL, MON) == SUN
+        assert previous_valid_session(SYMBOL, MON) == D2
 
     def test_a2_7b_holiday_aware_not_day_minus_one(self):
         """A US holiday must be skipped; the convention is not 'minus one day'."""
@@ -407,16 +410,23 @@ class TestA2_8_RecoveryOrder:
         assert order == sorted(order), "recovery must be chronological"
         assert order.index(P) < order.index(D), "P must be retried before D"
 
-    def test_a2_8b_recovery_batch_never_contains_two_dates_for_one_symbol(self):
-        """Recovery evaluates one (symbol, session_date) at a time, so the
-        batch_dates flaw cannot be triggered from the recovery path."""
+    def test_a2_8b_recovery_fetches_the_target_with_its_priors(self):
+        """Recovery must fetch the candidate TOGETHER WITH its prior sessions.
+
+        The write gate refuses a row whose immediately prior valid session is
+        not stored, and a single-date fetch can never supply that prior -- the
+        gap would become permanent. The batch_dates flaw stays avoided because
+        the extra dates are priors resolved on the symbol's own calendar, not a
+        second independent candidate pulled from the queue.
+        """
         import inspect
         import macro_data_fetch as m
 
         src = inspect.getsource(m.run_deferred_recovery)
-        assert 'cand.session_date' in src
-        # the match filter is pinned to the single candidate session
-        assert 'pd.to_datetime(r["date"]).date() == cand.session_date' in src
+        assert 'recovery_session_dates(cand.symbol, cand.session_date)' in src, (
+            "recovery must build its fetch window from the candidate")
+        assert 'fetch_symbol_rows(cand.symbol, _fetch_dates)' in src, (
+            "recovery must fetch the window, not only the candidate date")
 
 
 # --------------------------------------------------------------------------
@@ -574,16 +584,23 @@ class TestA2_12_TuesdayDependency:
 # A2-13  Sunday trading semantics preserved
 # --------------------------------------------------------------------------
 class TestA2_13_SundaySemanticsPreserved:
-    def test_a2_13_sunday_remains_a_trading_session(self):
-        """Changing the daily-bar dependency logic must not make Sunday
-        globally non-trading."""
+    def test_a2_13_sunday_is_not_a_daily_session(self):
+        """The daily-bar calendar is Monday-Friday.
+
+        Globex genuinely trades Sunday 17:00 ET, but yfinance's continuous
+        futures publish Monday-Friday daily bars only -- the Sunday session
+        rolls into Monday's bar, and the Sunday-labelled bar yfinance shows
+        while that session is still open is relabelled once it closes. Treating
+        Sunday as a session queued a bar that can never exist: 2026-10-18 for
+        the nine yfinance-sourced equity/index futures.
+        """
         adapter = adapter_for(SYMBOL)
-        assert adapter.is_trading_day(SUN) is True
+        assert adapter.is_trading_day(SUN) is False
         assert adapter.is_trading_day(MON_) is True
 
-    def test_a2_13_sunday_previous_session_unchanged(self):
+    def test_a2_13_monday_previous_session_is_friday(self):
         from db_builder.session_calendar import previous_valid_session
-        assert previous_valid_session(SYMBOL, MON_) == SUN
+        assert previous_valid_session(SYMBOL, MON_) == FRI
 
     def test_a2_13_crypto_sunday_is_a_real_observation(self):
         """Crypto trades weekends: Sunday is a genuine observation date, so the
@@ -595,9 +612,16 @@ class TestA2_13_SundaySemanticsPreserved:
         from db_builder.session_calendar import (
             previous_valid_observation_date, previous_valid_session,
         )
-        # same symbol, deliberately different answers
-        assert previous_valid_observation_date(SYMBOL, MON_) == FRI
-        assert previous_valid_session(SYMBOL, MON_) == SUN
+        # The two questions still have distinct answers. 2026-12-28 is a
+        # Monday; the *session* before it is Friday 2026-12-25 (the daily-bar
+        # calendar is weekday-only), while the *observation* before it is
+        # Thursday 2026-12-24, because Christmas is a US futures holiday the
+        # us_futures convention skips.
+        assert previous_valid_session(SYMBOL, date(2026, 12, 28)) == date(2026, 12, 25)
+        assert (previous_valid_observation_date(
+            SYMBOL, date(2026, 12, 28),
+            SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY)
+            == date(2026, 12, 24))
 
 
 # --------------------------------------------------------------------------
@@ -936,16 +960,25 @@ class TestA2_22_FallbackDoesNotSwitchConvention:
 
     def test_a2_22_row_carried_definition_wins_over_registry(self):
         """A candidate row carrying its own definition is evaluated under that
-        definition, not the symbol's registry default."""
+        definition, not the symbol's registry default.
+
+        2026-01-02 is a Friday. Its *session* predecessor is Thursday
+        2026-01-01 (the daily-bar calendar is weekday-only), but its
+        *observation* predecessor under the yfinance continuous-futures
+        convention is Wednesday 2025-12-31, because New Year's Day is a US
+        futures holiday. The carried definition therefore decides which prior
+        the gate demands.
+        """
         from macro_data_fetch import _eligible_for_historical
-        row = make_row(MON_, 101.10, symbol="ES=F")
+        d, known = date(2026, 1, 2), {date(2025, 12, 31)}
+        row = make_row(d, 101.10, symbol="ES=F")
         row["source_definition"] = SOURCE_DEF_YFINANCE_CONTINUOUS_FUTURES_DAILY
-        dec = _eligible_for_historical(row, known_prior_sessions={FRI})
+        dec = _eligible_for_historical(row, known_prior_sessions=known)
         assert dec.routing == ROUTE_HISTORICAL
 
-        row2 = make_row(MON_, 101.10, symbol="ES=F")
+        row2 = make_row(d, 101.10, symbol="ES=F")
         row2["source_definition"] = SOURCE_DEF_INVESTING_HK40_FUTURES_DAILY
-        dec2 = _eligible_for_historical(row2, known_prior_sessions={FRI})
+        dec2 = _eligible_for_historical(row2, known_prior_sessions=known)
         assert dec2.routing == ROUTE_DEFERRED
 
 

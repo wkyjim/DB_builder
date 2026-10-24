@@ -29,6 +29,7 @@ from db_builder.config import MACRO_TABLE, local_engine as make_local_engine
 from db_builder.config import neon_engine as make_neon_engine
 from db_builder.trading_calendar import latest_completed_nyse_session_date
 from db_builder.session_calendar import (
+    BOND_MARKET_SYMBOLS,
     CMT_SYMBOLS,
     MARKET_REFERENCE_SYMBOLS,
     ROUTE_DEFERRED,
@@ -40,6 +41,7 @@ from db_builder.session_calendar import (
     TREASURY_SYMBOLS,
     historical_eligibility,
     adapter_for,
+    is_bond_market_holiday,
     previous_valid_session,
     previous_valid_observation_date,
     SOURCE_DEFINITION_BY_SYMBOL,
@@ -1409,6 +1411,14 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
             return False
         return _anchor_eligibility.get((row.symbol, row.session_date), False)
 
+    # Reconcile the WHOLE queue against the data it tracks before escalation.
+    # Without this, rows whose session is already stored stay pending forever
+    # and are re-escalated on every cycle.
+    _reconciled = reconcile_stored_sessions(engine, store, now=now)
+    if _reconciled:
+        print(f"[DEFERRED RECOVERY] queue reconciled={_reconciled} "
+              f"(sessions already stored)")
+
     candidates = store.due_candidates(now=now, limit=limit,
                                       recovery_days=recovery_days,
                                       provider_available=(
@@ -1434,9 +1444,25 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
 
     resolved = 0
     still = 0
+    reconciled = 0
     for cand in candidates:
+        # Reconcile first: a session already present in public.macro is resolved
+        # by definition, regardless of what the provider returns today. The
+        # provider's recent window never contains an old date, so without this
+        # check a session written by the backfill (or any other path) would be
+        # re-deferred on every cycle and escalated as permanently unresolved.
+        if session_is_stored(engine, cand.symbol, cand.session_date):
+            store.record_success(cand.symbol, cand.session_date, now=now,
+                                 attempted=False)
+            resolved += 1
+            reconciled += 1
+            print(f"[DEFERRED RECOVERY] RECONCILED {cand.symbol} "
+                  f"{cand.session_date} (already stored)")
+            continue
+
+        _fetch_dates = recovery_session_dates(cand.symbol, cand.session_date)
         try:
-            rows = fetch_symbol_rows(cand.symbol, [cand.session_date])
+            rows = fetch_symbol_rows(cand.symbol, _fetch_dates)
         except Exception as exc:
             exc_name = type(exc).__name__
             reason = f"RECOVERY_FETCH_ERROR:{exc_name}"
@@ -1469,33 +1495,51 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
             still += 1
             continue
 
-        match = [r for r in (rows or [])
-                 if pd.to_datetime(r["date"]).date() == cand.session_date]
-        if not match:
-            store.record_deferral(cand.symbol, cand.session_date,
-                                  "RECOVERY_DATA_STILL_MISSING", now=now,
-                                  attempted=True, retry_class=BACKOFF_ACTIVE)
-            still += 1
-            continue
+        # Write every session in the fetched frame that is not yet stored, in
+        # ascending order, so each row's prior is committed before the gate
+        # evaluates it. Only the candidate's own date is tracked by the queue;
+        # the priors are written so the gate can chain across the hole.
+        frame = {pd.to_datetime(r["date"]).date() for r in (rows or [])}
+        _missing = sorted(d for d in _fetch_dates
+                          if not session_is_stored(engine, cand.symbol, d))
 
-        written = upsert_macro(engine, match, mode="INGEST",
-                               prior_lookup=prior_lookup,
-                               prior_value_lookup=prior_value_lookup,
-                               provenance_lookup=_effective_provenance_lookup,
-                               trust_start=trust_start,
-                               deferred_store=store)
-        if written:
+        _wrote = set()
+        for _d in _missing:
+            _match = [r for r in (rows or [])
+                      if pd.to_datetime(r["date"]).date() == _d]
+            if not _match:
+                continue
+            _n = upsert_macro(engine, _match, mode="INGEST",
+                              prior_lookup=prior_lookup,
+                              prior_value_lookup=prior_value_lookup,
+                              provenance_lookup=_effective_provenance_lookup,
+                              trust_start=trust_start,
+                              deferred_store=store)
+            if _n:
+                _wrote.add(_d)
+
+        if cand.session_date in _wrote:
             # A real provider fetch occurred, so this resolution counts as one
             # recovery attempt (attempt_count += 1), consistent with the
             # failed/re-deferred paths. Explicit, never a default.
             store.record_success(cand.symbol, cand.session_date, now=now,
                                  attempted=True)
+            _extra = len(_wrote) - 1
             print(f"[DEFERRED RECOVERY] RESOLVED {cand.symbol} "
-                  f"{cand.session_date}")
+                  f"{cand.session_date}"
+                  + (f" (+{_extra} prior session(s) backfilled)"
+                     if _extra > 0 else ""))
             resolved += 1
-        else:
+        elif cand.session_date in frame:
+            # The provider supplied the session but the gate still refused it
+            # (prior unconfirmed, or provenance unverified).
             store.record_deferral(cand.symbol, cand.session_date,
                                   "RECOVERY_PRIOR_STILL_UNCONFIRMED", now=now,
+                                  attempted=True, retry_class=BACKOFF_ACTIVE)
+            still += 1
+        else:
+            store.record_deferral(cand.symbol, cand.session_date,
+                                  "RECOVERY_DATA_STILL_MISSING", now=now,
                                   attempted=True, retry_class=BACKOFF_ACTIVE)
             still += 1
 
@@ -1508,7 +1552,8 @@ def run_deferred_recovery(engine, store, *, fetch_symbol_rows, now_utc=None,
               f"(retained in tracking)")
 
     return {"retried": len(candidates), "resolved": resolved,
-            "still_deferred": still, "escalated": len(escalated)}
+            "still_deferred": still, "escalated": len(escalated),
+            "reconciled": reconciled}
 
 
 def _report_deferred_states(store, *, now, unavailable_keys=None):
@@ -1550,6 +1595,77 @@ def _report_deferred_states(store, *, now, unavailable_keys=None):
     if blocked:
         print(f"[DEFERRED DEPENDENCY] prerequisite_blocked={len(blocked)}")
 
+
+def ensure_row_sources(rows):
+    """Give every row a provider label (``source``) before it is persisted.
+
+    ``calculate_rows_for_symbol`` emits ``source_definition`` but not
+    ``source``, and ``upsert_macro``'s INSERT binds ``%(source)s``. Without this
+    the write raises ``InvalidRequestError: A value is required for bind
+    parameter 'source'``. The label is a pure function of the symbol, so it is
+    derived here rather than required from every fetch path.
+    """
+    for row in rows:
+        if row.get("source") is None:
+            row["source"] = provider_for_symbol(row.get("symbol"))
+    return rows
+
+
+def session_is_stored(engine, symbol, session_date):
+    """True when ``(symbol, session_date)`` is already persisted.
+
+    Used to reconcile the deferred store against the data it tracks, so a
+    session written by another path is never reported as still missing.
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT 1 FROM public.macro "
+                     "WHERE symbol=:s AND date=:d LIMIT 1"),
+                {"s": symbol, "d": session_date},
+            ).first()
+        return row is not None
+    except Exception:
+        # Never let bookkeeping reconciliation mask a real recovery outcome.
+        return False
+
+def reconcile_stored_sessions(engine, store, *, now=None):
+    """Resolve every pending queue row whose session is not expected to exist.
+
+    Returns the number of rows reconciled. Two cases:
+
+    * the session is already persisted -> resolved by definition, regardless of
+      which path wrote it or whether the provider can still serve that date;
+    * the session is not a valid *session* for that symbol (a holiday or a
+      non-trading day) -> no bar can ever exist for it, so the row is resolved
+      instead of being retried forever.
+
+    The second case is what cleared the phantom 2026-10-18 rows queued for the
+    nine yfinance-sourced equity/index futures once Globex stopped treating
+    Sunday as a session: the row was queued while the Sunday bar was still
+    labelled that way, then the bar was relabelled and the row could never
+    resolve by fetching.
+    """
+    now = now or datetime.now(ZoneInfo("UTC"))
+    reconciled = 0
+    for row in store.all_rows():
+        if row.status == "RESOLVED":
+            continue
+        if session_is_stored(engine, row.symbol, row.session_date):
+            store.record_success(row.symbol, row.session_date, now=now,
+                                 attempted=False)
+            reconciled += 1
+            continue
+        decision = historical_eligibility(
+            row.symbol, row.session_date,
+            source_definition=SOURCE_DEFINITION_BY_SYMBOL.get(row.symbol))
+        if decision.routing == ROUTE_REJECT:
+            print(f"[DEFERRED RECONCILE] {row.symbol} {row.session_date}: "
+                  f"not a session ({decision.reason}) -> resolved, not retried")
+            store.record_success(row.symbol, row.session_date, now=now,
+                                 attempted=False)
+            reconciled += 1
+    return reconciled
 
 def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
                  prior_value_lookup=None, provenance_lookup=None,
@@ -1640,6 +1756,8 @@ def upsert_macro(engine, rows, *, mode="INGEST", prior_lookup=None,
     # attempt_count, no C2 mutation. Universe/window safety is enforced by the
     # caller (sync_recent_macro_to_neon) before rows reach here.
     # Fall through to the same INSERT ... ON CONFLICT DO UPDATE below.
+
+    ensure_row_sources(rows)
 
     df = pd.DataFrame(rows)
     df = df.where(pd.notna(df), None)
@@ -2786,8 +2904,11 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
         if sd is None:
             counters["skipped_rows"] += 1
             continue
-        key = (s, sd)
-        if key not in C3A_APPROVED_ANCHORS and key not in SOURCE_DEFINITION_TRUST_START:
+        # Destination safety is the approved EOD/API universe, NOT anchor
+        # coverage: 45 of the 73 macro symbols have no C.1 trust-start anchor,
+        # and using the anchor map as this filter silently withheld every one of
+        # them from Neon. R22 exclusion is applied per-row further below.
+        if s not in APPROVED_MACRO_SYMBOLS:
             counters["skipped_rows"] += 1
             continue
         approved.append(s)
@@ -3460,6 +3581,19 @@ def _get_trusted_local_close(symbol, expected_prior):
 def _report_prev_session_unconfirmed(symbol, session_date, expected_prior,
                                      defer_callback=None):
     expected = expected_prior.isoformat() if expected_prior else "UNKNOWN"
+    # Phase B.3: a missing prior on a bond-market symbol can be an *expected*
+    # absence rather than a storage hole -- the US bond market is closed on
+    # Columbus Day and Veterans Day while NYSE stays open, and Treasury.gov,
+    # Investing.com's US Treasury yields and the ICE/CBOE Treasury indices all
+    # publish nothing on those dates. Attribute it so the two cases stay
+    # distinguishable in the log instead of both reading as "not present".
+    if (expected_prior is not None
+            and symbol in BOND_MARKET_SYMBOLS
+            and is_bond_market_holiday(expected_prior)):
+        print(f"[PREVIOUS_SESSION_BOND_HOLIDAY] {symbol} {session_date}: "
+              f"expected prior session {expected} is a US bond-market holiday "
+              f"-> provider publishes no bar by design, not a storage hole")
+        return
     print(f"[PREVIOUS_SESSION_NOT_CONFIRMED] {symbol} {session_date}: "
           f"expected prior session {expected} not present in provider frame "
           f"-> deferred (positional fallback prohibited)")
@@ -3481,6 +3615,11 @@ def _session_window_start(symbol, dates, fallback_start):
     Falls back to the calendar-day ``fallback_start`` when the calendar cannot
     resolve a boundary -- the previous behaviour, which is safe (it never drops
     a session the calendar would have kept) but coarser.
+
+    Note: this is a *write* window, not a *fetch* window. Rule 2 below keeps
+    the transitive priors of every kept row, so an explicit ``--start-date``
+    backfill needs no extra widening here -- and the fetch already returns the
+    full requested range.
     """
     if not dates:
         return fallback_start
@@ -3491,6 +3630,39 @@ def _session_window_start(symbol, dates, fallback_start):
             return fallback_start
         current = previous
     return current
+
+
+def recovery_session_dates(symbol, target, *, sessions=LOOKBACK_SESSIONS):
+    """Session dates to fetch for one deferred candidate.
+
+    The write gate refuses a row whose immediately prior valid session is not
+    stored, and the provider's recent window never contains an old date -- so a
+    single-date fetch can never satisfy that gate. Recovery therefore fetches
+    the target together with the ``sessions - 1`` preceding *observation* dates
+    on the symbol's own calendar, resolved from its approved source definition
+    (the same notion ``filter_rows_to_target_window`` uses to keep priors).
+
+    That one frame both supplies the prior the gate needs and carries any
+    earlier gap inside the same window, so a hole is healed instead of becoming
+    permanent.
+
+    Fails open to ``[target]`` when the calendar cannot resolve a prior: a
+    symbol without a resolvable source definition keeps the previous
+    single-date behaviour rather than fetching nothing.
+    """
+    if sessions <= 1:
+        return [target]
+
+    sd = SOURCE_DEFINITION_BY_SYMBOL.get(symbol)
+    dates = [target]
+    current = target
+    for _ in range(sessions - 1):
+        previous = previous_valid_observation_date(symbol, current, sd)
+        if previous is None:
+            break
+        dates.append(previous)
+        current = previous
+    return dates
 
 
 def filter_rows_to_target_window(rows, target_start_date):
@@ -3511,6 +3683,10 @@ def filter_rows_to_target_window(rows, target_start_date):
        any hole in storage permanent -- P could never be written (it is outside
        the window) and D could never be written either. Keeping the priors of
        the kept rows lets the pipeline heal such holes.
+
+    Note: this bounds the *write* window only. The fetch is independent of it,
+    so an operator ``--start-date`` backfill returns the whole requested range
+    and these rules then keep it, priors included.
     """
     if not rows:
         return rows
@@ -3604,6 +3780,8 @@ def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False,
         else:
             print(f"[UPSERT LOCAL {provider_label}] rows={len(local_missing_rows):,}")
             upsert_macro(local_engine, local_missing_rows,
+                         provenance_lookup=_build_anchor_provenance_lookup(
+                             local_engine),
                          deferred_store=deferred_store)
     else:
         print(f"[{provider_label} LOCAL NO NEW ROWS AFTER DEDUPE]")
@@ -3631,6 +3809,8 @@ def upsert_new_macro_rows(rows, symbols, *, upsert_neon=True, dry_run=False,
             else:
                 print(f"[UPSERT NEON {provider_label}] rows={len(neon_missing_rows):,}")
                 upsert_macro(neon_engine, neon_missing_rows,
+                             provenance_lookup=_build_anchor_provenance_lookup(
+                                 neon_engine),
                              count_telemetry=False)
         else:
             print(f"[{provider_label} NEON NO NEW ROWS AFTER DEDUPE]")
@@ -3754,11 +3934,16 @@ def _investiny_retry_delay(error, attempt):
 
 
 def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_retries=2):
-    """Fetch one Investing.com symbol by scraping its historical-data HTML page.
+    """Fetch one Investing.com symbol by scraping its historical-data pages.
 
-    HTML-only by design: the Investing.com JSON API is blocked for this project
-    (HTTP 403) and is explicitly out of scope. The scraper uses a browser TLS
-    fingerprint that passes Investing.com's WAF.
+    Investing.com is reached only through its public historical-data pages and
+    the date-range endpoint those pages use to render their own table. The
+    `investiny` Python API client is blocked for this project (HTTP 403) and is
+    explicitly out of scope. The scraper uses a browser TLS fingerprint that
+    passes Investing.com's WAF.
+
+    `start_date` / `end_date` are passed through so history older than the
+    page's default ~20-row window can be retrieved.
 
     Returns the same frame shape as the rest of the pipeline:
         Date, Open, High, Low, Close, Adj Close, Volume
@@ -3773,15 +3958,20 @@ def fetch_investiny_symbol_df(symbol, *, start_date=None, end_date=None, max_ret
 
     print(
         f"[INVESTING.COM FETCH WINDOW] {symbol} source_symbol={source_symbol} "
-        f"mode=html-scrape "
-        f"target_start={target_start_date} | end={fetch_end_date}"
+        f"mode=html-scrape+date-range "
+        f"fetch_start={fetch_start_date} | target_start={target_start_date} | "
+        f"end={fetch_end_date}"
     )
 
     last_error: BaseException | None = None
     for attempt in range(1, max_retries + 1):
         try:
             time.sleep(random.uniform(0.8, 2.0))
-            rows = _investing_html.fetch_historical_data(symbol)
+            rows = _investing_html.fetch_historical_data(
+                symbol,
+                start_date=fetch_start_date,
+                end_date=fetch_end_date,
+            )
             if not rows:
                 # Empty page: retry once through the loop, then surface it.
                 raise RuntimeError(
@@ -3863,9 +4053,10 @@ def process_investiny_symbol(symbol, meta, *, start_date=None, observed_at=None)
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
-            source_definition=SOURCE_DEF_INVESTING_CONTINUOUS_FUTURES_DAILY,
+            source_definition=SOURCE_DEFINITION_BY_SYMBOL.get(symbol),
         )
-        rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start_date)
+        rows = filter_rows_to_target_window(
+            rows=rows, target_start_date=target_start_date)
         if rows:
             print(f"[INVESTINY ROW DATES TARGET] {symbol} | {[row['date'] for row in rows]}")
         else:
@@ -4348,7 +4539,8 @@ def process_treasury_fallback_symbol(symbol, meta, *, start_date=None, observed_
             name=meta["name"],
             asset_type=meta["asset_type"],
         )
-        rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start)
+        rows = filter_rows_to_target_window(
+            rows=rows, target_start_date=target_start)
         if rows:
             print(
                 f"[UST FALLBACK ROW DATES TARGET] {symbol} | "
@@ -4474,7 +4666,8 @@ def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=Non
             name=meta["name"],
             asset_type=meta["asset_type"],
         )
-        rows = filter_rows_to_target_window(rows=rows, target_start_date=target_start)
+        rows = filter_rows_to_target_window(
+            rows=rows, target_start_date=target_start)
         if rows:
             print(
                 f"[OILPRICEAPI ROW DATES TARGET] {symbol} | "
@@ -4973,9 +5166,21 @@ def _yfinance_historical_rows(symbol, meta, dates, *, source_definition=None):
 
     Uses the same extract -> remove-unfinished -> calculate_rows_for_symbol
     path as normal ingestion, so a recovered row is never sourced differently.
+
+    Unlike the main cycle this does NOT apply ``filter_rows_to_target_window``:
+    that window clips to the five sessions before the frame's newest bar, which
+    would drop exactly the older sessions recovery was asked for. The requested
+    ``dates`` already form a market-session window that includes its own priors,
+    so the final membership filter is the correct boundary here.
     """
     wanted = {pd.to_datetime(d).date() for d in dates}
-    batch_df, target_start_date = download_recent_batch([symbol])
+    if not wanted:
+        return []
+    # Fetch far enough back to cover the whole requested window. The write gate
+    # needs a session's prior in the SAME provider frame, so the frame must
+    # reach the oldest requested session -- not merely the rolling recent one.
+    batch_df, _target_start_date = download_recent_batch(
+        [symbol], start_date=min(wanted))
     symbol_df = extract_symbol_df_from_batch(batch_df, symbol)
     symbol_df = remove_unfinished_bars(symbol_df, symbol)
     if symbol_df.empty:
@@ -4983,8 +5188,6 @@ def _yfinance_historical_rows(symbol, meta, dates, *, source_definition=None):
     rows = calculate_rows_for_symbol(
         df=symbol_df, symbol=symbol, name=meta["name"],
         asset_type=meta["asset_type"], source_definition=source_definition)
-    rows = filter_rows_to_target_window(rows=rows,
-                                        target_start_date=target_start_date)
     return [r for r in (rows or [])
             if pd.to_datetime(r["date"]).date() in wanted]
 
