@@ -16,7 +16,12 @@ from db_builder.equity_security_status import filter_core_coverage
 from db_builder.trading_calendar import reject_non_trading_dates
 
 
-YF_BATCH_SIZE = 100
+# yfinance's download() is serial (threads=False) and is called once per batch,
+# so a whole-universe fallback costs one round trip per batch. The equity
+# universe holds ~11,000 tickers: at 100/batch that is 114 serial round trips,
+# which blew past the 1200s fetch-step timeout. 500/batch is 23 round trips and
+# still keeps each response well inside yfinance's comfort range.
+YF_BATCH_SIZE = 500
 FETCH_BUFFER_DAYS = 5
 
 

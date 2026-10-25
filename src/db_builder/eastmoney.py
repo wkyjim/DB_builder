@@ -35,6 +35,10 @@ FIELDS_MAP = {
 }
 PAGE_SIZE = 100
 MIN_FETCH_COVERAGE_RATIO = 0.98
+# The prior-session YTD lookup is issued once per call, so a whole-universe
+# frame would scan every hypertable chunk for every ticker. Keep each query
+# bounded; 500 is well inside the planner's comfortable range.
+PRIOR_LOOKUP_BATCH_SIZE = 500
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
@@ -102,11 +106,24 @@ def replace_ytd_pct_chg_with_local_calculation(
         ORDER BY ticker, date DESC
         """
     )
-    prior_rows = pd.read_sql_query(
-        query,
-        engine,
-        params={"tickers": tickers, "target_date": date_value},
-    )
+    # The universe can hold ~11,000 tickers. One ANY(:tickers) query over the
+    # TimescaleDB hypertable fans out to every chunk (894 at the time of
+    # writing) and took 26+ minutes; the Eastmoney path never noticed because
+    # it calls this per 100-row page. Batch the lookup so each query is
+    # bounded regardless of how the caller assembled the frame.
+    prior_frames = []
+    for start in range(0, len(tickers), PRIOR_LOOKUP_BATCH_SIZE):
+        prior_frames.append(
+            pd.read_sql_query(
+                query,
+                engine,
+                params={
+                    "tickers": tickers[start:start + PRIOR_LOOKUP_BATCH_SIZE],
+                    "target_date": date_value,
+                },
+            )
+        )
+    prior_rows = pd.concat(prior_frames, ignore_index=True) if prior_frames else pd.DataFrame()
 
     result = frame.copy()
     result["ytd_pct_chg"] = _calculate_ytd_pct_chg_from_prior(result, prior_rows)

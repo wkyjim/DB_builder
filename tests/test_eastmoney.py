@@ -250,3 +250,77 @@ def test_calculate_ytd_pct_chg_first_available_defaults_to_daily_return():
     ytd = eastmoney._calculate_ytd_pct_chg_from_prior(frame, prior)
 
     assert ytd.iloc[0] == 5.0
+
+
+def test_prior_session_lookup_is_batched(monkeypatch):
+    """A whole-universe frame must not issue one unbounded ticker list.
+
+    The equity universe holds ~11,000 tickers. Issuing a single
+    ``ticker = ANY(:tickers)`` against the TimescaleDB hypertable fans out to
+    every chunk (894 at the time of writing) and measured 38+ minutes in
+    production; the Eastmoney path never noticed because it calls the lookup
+    once per 100-row page.
+    """
+    import pandas as pd
+
+    tickers = [f"T{i:05d}" for i in range(1300)]
+    frame = pd.DataFrame(
+        [{"ticker": t, "close": 10.0, "pct_chg": 0.5, "prev_close": 9.5} for t in tickers]
+    )
+
+    seen_batches: list[list[str]] = []
+
+    def _fake_read_sql_query(query, engine, params=None, **kwargs):
+        seen_batches.append(list(params["tickers"]))
+        return pd.DataFrame(
+            [
+                {
+                    "ticker": t,
+                    "prior_ytd_pct_chg": 10.0,
+                    "prior_close": 9.5,
+                }
+                for t in params["tickers"]
+            ]
+        )
+
+    monkeypatch.setattr(eastmoney.pd, "read_sql_query", _fake_read_sql_query)
+
+    eastmoney.replace_ytd_pct_chg_with_local_calculation(
+        None, frame, eastmoney.RAW_TABLE, target_date="2026-10-23"
+    )
+
+    assert len(seen_batches) == 3, "1300 tickers must be split into bounded queries"
+    assert all(
+        len(batch) <= eastmoney.PRIOR_LOOKUP_BATCH_SIZE for batch in seen_batches
+    )
+    assert [t for batch in seen_batches for t in batch] == tickers
+
+
+def test_prior_session_lookup_single_batch_for_small_frame(monkeypatch):
+    """A small frame keeps the original single-query behaviour."""
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        [
+            {"ticker": "AAPL", "close": 10.0, "pct_chg": 0.5, "prev_close": 9.5},
+            {"ticker": "MSFT", "close": 20.0, "pct_chg": 0.5, "prev_close": 19.0},
+        ]
+    )
+
+    calls: list[dict] = []
+
+    def _fake_read_sql_query(query, engine, params=None, **kwargs):
+        calls.append(dict(params))
+        return pd.DataFrame(
+            [{"ticker": t, "prior_ytd_pct_chg": 10.0, "prior_close": 9.5}
+             for t in params["tickers"]]
+        )
+
+    monkeypatch.setattr(eastmoney.pd, "read_sql_query", _fake_read_sql_query)
+
+    eastmoney.replace_ytd_pct_chg_with_local_calculation(
+        None, frame, eastmoney.RAW_TABLE, target_date="2026-10-23"
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["tickers"] == ["AAPL", "MSFT"]

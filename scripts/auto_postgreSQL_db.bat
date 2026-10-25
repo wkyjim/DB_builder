@@ -26,7 +26,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "else {" ^
       "Write-Log 'START' 'auto_postgreSQL_db workflow';" ^
       "if (-not (Invoke-RetryPython 'scripts\\health_check.py' 'health_check.py')) { Write-Log 'ERROR' 'health_check.py failed after 3 retries'; $ExitCode = 1 }" ^
-      "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_equities_auto.py' 'pgSQL_equities_auto.py' @('--fetch-only') 1200)) { Write-Log 'ERROR' 'pgSQL_equities_auto.py failed after 3 retries'; $ExitCode = 1 }" ^
+      "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_equities_auto.py' 'pgSQL_equities_auto.py' @('--fetch-only') 3600)) { Write-Log 'ERROR' 'pgSQL_equities_auto.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\repair_historical_equity_gaps.py' 'repair_historical_equity_gaps.py' @('--lookback-days', '60', '--minimum-coverage', '0.97', '--apply-local') 3600)) { Write-Log 'ERROR' 'repair_historical_equity_gaps.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_daily_bulk_sync_to_neon.py' 'pgSQL_daily_bulk_sync_to_neon.py' @('--tables', 'equities', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'pgSQL_daily_bulk_sync_to_neon.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\indicator_staged_backfill.py' 'indicator_staged_backfill.py' @('--stage', 'all', '--cleanup-on-success'))) { Write-Log 'ERROR' 'indicator_staged_backfill.py failed after 3 retries'; $ExitCode = 1 }" ^
