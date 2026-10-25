@@ -142,22 +142,25 @@ class TestSync:
         neon = _FakeEngine(0)
         result = min_.sync_macro_indicators_to_neon(_FakeEngine(0), neon, since="2026-05-01")
         assert result["uploaded"] == 0
+        assert result["pruned_rows"] == 0
         assert neon.calls == []
 
     def test_sync_reports_the_window_it_sent(self, monkeypatch):
         monkeypatch.setattr(min_, "fetch_macro_indicators", lambda *a, **k: _frame(3))
         monkeypatch.setattr(min_, "setup_macro_indicators_schema", lambda *a, **k: None)
         monkeypatch.setattr(min_, "bulk_upsert_macro_indicators", lambda *a, **k: 3)
+        monkeypatch.setattr(min_, "prune_macro_indicators_before", lambda *a, **k: 42)
         neon = _FakeEngine(99)
         result = min_.sync_macro_indicators_to_neon(_FakeEngine(0), neon, since="2026-05-01")
         assert result == {"local_rows": 3, "uploaded": 3, "remote_rows": 99,
-                          "failed": 0, "since": "2026-05-01"}
+                          "failed": 0, "pruned_rows": 42, "since": "2026-05-01"}
 
     def test_sync_rejects_a_short_remote(self, monkeypatch):
         """If Neon holds fewer rows than local sent, the sync must not report success."""
         monkeypatch.setattr(min_, "fetch_macro_indicators", lambda *a, **k: _frame(500))
         monkeypatch.setattr(min_, "setup_macro_indicators_schema", lambda *a, **k: None)
         monkeypatch.setattr(min_, "bulk_upsert_macro_indicators", lambda *a, **k: 500)
+        monkeypatch.setattr(min_, "prune_macro_indicators_before", lambda *a, **k: 0)
         with pytest.raises(RuntimeError, match="macro_indicators Neon sync failed"):
             min_.sync_macro_indicators_to_neon(
                 _FakeEngine(0), _FakeEngine(1), since="2026-05-01", retries=2)
@@ -165,6 +168,7 @@ class TestSync:
     def test_sync_retries_a_transient_neon_failure(self, monkeypatch):
         monkeypatch.setattr(min_, "fetch_macro_indicators", lambda *a, **k: _frame(2))
         monkeypatch.setattr(min_, "setup_macro_indicators_schema", lambda *a, **k: None)
+        monkeypatch.setattr(min_, "prune_macro_indicators_before", lambda *a, **k: 0)
 
         attempts = {"n": 0}
 
@@ -179,6 +183,20 @@ class TestSync:
             _FakeEngine(0), _FakeEngine(7), retries=3)
         assert attempts["n"] == 2
         assert result["failed"] == 0
+
+    def test_default_window_is_the_served_mirror_boundary(self):
+        """Without an explicit window the sync must not mirror full history."""
+        import inspect
+
+        from db_builder.config import NEON_MIRROR_SINCE
+        default = inspect.signature(min_.sync_macro_indicators_to_neon).parameters["since"].default
+        assert default == NEON_MIRROR_SINCE
+
+    def test_prune_deletes_only_rows_outside_the_window(self):
+        import inspect
+        source = inspect.getsource(min_.prune_macro_indicators_before)
+        assert "DELETE FROM" in source
+        assert "date < date :since" in source
 
 
 class TestHourlyWiring:

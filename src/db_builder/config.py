@@ -29,6 +29,10 @@ RAW_TABLE = "public.us_equities"
 INDICATOR_TABLE = "public.us_equities_indicators"
 MACRO_TABLE = "public.macro"
 
+# Neon is a *bounded* mirror, not a second copy of local: only rows on/after this
+# date are served downstream. Every Neon sync path prunes anything older.
+NEON_MIRROR_SINCE = "2026-05-01"
+
 
 def _required_env(name: str, aliases: tuple[str, ...] = ()) -> str:
     value = os.getenv(name)

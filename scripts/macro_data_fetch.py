@@ -25,7 +25,7 @@ import _bootstrap  # noqa: F401
 # historical-data HTML pages with a browser TLS fingerprint.
 import investing_html_scraper as _investing_html
 
-from db_builder.config import MACRO_TABLE, local_engine as make_local_engine
+from db_builder.config import MACRO_TABLE, NEON_MIRROR_SINCE, local_engine as make_local_engine
 from db_builder.config import neon_engine as make_neon_engine
 from db_builder.trading_calendar import latest_completed_nyse_session_date
 from db_builder.session_calendar import (
@@ -2841,7 +2841,8 @@ def run_eod_5session_refresh(
 
 
 def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
-                              window=RECENT_REFRESH_SESSIONS, dry_run=False):
+                              window=RECENT_REFRESH_SESSIONS, dry_run=False,
+                              prune_before=None):
     """Converge Neon's ``public.macro`` to the canonical LOCAL rows.
 
     Ordering contract (production)::
@@ -2895,6 +2896,7 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
         "local_latest_date": None,
         "neon_latest_date": None,
         "window": window,
+        "pruned_rows": 0,
     }
 
     # ---- destination safety: approved universe, R22 excluded ----
@@ -3080,6 +3082,33 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                   "no local rollback performed")
     elif to_submit and dry_run:
         print(f"[DRY RUN SKIP NEON MACRO SYNC] would_submit={len(to_submit)}")
+
+    # ---- bound the mirror: drop anything outside the served window ----
+    # The upsert above only ever writes the recent window, so without a prune
+    # Neon accumulates history indefinitely and grows into a second full copy of
+    # local public.macro. prune_before bounds the mirror to what the API serves.
+    if prune_before and not dry_run:
+        try:
+            _prune_neon = _neon if neon_engine_ is not None else make_neon_engine()
+            with _prune_neon.begin() as conn:
+                res = conn.execute(
+                    text(
+                        "DELETE FROM public.macro "
+                        "WHERE date < date :prune_before AND symbol = ANY(:symbols)"
+                    ),
+                    {"prune_before": prune_before, "symbols": approved},
+                )
+                counters["pruned_rows"] = (
+                    res.rowcount if res.rowcount is not None and res.rowcount >= 0 else 0
+                )
+            _prune_neon.dispose()
+            print(f"[NEON MACRO PRUNE] before={prune_before} "
+                  f"pruned_rows={counters['pruned_rows']}")
+        except Exception as exc:
+            counters["failed_rows"] += 1
+            print(f"[NEON MACRO PRUNE FAILED] {type(exc).__name__}: {exc}")
+            print("[NEON MACRO PRUNE] local DB remains authoritative; "
+                  "the mirror may be wider than the served window")
 
     # refresh neon_latest_date view after commit
     if counters["committed_rows"]:
@@ -6178,7 +6207,7 @@ def run_daily_update(
     # keeps universe/window/R22 destination safety.
     if not dry_run:
         try:
-            sync_recent_macro_to_neon(symbols=eod_symbols)
+            sync_recent_macro_to_neon(symbols=eod_symbols, prune_before=NEON_MIRROR_SINCE)
         except Exception as sync_error:
             # Local DB remains authoritative; never roll back valid local data.
             print(f"[NEON MACRO SYNC ERROR] {type(sync_error).__name__}: {sync_error}")

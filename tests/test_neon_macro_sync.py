@@ -30,6 +30,7 @@ _mock_config = types.ModuleType("db_builder.config")
 _mock_config.MACRO_TABLE = "public.macro"
 _mock_config.RAW_TABLE = "public.us_equities"
 _mock_config.INDICATOR_TABLE = "public.us_equities_indicators"
+_mock_config.NEON_MIRROR_SINCE = "2026-05-01"
 _mock_config.local_engine = lambda **kw: types.SimpleNamespace()
 _mock_config.neon_engine = lambda **kw: types.SimpleNamespace()  # will be overridden
 _mock_config.make_neon_engine = lambda **kw: types.SimpleNamespace()
@@ -46,7 +47,7 @@ from datetime import date
 
 FIELDS = ["date", "symbol", "name", "asset_type", "open", "high", "low",
           "close", "adj_close", "volume", "prev_close", "change",
-          "pct_chg", "amplitude"]
+          "pct_chg", "amplitude", "source", "source_definition"]
 
 
 class _Mappings:
@@ -109,6 +110,14 @@ class _Conn:
                 self.store[key] = {k: r.get(k) for k in FIELDS}
                 n += 1
             return _Res([], rowcount=n)
+        if low.startswith("delete"):
+            before = str(params.get("prune_before"))
+            syms = params.get("symbols") or []
+            doomed = [k for k, r in self.store.items()
+                      if str(r["date"]) < before and (not syms or r["symbol"] in syms)]
+            for k in doomed:
+                del self.store[k]
+            return _Res([], rowcount=len(doomed))
         raise AssertionError(f"unexpected SQL: {sql[:120]}")
 
 
@@ -172,7 +181,9 @@ def _row(sym, d, close=100.0, volume=1000.0, **kw):
     r = {"date": d, "symbol": sym, "name": sym, "asset_type": "stock_index",
          "open": 99.0, "high": 101.0, "low": 98.0, "close": close,
          "adj_close": close, "volume": volume, "prev_close": 98.5,
-         "change": round(close - 98.5, 4), "pct_chg": 1.5, "amplitude": 2.5}
+         "change": round(close - 98.5, 4), "pct_chg": 1.5, "amplitude": 2.5,
+         "source": "yfinance",
+         "source_definition": "YFINANCE_CASH_EQUITY_DAILY"}
     r.update(kw)
     return r
 
@@ -615,3 +626,56 @@ def test_item20_15_api_reflects_neon_latest():
     assert res["local_latest_date"] == "2026-10-12"
     # After convergence, Neon has the latest row
     assert (APPROVED, "2026-10-12") in neon.store
+
+
+# ---- NM-22: Neon is a bounded mirror, never a second full copy ---------
+def test_nm22_prune_drops_rows_outside_the_served_window():
+    """Rows older than the window must be deleted from Neon, not just not-written."""
+    local = FakeEngine([_row(APPROVED, date(2026, 10, 12))], "local")
+    # Neon accumulated history: one row inside the window, one far outside it
+    neon = FakeEngine([_row(APPROVED, date(2026, 10, 12)),
+                       _row(APPROVED, date(2025, 3, 4))], "neon")
+
+    res = mdf.sync_recent_macro_to_neon(
+        symbols=[APPROVED], local_engine_=local, neon_engine_=neon,
+        dry_run=False, prune_before="2026-05-01")
+
+    assert res["pruned_rows"] == 1, "stale row survived the prune"
+    assert (APPROVED, "2025-03-04") not in neon.store
+    assert (APPROVED, "2026-10-12") in neon.store
+    assert res["failed_rows"] == 0
+
+
+def test_nm22_prune_is_skipped_when_no_window_is_given(monkeypatch):
+    """Without prune_before the historic behaviour is unchanged (append-only)."""
+    local = FakeEngine([_row(APPROVED, date(2026, 10, 12))], "local")
+    neon = FakeEngine([_row(APPROVED, date(2025, 3, 4))], "neon")
+
+    res = mdf.sync_recent_macro_to_neon(
+        symbols=[APPROVED], local_engine_=local, neon_engine_=neon, dry_run=False)
+
+    assert res["pruned_rows"] == 0
+    assert (APPROVED, "2025-03-04") in neon.store
+
+
+def test_nm22_prune_only_touches_the_symbols_in_scope():
+    """A symbol outside the sync scope must be left alone."""
+    local = FakeEngine([_row(APPROVED, date(2026, 10, 12))], "local")
+    other = "^OTHER"
+    neon = FakeEngine([_row(other, date(2025, 3, 4))], "neon")
+
+    mdf.sync_recent_macro_to_neon(
+        symbols=[APPROVED], local_engine_=local, neon_engine_=neon,
+        dry_run=False, prune_before="2026-05-01")
+
+    assert (other, "2025-03-04") in neon.store
+
+
+def test_nm22_production_call_site_passes_the_served_window():
+    """The hourly path must bound the mirror, not just write the recent window."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "macro_data_fetch.py").read_text(
+        encoding="utf-8")
+    assert "NEON_MIRROR_SINCE" in source
+    assert "prune_before=NEON_MIRROR_SINCE" in source
