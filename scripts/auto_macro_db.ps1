@@ -80,6 +80,7 @@ try {
         elseif (-not (Invoke-RetryPython 'scripts\security_classification_fetch.py' 'security_classification_fetch.py' '--upsert-local' 900)) { Write-Log 'ERROR' 'security_classification_fetch.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' '' 1800)) { Write-Log 'ERROR' 'macro_data_fetch.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\recalc_all.py' 'recalc_all.py' '' 900)) { Write-Log 'ERROR' 'recalc_all.py failed after 3 retries'; $ExitCode = 1 }
+        elseif (-not (Invoke-RetryPython 'scripts\sync_macro_indicators_neon.py' 'sync_macro_indicators_neon.py' '' 1800)) { Write-Log 'ERROR' 'sync_macro_indicators_neon.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\finra_short_incremental.py' 'finra_short_incremental.py' '' 1800)) { Write-Log 'ERROR' 'finra_short_incremental.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\short_analytics_latest_sync.py' 'short_analytics_latest_sync.py' '' 1800)) { Write-Log 'ERROR' 'short_analytics_latest_sync.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\economic_data_fetch.py' 'economic_data_fetch.py' '--upsert-local')) { Write-Log 'ERROR' 'economic_data_fetch.py failed after 3 retries'; $ExitCode = 1 }
