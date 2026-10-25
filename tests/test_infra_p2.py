@@ -258,3 +258,38 @@ class TestBatVersionStamp:
             text = self._read(rel)
             for state in ["MISSING", "NOBLOB", "UNKNOWN", "SYNC", "LAG"]:
                 assert f"'{state}'" in text, f"{rel}: state {state} not handled"
+
+
+class TestMacroIndicatorStep:
+    """The hourly macro workflow must recompute macro_indicators.
+
+    public.macro_indicators is the only source for the macro technicals, and it
+    is derived: without a recompute step it silently lags public.macro (it sat
+    at 2026-10-14 while macro was at 2026-10-23, with some stored values not
+    even reproducible from the current price history).
+    """
+
+    PS1 = "scripts/auto_macro_db.ps1"
+
+    def _read(self):
+        return (PROJECT_ROOT / self.PS1).read_text(encoding="utf-8", errors="replace")
+
+    def test_macro_workflow_recomputes_indicators(self):
+        text = self._read()
+        assert "Invoke-RetryPython 'scripts\\recalc_all.py'" in text
+
+    def test_indicator_step_runs_after_the_macro_fetch(self):
+        """It must see the data the fetch just wrote, and nothing downstream
+        may depend on indicators that predate that fetch."""
+        text = self._read()
+        fetch = text.find("Invoke-RetryPython 'scripts\\macro_data_fetch.py'")
+        recalc = text.find("Invoke-RetryPython 'scripts\\recalc_all.py'")
+        assert 0 < fetch < recalc, "indicator recompute must follow the macro fetch"
+
+    def test_indicator_step_is_in_the_retry_chain(self):
+        """Not a detached/optional call: it must be a chained step so a failure
+        surfaces in the workflow exit code instead of passing silently."""
+        text = self._read()
+        line = next(l for l in text.splitlines() if "recalc_all.py" in l)
+        assert line.lstrip().startswith("elseif (-not (Invoke-RetryPython"), line
+        assert "$ExitCode = 1" in line
