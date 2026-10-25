@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -324,3 +326,43 @@ def test_prior_session_lookup_single_batch_for_small_frame(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0]["tickers"] == ["AAPL", "MSFT"]
+
+
+def test_initial_probe_retries_through_transient_5xx(monkeypatch):
+    """One transient 5xx must not hand the whole session to the fallback.
+
+    The probe alone decides provider-vs-fallback for the whole run, so it needs
+    the same retry budget the per-page loop has. Eastmoney's clist endpoint
+    flaps, and a single 502 here was enough to push the entire session onto
+    yfinance.
+    """
+    import db_builder.eastmoney as em
+    import pandas as pd
+
+    calls = {"n": 0}
+
+    def _always_502(url, headers=None, timeout=None, **kw):
+        calls["n"] += 1
+        err = requests.HTTPError("502 Server Error")
+        err.response = type("R", (), {"status_code": 502})()
+        raise err
+
+    monkeypatch.setattr(em.requests, "get", _always_502)
+    monkeypatch.setattr(em.time, "sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(em, "_load_target_table", lambda engine, tn: object())
+    monkeypatch.setattr(
+        em, "latest_completed_nyse_session_date", lambda: date(2026, 10, 23)
+    )
+    monkeypatch.setattr(em, "fetch_prior_session_universe", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(
+        em,
+        "fetch_missing_session_rows",
+        lambda *a, **k: type("R", (), {"frame": pd.DataFrame(), "found": set()})(),
+    )
+
+    with pytest.raises(RuntimeError):
+        em.fetch_and_save_all(engine=object(), table_name=em.RAW_TABLE)
+
+    assert calls["n"] == em.INITIAL_PROBE_RETRIES, (
+        f"probe must retry {em.INITIAL_PROBE_RETRIES} times, got {calls['n']}"
+    )

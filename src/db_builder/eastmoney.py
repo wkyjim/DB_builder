@@ -16,6 +16,11 @@ from db_builder.config import RAW_TABLE
 # Provider-level circuit breaker
 MAX_NO_DATA_PAGES = 5  # If 5+ consecutive pages return no data, abort the fetch
 MAX_PAGE_RETRIES = 3   # Reduced from 5 to 3 per page
+# The initial probe decides provider-vs-fallback for the whole run, so it needs
+# its own retry budget. 5 attempts with linear backoff (3+6+9+12 = 30s) spans
+# the short 5xx windows the clist endpoint flaps through.
+INITIAL_PROBE_RETRIES = 5
+INITIAL_PROBE_BASE_DELAY = 3.0
 
 from db_builder.trading_calendar import (
     latest_completed_nyse_session_date,
@@ -202,9 +207,25 @@ def fetch_and_save_all(
     provider_connection_errors = 0
 
     try:
-        init_resp = requests.get(get_api_url(pn=1, pz=1), headers=headers, timeout=15)
-        init_resp.raise_for_status()
-        total_count = init_resp.json()["data"]["total"]
+        # The initial probe is the single point of failure for the whole run:
+        # one transient 5xx here opens the breaker and hands the entire session
+        # to the yfinance fallback. Eastmoney's clist endpoint flaps, so retry
+        # it the same way the per-page loop does.
+        last_exc: Exception | None = None
+        total_count: int | None = None
+        for _attempt in range(1, INITIAL_PROBE_RETRIES + 1):
+            try:
+                init_resp = requests.get(get_api_url(pn=1, pz=1), headers=headers, timeout=15)
+                init_resp.raise_for_status()
+                total_count = init_resp.json()["data"]["total"]
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _attempt < INITIAL_PROBE_RETRIES:
+                    time.sleep(INITIAL_PROBE_BASE_DELAY * _attempt)
+        if last_exc is not None:
+            raise last_exc
         pz = min(max(limit or PAGE_SIZE, 1), PAGE_SIZE) if dry_run else PAGE_SIZE
         total_pages = ceil(total_count / pz)
         print(f"Total equities: {total_count} | pages: {total_pages} | date: {target_date}")
