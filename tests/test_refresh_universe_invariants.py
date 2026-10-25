@@ -387,3 +387,27 @@ def test_special_futures_have_source_definitions():
         else:
             expected_def = const_name[len('SOURCE_DEF_'):]
         assert actual == expected_def, f"{sym}: expected {expected_def}, got {actual}"
+
+
+def test_ks200_is_retired_and_ks11_kor200c1_are_the_kospi_series():
+    """The KOSPI series is ^KS11 (yfinance cash index) + KOR200c1 (Investing.com
+    KOSPI 200 futures). ^KS200 was retired and must not re-enter the universe --
+    it is not an approved symbol, has no source definition, and is not a
+    calendar/provider mapping anywhere.
+    """
+    approved = _extract_approved_symbols()
+    assert "^KS200" not in approved
+    assert "^KS11" in approved
+    assert "KOR200c1" in approved
+
+    source_defs = _extract_source_definitions()
+    assert "^KS200" not in source_defs
+    assert source_defs.get("^KS11") == "YFINANCE_CASH_EQUITY_DAILY"
+    assert source_defs.get("KOR200c1") == "INVESTING_KOSPI200_FUTURES_DAILY"
+
+    # The universe export must not advertise the retired ticker, and the
+    # integrity audit must check the symbol that replaced it.
+    export_text = _read_file(os.path.join(PROJECT_ROOT, "scripts/export_universe.py"))
+    assert "'^KS200'" not in export_text
+    audit_text = _read_file(os.path.join(PROJECT_ROOT, "scripts/audit_data_integrity.py"))
+    assert "KOR200c1 Specific Check" in audit_text

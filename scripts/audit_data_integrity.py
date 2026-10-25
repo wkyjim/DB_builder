@@ -244,17 +244,21 @@ def audit_macro(engine, today: date, latest_nyse: date) -> str:
         else:
             out += f"\n**{symbol}**: ❌ NOT FOUND\n"
 
-    # ^KS200 specific
-    out += section("^KS200 Specific Check", 3)
-    ks200 = q(engine, "SELECT MAX(date), COUNT(*) FROM public.macro WHERE symbol = '^KS200'")
-    if ks200 and ks200[0][0]:
-        out += f"- Latest: {ks200[0][0]}, Rows: {ks200[0][1]}\n"
-        if ks200[0][0] < latest_nyse:
+    # KOR200c1 (Investing.com KOSPI 200 futures). ^KS200 was retired: the cash
+    # index comes from ^KS11 (yfinance), the futures from KOR200c1 (Investing.com).
+    out += section("KOR200c1 Specific Check", 3)
+    kor = q(engine, "SELECT MAX(date), COUNT(*) FROM public.macro WHERE symbol = 'KOR200c1'")
+    if kor and kor[0][0]:
+        out += f"- Latest: {kor[0][0]}, Rows: {kor[0][1]}\n"
+        if kor[0][0] < latest_nyse:
             out += f"- Status: {status_badge('WARN')} (stale — supplementary)\n"
         else:
             out += f"- Status: {status_badge('PASS')}\n"
     else:
         out += f"- Status: {status_badge('FAIL')} (not in DB)\n"
+    ks200_rows = q1(engine, "SELECT COUNT(*) FROM public.macro WHERE symbol = '^KS200'")
+    out += (f"- ^KS200 retired: "
+            f"**{'yes' if ks200_rows == 0 else 'NO - ' + str(ks200_rows) + ' rows still present'}**\n")
 
     # Macro Live
     out += section("Macro Live (public.macro_live)", 3)

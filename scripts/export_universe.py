@@ -58,7 +58,6 @@ ASSET_TYPE_MAP = {
     'US7YT_CMT': 'Rates/Yields', 'US10YT_CMT': 'Rates/Yields', 'US20YT_CMT': 'Rates/Yields',
     'US30YT_CMT': 'Rates/Yields',
     'HK50': 'Futures', 'KOR200c1': 'Futures', 'CIHc1': 'Futures',
-    '^KS200': 'Equity/Index',
 }
 
 # Provider ticker mapping
@@ -96,7 +95,6 @@ PROVIDER_TICKER = {
     'US30YT_CMT': ('Treasury.gov', 'US30YT_CMT'),
     'HK50': ('Investing', 'HK50'), 'KOR200c1': ('Investing', 'KOR200c1'),
     'CIHc1': ('Investing', 'CIHc1'),
-    '^KS200': ('Investing', '^KS200'),
 }
 
 # Source definition short names
