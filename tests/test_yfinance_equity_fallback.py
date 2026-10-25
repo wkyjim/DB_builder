@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
+import db_builder.yfinance_equity_fallback as yf_module
 from db_builder.yfinance_equity_fallback import (
     fetch_missing_range_rows,
     _target_row,
@@ -76,3 +78,43 @@ def test_range_fallback_requests_each_batch_once(monkeypatch):
     assert len(calls) == 1
     assert len(result.frame) == 2
     assert result.missing_keys == ()
+
+
+def test_prior_session_universe_keeps_etfs_and_warrants():
+    """The fallback universe must mirror the primary path's coverage.
+
+    fetch_prior_session_universe used to run filter_core_coverage(), which drops
+    ETFs, warrants, rights, preferreds and funds. When Eastmoney is down the
+    fallback is the only writer, so every one of those silently stopped
+    updating: the 2026-10-23 session landed with 19 of 1,355 ETFs, and 2,652
+    of the 2,707 missing tickers were coverage_eligible = true.
+    """
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        [
+            {"ticker": "AAPL", "name": "Apple Inc", "close": 200.0},
+            {"ticker": "SPY", "name": "SPDR S&P 500 ETF", "close": 500.0},
+            {"ticker": "AAAU", "name": "Goldman Sachs Physical Gold ETF", "close": 20.0},
+            {"ticker": "NSTR_WS", "name": "Newstar Rights", "close": 1.5},
+            {"ticker": "ABR_D", "name": "Arbor Realty Trust 6.375% Redeemable", "close": 25.0},
+        ]
+    )
+
+    captured: dict = {}
+
+    def _fake_read_sql(query, engine, params=None, **kwargs):
+        captured["query"] = str(query)
+        captured["params"] = params
+        return frame.copy()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(yf_module.pd, "read_sql", _fake_read_sql)
+
+    out = yf_module.fetch_prior_session_universe(
+        None, "2026-10-23", yf_module.RAW_TABLE
+    )
+    monkeypatch.undo()
+
+    assert len(out) == 5, "every prior-session row must survive"
+    assert set(out["ticker"]) == {"AAPL", "SPY", "AAAU", "NSTR_WS", "ABR_D"}

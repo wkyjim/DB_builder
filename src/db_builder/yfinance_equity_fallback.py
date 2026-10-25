@@ -12,7 +12,6 @@ import yfinance as yf
 from sqlalchemy import text
 
 from db_builder.config import RAW_TABLE
-from db_builder.equity_security_status import filter_core_coverage
 from db_builder.trading_calendar import reject_non_trading_dates
 
 
@@ -65,7 +64,14 @@ def fetch_prior_session_universe(
         engine,
         params={"target_date": pd.Timestamp(target_date).date()},
     )
-    return filter_core_coverage(frame)
+    # The fallback must mirror the primary path's coverage, not shrink it.
+    # filter_core_coverage() drops ETFs, warrants, rights, preferreds and funds,
+    # so when Eastmoney is down the fallback silently stopped updating every
+    # one of them: the 2026-10-23 session landed with 19 of 1,355 ETFs and
+    # 2,652 of the 2,707 missing tickers were coverage_eligible = true.
+    # The prior session's row set already IS the universe the primary path
+    # produced, so returning it as-is keeps both providers equivalent.
+    return frame
 
 
 def yfinance_symbol(ticker: str, name: str | None = None) -> str:
