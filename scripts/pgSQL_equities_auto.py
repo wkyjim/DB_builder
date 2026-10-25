@@ -9,6 +9,7 @@ import _bootstrap  # noqa: F401
 from db_builder.config import INDICATOR_TABLE, RAW_TABLE, local_engine, neon_engine
 from db_builder.eastmoney import fetch_and_save_all, fetch_and_save_tickers
 from db_builder.indicators import daily_update_missing_indicators
+from db_builder.massive_equity import fetch_and_save_session
 from db_builder.neon_sync import daily_bulk_sync_to_neon
 from db_builder.trading_calendar import (
     MIN_SESSION_COVERAGE_RATIO,
@@ -40,6 +41,16 @@ def parse_args() -> argparse.Namespace:
         "--allow-non-trading-day",
         action="store_true",
         help="Debug only: allow non-NYSE trading dates through validation.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=("massive", "eastmoney"),
+        default="massive",
+        help=(
+            "Raw equity provider. 'massive' (default) uses the Polygon grouped-daily "
+            "endpoint: one call per session for the whole US market. 'eastmoney' keeps "
+            "the legacy paginated clist path."
+        ),
     )
     return parser.parse_args()
 
@@ -203,13 +214,22 @@ def main() -> None:
                 print("Ticker-scoped local run complete; skipping indicators and Neon sync.")
                 return
         else:
-            fetch_and_save_all(
-                local,
-                dry_run=args.dry_run,
-                limit=args.limit,
-                expected_session_date=latest_completed,
-                allow_non_trading_day=args.allow_non_trading_day,
-            )
+            if args.source == "massive":
+                print(f"[FETCH] source=massive (grouped daily) session {latest_completed}")
+                fetch_and_save_session(
+                    local,
+                    latest_completed,
+                    dry_run=args.dry_run,
+                    allow_non_trading_day=args.allow_non_trading_day,
+                )
+            else:
+                fetch_and_save_all(
+                    local,
+                    dry_run=args.dry_run,
+                    limit=args.limit,
+                    expected_session_date=latest_completed,
+                    allow_non_trading_day=args.allow_non_trading_day,
+                )
     else:
         print(f"[SKIP] Equity fetch not needed — stored session {latest_stored} >= completed {latest_completed}")
 
