@@ -17,9 +17,34 @@ NON_CORE_TYPES = {
 }
 
 
+PLAIN_EQUITY_TYPES = {"common_stock", "adr"}
+
+# A "Series X" share is a preferred; a "Class X" share is a voting/second class
+# of the same common stock (BRK_B) and stays plain equity.
+_SERIES_RE = re.compile(r"\bSERIES\s+[A-Z]\b", re.IGNORECASE)
+_CLASS_RE = re.compile(r"\bCLASS\s+[A-Z]\b", re.IGNORECASE)
+# Option chains use a bare ticker with the expiry year appended: AAPL26,
+# AAPL2026, and the full OCC form AAPL260119C00150000.
+_OPTION_RE = re.compile(r"^[A-Z]{1,6}\d{2}(\d{4})?[CP]?\d{0,8}$")
+_OPTION_TAIL_RE = re.compile(r"^[A-Z]{1,6}\d{6,}$")
+
+
+def is_option_symbol(ticker: str) -> bool:
+    """True when the ticker is an option contract rather than a security."""
+    symbol = str(ticker or "").upper().strip()
+    if not symbol:
+        return False
+    if _OPTION_TAIL_RE.match(symbol):
+        return True
+    return bool(_OPTION_RE.match(symbol)) and any(ch.isdigit() for ch in symbol)
+
+
 def classify_security_type(ticker: str, name: str | None) -> str:
     symbol = str(ticker or "").upper().strip()
     label = str(name or "").upper().strip()
+    # Option chains carry no security name at all, so test the symbol first.
+    if is_option_symbol(symbol) and not label:
+        return "option"
     if re.search(r"\b(WARRANT|WARRANTS|WT)\b", label):
         return "warrant"
     if re.search(r"\b(RIGHT|RIGHTS|RT)\b", label):
@@ -28,8 +53,6 @@ def classify_security_type(ticker: str, name: str | None) -> str:
         return "unit"
     if "WHEN ISSUED" in label or re.search(r"\bWI\b", label):
         return "when_issued"
-    if re.search(r"\b(PREFERRED|PREFERENCE|PFD)\b", label):
-        return "preferred"
     if re.search(r"\b(NOTES? DUE|BOND|DEBENTURE)\b", label):
         return "debt"
     if re.search(r"\b(ETN|EXCHANGE TRADED NOTE)\b", label):
@@ -48,6 +71,11 @@ def classify_security_type(ticker: str, name: str | None) -> str:
         return "trust"
     if re.search(r"\b(ACQUISITION CORP|ACQUISITION CO|BLANK CHECK)\b", label):
         return "spac"
+    # Preferred before generic "Series": a Series share is a preferred unless
+    # the name calls it a class of common stock.
+    if re.search(r"\b(PREFERRED|PREFERENCE|PFD)\b", label) or _SERIES_RE.search(label):
+        if not _CLASS_RE.search(label):
+            return "preferred"
     if re.search(r"\bADR\b", label):
         return "adr"
     if symbol.endswith("_U"):
@@ -78,6 +106,21 @@ def filter_core_coverage(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[mask].copy()
 
 
+def is_plain_equity(security_type: str, lifecycle_status: str) -> bool:
+    """True only for a live common stock or ADR.
+
+    This is the single flag for "is this a real equity we want". False for
+    warrants, units, preferreds, options, rights, debt, ETFs/ETNs/funds/trusts/
+    SPACs, and for instruments with no usable price history or that have gone
+    quiet -- the classes a non-Eastmoney source such as the Polygon grouped
+    daily bars will not carry.
+    """
+    return (
+        security_type in PLAIN_EQUITY_TYPES
+        and lifecycle_status not in {"no_valid_price", "inactive_candidate"}
+    )
+
+
 def create_equity_security_status_table(engine) -> None:
     with engine.begin() as connection:
         connection.execute(
@@ -89,6 +132,7 @@ def create_equity_security_status_table(engine) -> None:
                     security_type text NOT NULL,
                     lifecycle_status text NOT NULL,
                     coverage_eligible boolean NOT NULL,
+                    is_plain_equity boolean NOT NULL DEFAULT true,
                     first_valid_date date,
                     last_valid_date date,
                     valid_price_rows integer NOT NULL DEFAULT 0,
@@ -96,6 +140,16 @@ def create_equity_security_status_table(engine) -> None:
                     status_reason text NOT NULL,
                     updated_at timestamptz NOT NULL DEFAULT now()
                 )
+                """
+            )
+        )
+        # Deployed tables predate the column; add it in place.
+        connection.execute(
+            text(
+                """
+                ALTER TABLE public.equity_security_status
+                    ADD COLUMN IF NOT EXISTS is_plain_equity boolean
+                        NOT NULL DEFAULT true
                 """
             )
         )
@@ -131,6 +185,7 @@ def build_security_status(frame: pd.DataFrame, latest_session) -> pd.DataFrame:
                 "security_type": security_type,
                 "lifecycle_status": lifecycle,
                 "coverage_eligible": coverage_eligible,
+                "is_plain_equity": is_plain_equity(security_type, lifecycle),
                 "status_reason": reason,
             }
         )
@@ -143,8 +198,14 @@ def refresh_equity_security_status(engine, latest_session) -> pd.DataFrame:
         text(
             f"""
             WITH latest_names AS (
+                -- The newest row per ticker is not necessarily named: the
+                -- Massive grouped-daily source stores no name, so picking
+                -- strictly by date would blank every name and break
+                -- name-driven classification (ETF, warrant, preferred).
+                -- Take the most recent row that actually carries one.
                 SELECT DISTINCT ON (ticker) ticker, name
                 FROM {RAW_TABLE}
+                WHERE name IS NOT NULL AND name <> ''
                 ORDER BY ticker, date DESC
             )
             SELECT
@@ -168,11 +229,13 @@ def refresh_equity_security_status(engine, latest_session) -> pd.DataFrame:
         """
         INSERT INTO public.equity_security_status (
             ticker, name, security_type, lifecycle_status, coverage_eligible,
+            is_plain_equity,
             first_valid_date, last_valid_date, valid_price_rows,
             distinct_close_count, status_reason, updated_at
         )
         VALUES (
             :ticker, :name, :security_type, :lifecycle_status, :coverage_eligible,
+            :is_plain_equity,
             :first_valid_date, :last_valid_date, :valid_price_rows,
             :distinct_close_count, :status_reason, now()
         )
@@ -181,6 +244,7 @@ def refresh_equity_security_status(engine, latest_session) -> pd.DataFrame:
             security_type = EXCLUDED.security_type,
             lifecycle_status = EXCLUDED.lifecycle_status,
             coverage_eligible = EXCLUDED.coverage_eligible,
+            is_plain_equity = EXCLUDED.is_plain_equity,
             first_valid_date = EXCLUDED.first_valid_date,
             last_valid_date = EXCLUDED.last_valid_date,
             valid_price_rows = EXCLUDED.valid_price_rows,
