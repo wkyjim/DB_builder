@@ -16,6 +16,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from db_builder.config import NEON_MIRROR_SINCE
+from db_builder.neon_sync import record_sync_checkpoint
 
 MACRO_INDICATOR_TABLE = "public.macro_indicators"
 MIGRATION = Path(__file__).resolve().parents[2] / "migrations" / "20261025_macro_indicators.sql"
@@ -155,6 +156,8 @@ def sync_macro_indicators_to_neon(
                   f"since={since} attempt={attempt}/{retries}")
             uploaded = bulk_upsert_macro_indicators(neon_engine, local, chunk_size=chunk_size)
             pruned = prune_macro_indicators_before(neon_engine, since)
+            record_sync_checkpoint(neon_engine, MACRO_INDICATOR_TABLE,
+                                   pd.Timestamp(local["date"].max()).date())
             remote = count_macro_indicators(neon_engine, since=since)
             if remote < len(local):
                 raise RuntimeError(

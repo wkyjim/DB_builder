@@ -56,6 +56,7 @@ from db_builder.deferred_history import (
     ProviderBackoffStore,
 )
 from db_builder import retry_policy as _retry_policy
+from db_builder.neon_sync import record_sync_checkpoint
 from db_builder.retry_policy import (
     PROVIDER_INVESTING,
     PROVIDER_YFINANCE,
@@ -2840,6 +2841,49 @@ def run_eod_5session_refresh(
     return counters
 
 
+def _neon_macro_columns(conn) -> list[str]:
+    """Column order of the Neon ``public.macro`` target, from the destination."""
+    rows = conn.execute(text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'macro'
+        ORDER BY ordinal_position
+    """)).all()
+    return [r[0] for r in rows]
+
+
+def _staged_upsert_neon_macro(neon_engine, to_submit: list) -> int:
+    """Upsert macro rows through a temp staging table (single round trip).
+
+    ``executemany`` sends one round trip per row, which over the Neon link
+    measured ~20s per symbol. Staging uploads the whole frame in chunks and
+    merges it with one ``INSERT ... SELECT ... ON CONFLICT`` statement.
+    """
+    with neon_engine.begin() as conn:
+        columns = _neon_macro_columns(conn)
+        frame = pd.DataFrame([dict(row) for row in to_submit]).reindex(columns=columns)
+        frame = frame.replace([float("inf"), float("-inf")], None)
+        frame = frame.astype(object).where(pd.notna(frame), None)
+
+        conn.execute(text(
+            "CREATE TEMP TABLE temp_macro "
+            "(LIKE public.macro INCLUDING DEFAULTS) ON COMMIT DROP"
+        ))
+        frame.to_sql(
+            "temp_macro", conn, if_exists="append", index=False,
+            chunksize=500, method="multi",
+        )
+        conn.execute(text(
+            f"""
+                INSERT INTO public.macro ({', '.join(columns)})
+                SELECT {', '.join(columns)} FROM temp_macro
+                ON CONFLICT (date, symbol) DO UPDATE SET
+                  {', '.join(f'{c} = EXCLUDED.{c}' for c in columns if c not in ('date', 'symbol'))}
+            """
+        ))
+    return len(frame)
+
+
 def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
                               window=RECENT_REFRESH_SESSIONS, dry_run=False,
                               prune_before=None):
@@ -3037,42 +3081,11 @@ def sync_recent_macro_to_neon(*, symbols, local_engine_=None, neon_engine_=None,
     if to_submit and not dry_run:
         try:
             _write_neon = _neon if neon_engine_ is not None else make_neon_engine()
-            with _write_neon.begin() as conn:
-                conn.execute(
-                    text("""
-                        INSERT INTO public.macro (
-                            date, symbol, name, asset_type,
-                            open, high, low, close, adj_close, volume,
-                            prev_close, change, pct_chg, amplitude,
-                            source, source_definition
-                        )
-                        VALUES (
-                            :date, :symbol, :name, :asset_type,
-                            :open, :high, :low, :close, :adj_close, :volume,
-                            :prev_close, :change, :pct_chg, :amplitude,
-                            :source, :source_definition
-                        )
-                        ON CONFLICT (date, symbol)
-                        DO UPDATE SET
-                            name = EXCLUDED.name,
-                            asset_type = EXCLUDED.asset_type,
-                            open = EXCLUDED.open,
-                            high = EXCLUDED.high,
-                            low = EXCLUDED.low,
-                            close = EXCLUDED.close,
-                            adj_close = EXCLUDED.adj_close,
-                            volume = EXCLUDED.volume,
-                            prev_close = EXCLUDED.prev_close,
-                            change = EXCLUDED.change,
-                            pct_chg = EXCLUDED.pct_chg,
-                            amplitude = EXCLUDED.amplitude,
-                            source = EXCLUDED.source,
-                            source_definition = EXCLUDED.source_definition
-                    """),
-                    to_submit,
-                )
+            staged = _staged_upsert_neon_macro(_write_neon, to_submit)
             _write_neon.dispose()
-            counters["committed_rows"] = len(to_submit)
+            counters["committed_rows"] = staged
+            record_sync_checkpoint(_write_neon, "public.macro",
+                                   counters["local_latest_date"])
         except Exception as exc:
             counters["failed_rows"] = len(to_submit)
             counters["committed_rows"] = 0

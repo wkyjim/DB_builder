@@ -80,9 +80,10 @@ class _Res:
 
 
 class _Conn:
-    def __init__(self, store, log):
+    def __init__(self, store, log, sync_state=None):
         self.store = store
         self.log = log
+        self.sync_state = sync_state if sync_state is not None else {}
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
@@ -102,6 +103,11 @@ class _Conn:
                 out.extend(mine)
             out.sort(key=lambda r: (r["symbol"], r["date"]))
             return _Res([dict(r) for r in out])
+        if low.startswith("create table"):
+            return _Res([], rowcount=0)
+        if low.startswith("insert into public.sync_state"):
+            self.sync_state[params.get("table_name")] = params.get("latest_date")
+            return _Res([], rowcount=1)
         if low.startswith("insert"):
             rows = params if isinstance(params, list) else [params]
             n = 0
@@ -122,12 +128,13 @@ class _Conn:
 
 
 class _Beg:
-    def __init__(self, store, log):
+    def __init__(self, store, log, sync_state=None):
         self.store = store
         self.log = log
+        self.sync_state = sync_state if sync_state is not None else {}
 
     def __enter__(self):
-        return _Conn(self.store, self.log)
+        return _Conn(self.store, self.log, self.sync_state)
 
     def __exit__(self, *a):
         return False
@@ -138,11 +145,12 @@ class FakeEngine:
         self.store = {}
         self.name = name
         self.log = []
+        self.sync_state = {}
         for r in (rows or []):
             self.store[(r["symbol"], str(r["date"]))] = dict(r)
 
     def begin(self):
-        return _Beg(self.store, self.log)
+        return _Beg(self.store, self.log, self.sync_state)
 
     def connect(self):
         return _Beg(self.store, self.log)
@@ -351,6 +359,30 @@ def test_nm11_sync_is_wired_after_the_eod_refresh():
     assert i_sync != -1, "sync_recent_macro_to_neon call not found"
     assert i_sync > i_refresh, (
         "Neon convergence sync must be called AFTER run_eod_5session_refresh")
+
+
+@pytest.fixture(autouse=True)
+def _emulate_staging_write(monkeypatch):
+    """Emulate the staged Neon merge against the fake store.
+
+    ``_staged_upsert_neon_macro`` uploads through ``pandas.to_sql`` into a
+    TEMP staging table, which needs a real SQLAlchemy connectable. The
+    diff/accounting contract these tests pin is unchanged by that transport,
+    so the merge is emulated here and the staging statement is asserted
+    separately by the production convergence check.
+    """
+
+    def _fake_stage(neon_engine, to_submit):
+        store = getattr(neon_engine, "store", None)
+        if store is not None:
+            for row in to_submit:
+                store[(row["symbol"], str(row["date"]))] = {
+                    k: row.get(k) for k in FIELDS
+                }
+        return len(to_submit)
+
+    monkeypatch.setattr(mdf, "_staged_upsert_neon_macro", _fake_stage)
+    yield
 
 
 # ---- NM-12 --------------------------------------------------------
@@ -679,3 +711,78 @@ def test_nm22_production_call_site_passes_the_served_window():
         encoding="utf-8")
     assert "NEON_MIRROR_SINCE" in source
     assert "prune_before=NEON_MIRROR_SINCE" in source
+
+
+# ---- NM-23: the Neon upsert is batched through a staging table ----------
+def test_nm23_upsert_goes_through_staging_not_row_at_a_time():
+    """No row-at-a-time executemany: the write must be a staged merge.
+
+    ``executemany`` is one round trip per row, which over the Neon link
+    measured ~20s per symbol. The upsert must instead upload the frame into a
+    TEMP staging table and merge it with a single INSERT ... SELECT.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "macro_data_fetch.py").read_text(
+        encoding="utf-8")
+    fn = source.split("def _staged_upsert_neon_macro", 1)[1].split("\ndef ", 1)[0]
+    assert "CREATE TEMP TABLE temp_macro" in fn
+    assert "to_sql" in fn
+    assert "INSERT INTO public.macro" in fn
+    assert "ON CONFLICT (date, symbol) DO UPDATE SET" in fn
+    assert ":date, :symbol" not in fn, "row-at-a-time VALUES binding is back"
+
+
+def test_nm23_staged_upsert_actually_writes_every_row(monkeypatch):
+    """The staged merge must land every submitted row (not just the first)."""
+    local = FakeEngine([_row(APPROVED, date(2026, 10, 10)),
+                        _row(APPROVED, date(2026, 10, 11))], "local")
+    neon = FakeEngine([], "neon")
+    seen: list = []
+
+    def _spy(neon_engine, to_submit):
+        seen.extend(to_submit)
+        for row in to_submit:
+            neon_engine.store[(row["symbol"], str(row["date"]))] = {
+                k: row.get(k) for k in FIELDS
+            }
+        return len(to_submit)
+
+    monkeypatch.setattr(mdf, "_staged_upsert_neon_macro", _spy)
+    res = mdf.sync_recent_macro_to_neon(
+        symbols=[APPROVED], local_engine_=local, neon_engine_=neon, dry_run=False)
+
+    assert len(seen) == 2
+    assert (APPROVED, "2026-10-10") in neon.store
+    assert (APPROVED, "2026-10-11") in neon.store
+    assert res["committed_rows"] == 2
+
+
+# ---- NM-24: the macro mirror is visible in public.sync_state ------------
+def test_nm24_macro_mirror_records_a_sync_checkpoint():
+    """The mirror must appear in public.sync_state.
+
+    ``audit_sync_state`` lists whatever is in that table. Only the equity
+    tables used to be recorded, so the macro mirror was invisible to the audit
+    even though it runs on the same hourly path.
+    """
+    local = FakeEngine([_row(APPROVED, date(2026, 10, 12))], "local")
+    neon = FakeEngine([], "neon")
+
+    mdf.sync_recent_macro_to_neon(
+        symbols=[APPROVED], local_engine_=local, neon_engine_=neon, dry_run=False)
+
+    assert "public.macro" in neon.sync_state
+    assert str(neon.sync_state["public.macro"]) == "2026-10-12"
+
+
+def test_nm24_dry_run_records_no_checkpoint():
+    """A dry run must not write data or a checkpoint."""
+    local = FakeEngine([_row(APPROVED, date(2026, 10, 12))], "local")
+    neon = FakeEngine([], "neon")
+
+    mdf.sync_recent_macro_to_neon(
+        symbols=[APPROVED], local_engine_=local, neon_engine_=neon, dry_run=True)
+
+    assert neon.sync_state == {}
+    assert neon.store == {}

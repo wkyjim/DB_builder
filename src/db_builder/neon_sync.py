@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -95,6 +96,47 @@ def update_sync_state(neon_engine, table_name: str, latest_date) -> None:
             text(sql),
             {"table_name": table_name, "latest_date": latest_date},
         )
+
+
+SYNC_STATE_TABLE = "public.sync_state"
+
+
+def ensure_sync_state_table(neon_engine) -> None:
+    """Create ``public.sync_state`` if a mirror path has never touched it.
+
+    The equity sync creates it; the macro mirrors are independent writers and
+    must not assume it already exists.
+    """
+    with neon_engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {SYNC_STATE_TABLE} (
+                table_name text PRIMARY KEY,
+                latest_date date,
+                updated_at timestamp DEFAULT now()
+            )
+        """))
+
+
+def record_sync_checkpoint(neon_engine, table_name: str, latest_date) -> None:
+    """Record a mirror checkpoint so the Neon sync audit can see every writer.
+
+    ``audit_sync_state`` lists whatever is in ``public.sync_state``. Only the
+    equity tables used to be recorded, so the macro mirrors were invisible to
+    it.
+    """
+    if latest_date is None:
+        return
+    ensure_sync_state_table(neon_engine)
+    if not isinstance(latest_date, (date, datetime)):
+        latest_date = pd.Timestamp(latest_date).date()
+    with neon_engine.begin() as conn:
+        conn.execute(text(f"""
+            INSERT INTO {SYNC_STATE_TABLE} (table_name, latest_date, updated_at)
+            VALUES (:table_name, :latest_date, now())
+            ON CONFLICT (table_name) DO UPDATE SET
+                latest_date = EXCLUDED.latest_date,
+                updated_at = now()
+        """), {"table_name": table_name, "latest_date": latest_date})
 
 
 def fetch_local_rows_for_daily_sync(
