@@ -387,6 +387,36 @@ All `.bat` workflows use PowerShell `Invoke-RetryPython` with:
 | `/tasks/send/{kind}/{secret}` | POST | Scheduled report |
 | `/tasks/alert/{secret}` | POST | System alert |
 
+### 9.3 Market Tape
+
+`/market-tape` serves one row per symbol, preferring a live session when one is
+fresh and falling back to the last close. Freshness is `observed_at` within 4
+hours **and** the live session date not older than the close date, so a
+carried-over Friday bar can never shadow Monday's open.
+
+`MARKET_TAPE_GROUPS` in `neon-api/main.py` is the authoritative list of groups
+and symbols. Each symbol must exist in `public.macro`; a typo produces an empty
+group with no error, which is how whole asset classes went missing before.
+
+| Group | Symbols | Coverage |
+|-------|---------|----------|
+| `equity_indices` | 12 | US, Europe, Asia-Pacific |
+| `index_futures` | 8 | US, HK, JP, KR, CN |
+| `fx_spot` | 10 | Majors + USD/CNY, USD/HKD, USD/SGD, DXY |
+| `oil` | 5 | WTI/Brent spot + futures, natural gas |
+| `crypto` | 2 | BTC, ETH |
+| `ust_yields` | 7 | 2Y–30Y cash curve |
+| `ust_yields_cmt` | 7 | 2Y–30Y Treasury.gov par curve |
+| `volatility` | 3 | VIX, MOVE, SKEW |
+
+`index_futures` keeps its historical name because `market-dashboard/scripts/fetch_tape.py`
+reads it.
+
+Live rows come from `public.macro_live`, written by
+`scripts/macro_data_fetch.py` only when the symbol's session is actually open.
+A closed session therefore serves the close instead — this is expected, not a
+gap.
+
 ## 10. Known Architectural Decisions
 
 1. **Local PostgreSQL is source of truth** — Neon is a deployment subset
