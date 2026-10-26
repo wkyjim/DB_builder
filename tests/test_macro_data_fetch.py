@@ -1248,3 +1248,78 @@ class TestWriteWindowUsesMarketSessions:
             [], date(2026, 10, 18)) == []
 
 
+
+
+class TestOilPriceAPIQuotaThrottle:
+    """OilPriceAPI allows 50 calls/day, and re-calling one commodity sooner than
+    90 minutes only burns quota -- the provider returns the same observation.
+    """
+
+    @pytest.fixture
+    def engine(self):
+        from sqlalchemy import create_engine
+        eng = create_engine("sqlite://")
+        macro_data_fetch.create_oilpriceapi_call_log_table(eng)
+        return eng
+
+    def test_first_call_is_allowed(self, engine):
+        allowed, reason = macro_data_fetch.oilpriceapi_may_call(
+            engine, "BRENT_CRUDE_USD")
+        assert allowed is True
+        assert reason == "allowed"
+
+    def test_second_call_within_90_minutes_is_blocked(self, engine):
+        macro_data_fetch.oilpriceapi_record_call(engine, "BRENT_CRUDE_USD", 1)
+        allowed, reason = macro_data_fetch.oilpriceapi_may_call(
+            engine, "BRENT_CRUDE_USD")
+        assert allowed is False
+        assert reason.startswith("throttled for BRENT_CRUDE_USD")
+
+    def test_other_commodity_is_unaffected(self, engine):
+        """The spacing limit is per commodity, not global."""
+        macro_data_fetch.oilpriceapi_record_call(engine, "BRENT_CRUDE_USD", 1)
+        allowed, _ = macro_data_fetch.oilpriceapi_may_call(engine, "WTI_USD")
+        assert allowed is True
+
+    def test_call_is_allowed_once_the_interval_has_passed(self, engine):
+        from datetime import datetime, timedelta, timezone
+        table = macro_data_fetch._oilpriceapi_log_table()
+        old = datetime.now(timezone.utc) - timedelta(
+            seconds=macro_data_fetch.OILPRICEAPI_MIN_INTERVAL_SECONDS + 60)
+        with engine.begin() as conn:
+            conn.execute(table.insert().values(
+                commodity_code="BRENT_CRUDE_USD", called_at=old, pages=1,
+                http_calls=1))
+        allowed, _ = macro_data_fetch.oilpriceapi_may_call(
+            engine, "BRENT_CRUDE_USD")
+        assert allowed is True
+
+    def test_daily_cap_blocks_further_calls(self, engine):
+        from datetime import datetime, timedelta, timezone
+        table = macro_data_fetch._oilpriceapi_log_table()
+        now = datetime.now(timezone.utc)
+        with engine.begin() as conn:
+            for i in range(macro_data_fetch.OILPRICEAPI_DAILY_CALL_CAP):
+                conn.execute(table.insert().values(
+                    commodity_code=f"C{i}", called_at=now - timedelta(seconds=i),
+                    pages=1, http_calls=1))
+        allowed, reason = macro_data_fetch.oilpriceapi_may_call(engine, "WTI_USD")
+        assert allowed is False
+        assert reason.startswith("daily cap reached")
+
+    def test_history_pages_fetch_is_bounded(self):
+        """Eight pages fetched ~800 rows to use ~10 of them."""
+        assert macro_data_fetch.OILPRICEAPI_HISTORY_PAGES == 1
+
+    def test_process_symbol_raises_skip_when_throttled(self, engine):
+        macro_data_fetch.oilpriceapi_record_call(engine, "BRENT_CRUDE_USD", 1)
+        with pytest.raises(macro_data_fetch.OilPriceAPISkipped) as exc:
+            macro_data_fetch.process_oilpriceapi_symbol(
+                "BRENT_OILPRICE",
+                {"name": "Brent", "asset_type": "oil_price"},
+                engine=engine,
+            )
+        assert "throttled for BRENT_CRUDE_USD" in str(exc.value)
+
+    def test_min_interval_is_ninety_minutes(self):
+        assert macro_data_fetch.OILPRICEAPI_MIN_INTERVAL_SECONDS == 90 * 60

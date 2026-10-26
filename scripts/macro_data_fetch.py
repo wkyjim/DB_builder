@@ -374,6 +374,146 @@ OILPRICEAPI_MAPPING = {
 OILPRICEAPI_ASSETS = frozenset(OILPRICEAPI_MAPPING)
 OILPRICEAPI_BASE_URL = "https://api.oilpriceapi.com/v1"
 OILPRICEAPI_RATE_LIMIT_SECONDS = 2.0
+# The plan quota is 50 calls/day. A bare per-request sleep does not bound the
+# *daily* total at all: the hourly task fetches both commodities every run, so
+# two more limits are required.
+#
+# 1. Per-commodity spacing. A second call to the same commodity sooner than
+#    this interval is skipped entirely -- the previous observation is still the
+#    freshest one the provider will return, so re-calling only burns quota.
+# 2. A daily cap, so a runaway loop (or a second task firing on the same day)
+#    can never push the account past the quota and into HTTP 402.
+OILPRICEAPI_MIN_INTERVAL_SECONDS = 90 * 60
+OILPRICEAPI_DAILY_CALL_CAP = 40
+# past_year with per_page=100 returns ~100 observations, i.e. roughly five
+# months. The ingestion window is LOOKBACK_DAYS + CALC_BUFFER_DAYS = 10 days, so
+# one page covers it with a wide margin. Eight pages was fetching ~800 rows to
+# use ~10 of them, i.e. eight wasted calls per commodity per run.
+OILPRICEAPI_HISTORY_PAGES = 1
+# Append-only call log. Both throttle decisions read from it, which keeps the
+# state durable and shared across every process that runs this script.
+OILPRICEAPI_CALL_LOG_TABLE = "oilpriceapi_call_log"
+
+_OILPRICEAPI_LOG_META = None
+_OILPRICEAPI_LOG_TABLE = None
+
+
+def _oilpriceapi_log_table():
+    """Return the SQLAlchemy Table for the call log, creating the DDL once.
+
+    Built with Core rather than raw SQL so the same code runs against the
+    production PostgreSQL engine and the SQLite engine the test-suite uses.
+    """
+    global _OILPRICEAPI_LOG_META, _OILPRICEAPI_LOG_TABLE
+    if _OILPRICEAPI_LOG_TABLE is None:
+        from sqlalchemy import (
+            Column, DateTime, Index, Integer, MetaData, String, Table,
+        )
+        _OILPRICEAPI_LOG_META = MetaData()
+        _OILPRICEAPI_LOG_TABLE = Table(
+            OILPRICEAPI_CALL_LOG_TABLE,
+            _OILPRICEAPI_LOG_META,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("commodity_code", String, nullable=False),
+            # Naive UTC on purpose: storing an aware datetime makes the
+            # rendered value depend on the session timezone, and a tz-aware
+            # bind compared against naive stored strings silently matches
+            # nothing on SQLite.
+            Column("called_at", DateTime, nullable=False),
+            Column("pages", Integer, nullable=False, default=1),
+            Column("http_calls", Integer, nullable=False, default=1),
+        )
+        Index("oilpriceapi_call_log_commodity_idx",
+              _OILPRICEAPI_LOG_TABLE.c.commodity_code,
+              _OILPRICEAPI_LOG_TABLE.c.called_at.desc())
+    return _OILPRICEAPI_LOG_TABLE
+
+
+def create_oilpriceapi_call_log_table(engine):
+    """Create the OilPriceAPI call log if it does not exist yet."""
+    table = _oilpriceapi_log_table()
+    table.create(engine, checkfirst=True)
+
+
+def oilpriceapi_last_call_at(engine, commodity_code):
+    """Return the most recent call time for a commodity, or None."""
+    from datetime import datetime
+    table = _oilpriceapi_log_table()
+    with engine.connect() as conn:
+        row = conn.execute(
+            table.select()
+            .with_only_columns(table.c.called_at)
+            .where(table.c.commodity_code == commodity_code)
+            .order_by(table.c.called_at.desc())
+            .limit(1)
+        ).first()
+    value = row[0] if row else None
+    if isinstance(value, datetime) and value.tzinfo is None:
+        from datetime import timezone
+        value = value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def oilpriceapi_calls_today(engine):
+    """Return the number of API calls already made today (Hong Kong date).
+
+    The quota is a calendar-day allowance, and the scheduled task runs on
+    Hong Kong wall-clock time, so the boundary must not drift with the DB
+    server's own timezone setting.
+    """
+    from datetime import datetime, timedelta, timezone
+    hkt = timezone(timedelta(hours=8))
+    day_start = (datetime.now(timezone.utc).astimezone(hkt)
+                 .replace(hour=0, minute=0, second=0, microsecond=0)
+                 .astimezone(timezone.utc).replace(tzinfo=None))
+    table = _oilpriceapi_log_table()
+    with engine.connect() as conn:
+        return conn.execute(
+            table.select()
+            .with_only_columns(table.c.id)
+            .where(table.c.called_at >= day_start)
+        ).fetchall().__len__()
+
+
+def oilpriceapi_may_call(engine, commodity_code):
+    """Decide whether a call to ``commodity_code`` is allowed right now.
+
+    Returns ``(allowed, reason)``. The reasons are stable strings so callers can
+    log and test them without parsing prose.
+    """
+    from datetime import datetime, timezone
+    create_oilpriceapi_call_log_table(engine)
+
+    used = oilpriceapi_calls_today(engine)
+    if used >= OILPRICEAPI_DAILY_CALL_CAP:
+        return False, f"daily cap reached ({used}/{OILPRICEAPI_DAILY_CALL_CAP})"
+
+    last = oilpriceapi_last_call_at(engine, commodity_code)
+    if last is not None:
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        if elapsed < OILPRICEAPI_MIN_INTERVAL_SECONDS:
+            remaining = int(OILPRICEAPI_MIN_INTERVAL_SECONDS - elapsed)
+            return False, (
+                f"throttled for {commodity_code}: last call "
+                f"{int(elapsed)}s ago, {remaining}s remaining"
+            )
+    return True, "allowed"
+
+
+def oilpriceapi_record_call(engine, commodity_code, pages):
+    """Record a completed OilPriceAPI call so the throttle can see it."""
+    from datetime import datetime, timezone
+    table = _oilpriceapi_log_table()
+    create_oilpriceapi_call_log_table(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            table.insert().values(
+                commodity_code=commodity_code,
+                called_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                pages=int(pages),
+                http_calls=int(pages),
+            )
+        )
 
 # P1B: U.S. Treasury official par-yield fallback.
 # Canonical DB symbols map to Treasury XML BC_*YEAR elements. The Treasury
@@ -559,6 +699,15 @@ class SymbolProcessingError(RuntimeError):
         super().__init__(message)
         self.rows_fetched = rows_fetched
         self.latest_observation = latest_observation
+
+
+class OilPriceAPISkipped(RuntimeError):
+    """The OilPriceAPI quota throttle declined this call.
+
+    Not a provider failure: the last successful observation is still the
+    freshest value the provider can return. Callers must record it as a no-op
+    so a throttled run neither fails the pipeline nor consumes quota.
+    """
 
 INVESTINY_ASSETS = {
     "US2YT=X": 23701,
@@ -4623,7 +4772,7 @@ def provider_for_symbol(symbol):
     return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
 
 
-def fetch_oilpriceapi_history(commodity_code, pages=8):
+def fetch_oilpriceapi_history(commodity_code, pages=OILPRICEAPI_HISTORY_PAGES):
     """Fetch daily spot prices for one OilPriceAPI commodity.
 
     Only /prices/past_year is deep enough to be useful; the API caps history at
@@ -4666,11 +4815,17 @@ def fetch_oilpriceapi_history(commodity_code, pages=8):
     return out
 
 
-def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=None):
+def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=None,
+                               engine=None):
     """Fetch and transform one OilPriceAPI spot-price symbol.
 
     Rows are SYNTHETIC single-point observations, not true OHLC bars:
     open = high = low = close = spot price, volume = NULL.
+
+    Raises :class:`OilPriceAPISkipped` when the quota throttle declines the
+    call. That is a normal, expected outcome -- the previous observation is
+    still the provider's freshest -- so the caller must not treat it as a
+    provider failure.
     """
     if symbol not in OILPRICEAPI_ASSETS:
         raise ValueError(f"oilpriceapi provider is not enabled for {symbol}")
@@ -4679,7 +4834,13 @@ def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=Non
     rows_fetched = 0
     latest_observation = None
     try:
+        if engine is not None:
+            allowed, reason = oilpriceapi_may_call(engine, commodity_code)
+            if not allowed:
+                raise OilPriceAPISkipped(reason)
         observations = fetch_oilpriceapi_history(commodity_code)
+        if engine is not None:
+            oilpriceapi_record_call(engine, commodity_code, OILPRICEAPI_HISTORY_PAGES)
         if not observations:
             raise ValueError(f"empty OilPriceAPI response for {commodity_code}")
         rows_fetched = len(observations)
@@ -4728,6 +4889,10 @@ def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=Non
             live_row = latest
 
         return rows, live_row, rows_fetched, latest_observation
+    except OilPriceAPISkipped:
+        # A throttle skip is a normal no-op, not a provider failure. Re-raise
+        # untouched so the caller can record it separately.
+        raise
     except Exception as exc:
         raise SymbolProcessingError(
             f"{type(exc).__name__}: {exc}",
@@ -6078,7 +6243,8 @@ def run_daily_update(
         try:
             rows, live_row, rows_fetched, latest_observation = (
                 process_oilpriceapi_symbol(
-                    symbol, meta, start_date=start_date, observed_at=observed_at)
+                    symbol, meta, start_date=start_date, observed_at=observed_at,
+                    engine=local_engine)
             )
             if live_row:
                 all_live_rows.append(live_row)
@@ -6107,6 +6273,22 @@ def run_daily_update(
                 fallback_provider=None,
             )
             print(f"[OILPRICEAPI OK] {symbol} | latest_observation={latest_observation}")
+        except OilPriceAPISkipped as skip:
+            # Quota throttle: no-op, NOT a failure. The symbol keeps its last
+            # observation and must not enter the required-failure set, or the
+            # hourly task would fail the whole run every 90 minutes.
+            outcomes[symbol] = SymbolFetchOutcome(
+                symbol=symbol,
+                name=meta["name"],
+                provider="oilpriceapi.com",
+                required=symbol in REQUIRED_SYMBOLS,
+                success=True,
+                rows_fetched=0,
+                latest_observation=None,
+                primary_provider="oilpriceapi.com",
+                fallback_provider=None,
+            )
+            print(f"[OILPRICEAPI SKIPPED] {symbol} | {skip}")
         except Exception as oil_error:
             rows_fetched = getattr(oil_error, "rows_fetched", 0)
             latest_observation = getattr(oil_error, "latest_observation", None)
