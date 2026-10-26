@@ -46,14 +46,23 @@ $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("oracle-market-intellige
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 try {
     $oracleEnv = Join-Path $tempDir "oracle.env"
-    @"
-API_HOST=$ApiHost
-BOT_HOST=$BotHost
-NEON_API_CONTEXT=/opt/market-intelligence/apps/neon-api
-TELEGRAM_BOT_CONTEXT=/opt/market-intelligence/apps/market-intelligence-telegram-bot
-NEON_API_ENV_FILE=/opt/market-intelligence/secrets/neon-api.env
-TELEGRAM_BOT_ENV_FILE=/opt/market-intelligence/secrets/telegram-bot.env
-"@ | Set-Content -LiteralPath $oracleEnv -Encoding ascii
+    # Bash `source` does not strip a trailing CR, so a CRLF file leaves "\r"
+    # glued to the last variable's value. The secret-file check then looks for
+    # a path ending in "\r" and fails with "Missing secret environment file".
+    # Write LF explicitly; Set-Content on Windows emits CRLF.
+    $oracleEnvBody = @(
+        "API_HOST=$ApiHost",
+        "BOT_HOST=$BotHost",
+        "NEON_API_CONTEXT=/opt/market-intelligence/apps/neon-api",
+        "TELEGRAM_BOT_CONTEXT=/opt/market-intelligence/apps/market-intelligence-telegram-bot",
+        "NEON_API_ENV_FILE=/opt/market-intelligence/secrets/neon-api.env",
+        "TELEGRAM_BOT_ENV_FILE=/opt/market-intelligence/secrets/telegram-bot.env"
+    ) -join "`n"
+    [System.IO.File]::WriteAllText(
+        $oracleEnv,
+        $oracleEnvBody + "`n",
+        (New-Object System.Text.ASCIIEncoding)
+    )
 
     & ssh -i $PrivateKey -o IdentitiesOnly=yes $target "mkdir -p /opt/market-intelligence/apps/neon-api /opt/market-intelligence/apps/market-intelligence-telegram-bot /opt/market-intelligence/deploy /opt/market-intelligence/secrets"
     if ($LASTEXITCODE -ne 0) { throw "Could not prepare remote directories." }
