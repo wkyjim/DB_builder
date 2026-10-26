@@ -404,6 +404,7 @@ group with no error, which is how whole asset classes went missing before.
 | `index_futures` | 8 | US, HK, JP, KR, CN |
 | `fx_spot` | 10 | Majors + USD/CNY, USD/HKD, USD/SGD, DXY |
 | `oil` | 3 | WTI/Brent futures, natural gas (yfinance) |
+| `commodities` | 3 | Gold, silver, copper (yfinance) |
 | `crypto` | 2 | BTC, ETH |
 | `ust_yields` | 7 | 2Y–30Y cash curve |
 | `ust_yields_cmt` | 7 | 2Y–30Y Treasury.gov par curve |
