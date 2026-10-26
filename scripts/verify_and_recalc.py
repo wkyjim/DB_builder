@@ -8,7 +8,7 @@ sys.path.insert(0, r"C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\scripts"
 
 from db_builder import config
 from db_builder.config import local_engine
-from macro_data_fetch import OILPRICEAPI_ASSETS, OILPRICEAPI_MAPPING, fetch_oilpriceapi_history
+from macro_data_fetch import OILPRICEAPI_ASSETS, OILPRICEAPI_MAPPING, fetch_oilpriceapi_latest
 from sqlalchemy import text
 import pandas as pd
 
@@ -22,7 +22,7 @@ with eng.connect() as c:
         df = pd.read_sql(text(
             "SELECT date, close, prev_close FROM public.macro "
             "WHERE symbol=:s ORDER BY date"), c, params={"s": symbol})
-        obs = dict(fetch_oilpriceapi_history(OILPRICEAPI_MAPPING[symbol]))
+        obs = dict(fetch_oilpriceapi_latest(OILPRICEAPI_MAPPING[symbol]))
         stored = {d.strftime("%Y-%m-%d"): float(v) for d, v in zip(df["date"], df["close"])}
         common = sorted(set(stored) & set(obs))
         mism = [(d, stored[d], obs[d]) for d in common

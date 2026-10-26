@@ -4772,47 +4772,41 @@ def provider_for_symbol(symbol):
     return "investing.com" if symbol in INVESTINY_ASSETS else "yfinance"
 
 
-def fetch_oilpriceapi_history(commodity_code, pages=OILPRICEAPI_HISTORY_PAGES):
-    """Fetch daily spot prices for one OilPriceAPI commodity.
+def fetch_oilpriceapi_latest(commodity_code):
+    """Fetch the latest spot price for one OilPriceAPI commodity.
 
-    Only /prices/past_year is deep enough to be useful; the API caps history at
-    ~365 days, so the earliest available observation bounds what can be stored.
-    Returns a list of (as_of_date, price) sorted ascending.
+    Only /prices/latest is on the current plan. The 7-day trial that covered
+    past_day / past_week / past_month / past_year has ended, and every one of
+    those now answers HTTP 402 UPGRADE_REQUIRED -- so the historical series
+    cannot be extended unless the plan is upgraded. The stored history stays
+    valid; only new observations have to come from the latest endpoint.
+
+    Returns a list of (as_of_date, price). It is a list, not a scalar, so the
+    caller keeps the same shape it had when history was available and can grow
+    past one observation without a second rewrite.
     """
     api_key = os.getenv("OIL_PRICE_API_KEY", "")
     if not api_key:
         raise ValueError("OIL_PRICE_API_KEY is not set")
 
-    out = []
-    for page in range(1, pages + 1):
-        url = (
-            f"{OILPRICEAPI_BASE_URL}/prices/past_year"
-            f"?by_code={commodity_code}&per_page=100&page={page}"
-        )
-        request = urllib.request.Request(
-            url, headers={"Authorization": f"Token {api_key}"}
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8", "replace"))
-        except urllib.error.HTTPError as exc:
-            raise ValueError(
-                f"OilPriceAPI HTTP {exc.code} for {commodity_code} page {page}"
-            ) from exc
-        prices = (payload.get("data") or {}).get("prices") or []
-        if not prices:
-            break
-        for item in prices:
-            as_of = item.get("as_of") or item.get("observed_at")
-            price = item.get("price")
-            if as_of is None or price is None:
-                continue
-            out.append((as_of[:10], float(price)))
-        if len(prices) < 100:
-            break
-        time.sleep(OILPRICEAPI_RATE_LIMIT_SECONDS)
-    out.sort()
-    return out
+    url = f"{OILPRICEAPI_BASE_URL}/prices/latest?by_code={commodity_code}"
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Token {api_key}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raise ValueError(
+            f"OilPriceAPI HTTP {exc.code} for {commodity_code}"
+        ) from exc
+
+    data = payload.get("data") or {}
+    price = data.get("price")
+    observed = data.get("observed_at") or data.get("created_at") or data.get("as_of")
+    if price is None or observed is None:
+        raise ValueError(f"OilPriceAPI response missing price/observed_at for {commodity_code}")
+    return [(observed[:10], float(price))]
 
 
 def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=None,
@@ -4838,7 +4832,7 @@ def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=Non
             allowed, reason = oilpriceapi_may_call(engine, commodity_code)
             if not allowed:
                 raise OilPriceAPISkipped(reason)
-        observations = fetch_oilpriceapi_history(commodity_code)
+        observations = fetch_oilpriceapi_latest(commodity_code)
         if engine is not None:
             oilpriceapi_record_call(engine, commodity_code, OILPRICEAPI_HISTORY_PAGES)
         if not observations:
