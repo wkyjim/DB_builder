@@ -403,7 +403,7 @@ group with no error, which is how whole asset classes went missing before.
 | `equity_indices` | 12 | US, Europe, Asia-Pacific |
 | `index_futures` | 8 | US, HK, JP, KR, CN |
 | `fx_spot` | 10 | Majors + USD/CNY, USD/HKD, USD/SGD, DXY |
-| `oil` | 5 | WTI/Brent spot + futures, natural gas |
+| `oil` | 3 | WTI/Brent futures, natural gas (yfinance) |
 | `crypto` | 2 | BTC, ETH |
 | `ust_yields` | 7 | 2Y–30Y cash curve |
 | `ust_yields_cmt` | 7 | 2Y–30Y Treasury.gov par curve |
@@ -411,6 +411,11 @@ group with no error, which is how whole asset classes went missing before.
 
 `index_futures` keeps its historical name because `market-dashboard/scripts/fetch_tape.py`
 reads it.
+
+`GET /market-tape` also returns `group_titles`. The dashboard and the
+`market-intelligence-telegram-bot` both read the groups straight from this
+endpoint instead of keeping their own copy of the mapping, so a group cannot
+silently diverge between API, web and bot.
 
 Live rows come from `public.macro_live`, written by
 `scripts/macro_data_fetch.py` only when the symbol's session is actually open.
