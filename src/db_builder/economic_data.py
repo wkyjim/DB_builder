@@ -154,86 +154,35 @@ def default_release_calendar(now: datetime | None = None) -> list[dict]:
     calls before a new observation is plausibly available.
     """
     now = now or datetime.now(timezone.utc)
-    releases = [
-        {
-            "source": "BLS",
-            "release_name": "Employment Situation",
-            "series_ids": ["PAYEMS", "UNRATE", "CIVPART"],
-            "category": "labor",
-            "country": "US",
-            "period_covered": "June 2026",
-            "release_datetime": _utc_datetime(2026, 7, 2, 12, 30),
-            "release_timezone": "America/New_York",
-            "importance": "high",
-            "status": "scheduled",
-            "source_url": "https://www.bls.gov/schedule/news_release/",
-        },
-        {
-            "source": "BLS",
-            "release_name": "Consumer Price Index",
-            "series_ids": ["CPIAUCSL", "CPILFESL", "CPIAUCNS", "CPILFENS"],
-            "category": "inflation",
-            "country": "US",
-            "period_covered": "June 2026",
-            "release_datetime": _utc_datetime(2026, 7, 14, 12, 30),
-            "release_timezone": "America/New_York",
-            "importance": "high",
-            "status": "scheduled",
-            "source_url": "https://www.bls.gov/schedule/news_release/",
-        },
-        {
-            "source": "BLS",
-            "release_name": "Producer Price Index",
-            "series_ids": ["PPIACO", "PPIFID", "PPIFES"],
-            "category": "inflation",
-            "country": "US",
-            "period_covered": "June 2026",
-            "release_datetime": _utc_datetime(2026, 7, 15, 12, 30),
-            "release_timezone": "America/New_York",
-            "importance": "high",
-            "status": "scheduled",
-            "source_url": "https://www.bls.gov/schedule/news_release/",
-        },
-        {
-            "source": "Census",
-            "release_name": "Advance Monthly Retail Sales",
-            "series_ids": ["RSAFS"],
-            "category": "growth",
-            "country": "US",
-            "period_covered": "June 2026",
-            "release_datetime": _utc_datetime(2026, 7, 16, 12, 30),
-            "release_timezone": "America/New_York",
-            "importance": "high",
-            "status": "scheduled",
-            "source_url": "https://www.census.gov/economic-indicators/calendar-listview.html",
-        },
-        {
-            "source": "Census",
-            "release_name": "New Residential Construction",
-            "series_ids": ["HOUST", "PERMIT"],
-            "category": "housing",
-            "country": "US",
-            "period_covered": "June 2026",
-            "release_datetime": _utc_datetime(2026, 7, 17, 12, 30),
-            "release_timezone": "America/New_York",
-            "importance": "medium",
-            "status": "scheduled",
-            "source_url": "https://www.census.gov/economic-indicators/calendar-listview.html",
-        },
-        {
-            "source": "BEA",
-            "release_name": "GDP Advance Estimate and Personal Income and Outlays",
-            "series_ids": ["GDPC1", "PCEPI", "PCEPILFE"],
-            "category": "growth_inflation",
-            "country": "US",
-            "period_covered": "Q2 2026 / June 2026",
-            "release_datetime": _utc_datetime(2026, 7, 30, 12, 30),
-            "release_timezone": "America/New_York",
-            "importance": "high",
-            "status": "scheduled",
-            "source_url": "https://www.bea.gov/news/schedule",
-        },
+    releases = []
+    # High-impact monthly releases. These use *rolling* dates computed from `now`
+    # rather than one-off scheduled timestamps, so the calendar always carries a
+    # future row for each series. A one-off date that has already passed would
+    # leave the series with no upcoming row and -- until the staleness window
+    # elapsed -- trigger an unconditional fetch every cycle (wasting a FRED hit on
+    # unchanged data). `day` is the typical publication day-of-month; the real
+    # release may shift by a few days, which the per-frequency staleness window
+    # absorbs. Times are 12:30 UTC ≈ 8:30 ET, the standard US morning release.
+    high_impact = [
+        ("BLS", "Employment Situation", ["PAYEMS", "UNRATE", "CIVPART"],
+         "labor", "high", 7, time(12, 30)),
+        ("BLS", "Consumer Price Index", ["CPIAUCSL", "CPILFESL", "CPIAUCNS", "CPILFENS"],
+         "inflation", "high", 14, time(12, 30)),
+        ("BLS", "Producer Price Index", ["PPIACO", "PPIFID", "PPIFES"],
+         "inflation", "high", 15, time(12, 30)),
+        ("Census", "Advance Monthly Retail Sales", ["RSAFS"],
+         "growth", "high", 16, time(12, 30)),
+        ("Census", "New Residential Construction", ["HOUST", "PERMIT"],
+         "housing", "medium", 17, time(12, 30)),
+        # BEA publishes the GDP advance/second/third estimates and PCE across the
+        # month; a monthly cadence on the 28th captures each revision without a
+        # per-quarter table. GDPC1's quarterly staleness window still gates it.
+        ("BEA", "GDP Advance Estimate and Personal Income and Outlays", ["GDPC1", "PCEPI", "PCEPILFE"],
+         "growth_inflation", "high", 28, time(12, 30)),
     ]
+    for source, name, series_ids, category, importance, day, release_time in high_impact:
+        release_dt = _next_monthly_release(now, day, release_time)
+        releases.append(_release_row(source, name, series_ids, category, release_dt, importance, "rule_based_monthly"))
     weekly_rules = {
         "ICSA": ("BLS/FRED", "Initial Claims", "labor", "high", 3, time(12, 30)),
         "CCSA": ("BLS/FRED", "Continued Claims", "labor", "medium", 3, time(12, 30)),
@@ -377,13 +326,96 @@ def next_release_for_series(engine, series_id: str, *, now: datetime | None = No
     return df.iloc[0].to_dict()
 
 
-def should_fetch_series(engine, series_id: str, *, now: datetime | None = None, force_refresh: bool = False) -> tuple[bool, str]:
+# A series may lag its own publication cadence by roughly this long before the
+# release calendar stops being authoritative. Without this floor, a release
+# calendar row dated far in the future blocks a daily or weekly series for
+# months (observed: FRED DFF/SOFR stalled from 2026-06-29 to 2026-10-26).
+# Staleness windows per frequency: a series is re-fetched when its newest local
+# observation is older than this many days, UNLESS the release calendar already
+# says the next release is due. Windows are set to comfortably exceed the normal
+# publication lag for each frequency so healthy data is not re-fetched every
+# cycle, while genuinely stuck series are still caught.
+#   daily    7  -> healthy daily is 1-2d old; buffer covers weekends/holidays.
+#   weekly   21 -> healthy weekly lags ~2-3 weeks after the reference week.
+#   monthly  90 -> e.g. Sep PAYEMS publishes mid-Oct (~55d); 45 was too tight
+#                  and re-fetched healthy monthly series every cycle.
+#   quarterly 180 -> healthy quarterly lags ~3 months past quarter-end.
+#   annual   400 -> annual releases + revisions can lag well over a year.
+FRESHNESS_WINDOW_DAYS = {
+    "daily": 7,
+    "weekly": 21,
+    "monthly": 90,
+    "quarterly": 180,
+    "annual": 400,
+}
+DEFAULT_FRESHNESS_WINDOW_DAYS = 90
+
+
+def freshness_window_days(frequency: str | None) -> int:
+    if not frequency:
+        return DEFAULT_FRESHNESS_WINDOW_DAYS
+    return FRESHNESS_WINDOW_DAYS.get(str(frequency).strip().lower(), DEFAULT_FRESHNESS_WINDOW_DAYS)
+
+
+def latest_series_date(engine, series_id: str):
+    """Return the newest observation date stored for a series, or None."""
+    sql = """
+        SELECT max(date) FROM public.economic_indicators WHERE series_id = :series_id
+    """
+    return pd.read_sql(text(sql), engine, params={"series_id": series_id}).iloc[0, 0]
+
+
+def series_staleness_days(engine, series_id: str, *, now: datetime | None = None):
+    """Days since the series' newest observation; None when it has no rows."""
+    now = now or datetime.now(timezone.utc)
+    latest = latest_series_date(engine, series_id)
+    if latest is None or (isinstance(latest, float) and pd.isna(latest)):
+        return None
+    latest_date = pd.Timestamp(latest).date()
+    return (now.date() - latest_date).days
+
+
+def should_fetch_series(
+    engine,
+    series_id: str,
+    *,
+    now: datetime | None = None,
+    force_refresh: bool = False,
+    frequency: str | None = None,
+) -> tuple[bool, str]:
+    """Decide whether a series needs fetching this cycle.
+
+    Two independent reasons force a fetch:
+
+    1. the official release calendar says the next release has already passed;
+    2. the series is staler than its own frequency window -- the release
+       calendar only ever lists *upcoming* releases, so a far-future row would
+       otherwise keep a daily series frozen for months.
+    """
     if force_refresh:
         return True, "force-refresh"
     now = now or datetime.now(timezone.utc)
+
+    stale_by = series_staleness_days(engine, series_id, now=now)
+    window = freshness_window_days(frequency)
+
+    # Bootstrap: a series with no local observations yet always fetches, even if
+    # its next scheduled release is still in the future.
+    if stale_by is None:
+        return True, "no local data yet"
+
+    # Staleness override: older than the frequency window -> fetch regardless of
+    # the release calendar, which only ever lists *upcoming* releases and would
+    # otherwise keep a series frozen for months.
+    if stale_by > window:
+        return True, f"stale {stale_by}d exceeds {window}d {frequency or 'unknown'} window"
+
+    # Otherwise the local series is fresh. Only fetch when the calendar says the
+    # next release has already passed. A missing calendar row is NOT a reason to
+    # re-hit FRED -- the data is already current -- so skip.
     next_release = next_release_for_series(engine, series_id, now=now)
     if not next_release:
-        return True, "no release calendar row"
+        return False, f"fresh {stale_by}d, no upcoming release on calendar"
     release_at = _coerce_utc(next_release["release_datetime"])
     if is_release_due(release_at, now=now):
         return True, f"release passed: {release_at.isoformat()}"

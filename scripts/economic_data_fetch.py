@@ -73,7 +73,12 @@ def main() -> None:
     all_rows = []
     fred_unavailable = []
     for series in selected:
-        should_fetch, reason = should_fetch_series(engine, series.series_id, force_refresh=args.force_refresh)
+        should_fetch, reason = should_fetch_series(
+            engine,
+            series.series_id,
+            force_refresh=args.force_refresh,
+            frequency=series.frequency,
+        )
         if not should_fetch:
             print(f"[SKIP] {series.series_id} {reason}")
             continue
