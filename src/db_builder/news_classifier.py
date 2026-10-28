@@ -50,6 +50,127 @@ def ollama_deep_model() -> str:
     return os.getenv("OLLAMA_DEEP_MODEL") or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_DEEP_MODEL)
 
 
+# ---------------------------------------------------------------------------
+# Hermes proxy (OpenAI-compatible) classifier
+# ---------------------------------------------------------------------------
+# ``hermes proxy start`` exposes an OpenAI-compatible /v1/chat/completions
+# endpoint backed by the user's OAuth provider (Nous Portal). Pointing the
+# classifier at it removes the hard dependency on a local Ollama install while
+# keeping the identical prompt / JSON contract. Any bearer token is accepted;
+# the proxy injects the real credentials.
+DEFAULT_HERMES_PROXY_URL = "http://127.0.0.1:8645/v1/chat/completions"
+DEFAULT_HERMES_MODEL = "upstage/solar-mini4:free"
+
+
+def hermes_url() -> str:
+    return os.getenv("HERMES_PROXY_URL", DEFAULT_HERMES_PROXY_URL)
+
+
+def hermes_model() -> str:
+    return os.getenv("HERMES_MODEL", DEFAULT_HERMES_MODEL)
+
+
+def selected_provider() -> str:
+    """Classifier backend: 'hermes' (default) or 'ollama'."""
+    return os.getenv("NEWS_CLASSIFIER_PROVIDER", "hermes").strip().lower()
+
+
+def selected_url() -> str:
+    return ollama_url() if selected_provider() == "ollama" else hermes_url()
+
+
+def selected_model() -> str:
+    if selected_provider() == "ollama":
+        return ollama_model()
+    return hermes_model()
+
+
+def _auth_headers() -> dict:
+    token = os.getenv("HERMES_PROXY_TOKEN", "local")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _models_probe_url() -> str:
+    """Best-effort GET endpoint for the configured provider's availability probe."""
+    if selected_provider() == "ollama":
+        return f"{ollama_url().rsplit('/api/chat', 1)[0].rstrip('/')}/api/tags"
+    base = hermes_url().rsplit("/chat/completions", 1)[0].rstrip("/")
+    return f"{base}/models"
+
+
+def classifier_available(timeout_seconds: float = 4.0) -> bool:
+    """Circuit-breaker probe for the configured classifier backend."""
+    import urllib.request
+
+    probe = _models_probe_url()
+    request = urllib.request.Request(probe, headers=_auth_headers())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds):
+            return True
+    except Exception:
+        return False
+
+
+def _openai_chat(
+    messages: list[dict],
+    *,
+    url: str,
+    model: str,
+    timeout: int,
+    json_mode: bool = True,
+) -> str:
+    """POST to an OpenAI-compatible /chat/completions endpoint; return content."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "temperature": 0,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    response = requests.post(url, json=payload, headers=_auth_headers(), timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    return body["choices"][0]["message"]["content"]
+
+
+def classify_with_hermes(
+    article: dict,
+    *,
+    url: str | None = None,
+    model: str | None = None,
+    timeout: int = 120,
+    repair: bool = True,
+) -> dict:
+    selected_url_ = url or hermes_url()
+    selected_model_ = model or hermes_model()
+    content = _openai_chat(
+        classification_prompt(article),
+        url=selected_url_,
+        model=selected_model_,
+        timeout=timeout,
+    )
+    try:
+        parsed = parse_model_response(content)
+    except ClassificationError:
+        if not repair:
+            raise
+        repair_content = _openai_chat(
+            repair_prompt(content),
+            url=selected_url_,
+            model=selected_model_,
+            timeout=timeout,
+        )
+        try:
+            parsed = parse_model_response(repair_content)
+        except ClassificationError as exc:
+            raise ClassificationError(f"Repair failed: {exc}") from exc
+    parsed["raw_response"] = {"model": selected_model_, "content": content}
+    parsed["model_provider"] = "hermes"
+    parsed["model_name"] = selected_model_
+    return parsed
+
+
 def select_articles_for_classification(
     engine,
     *,
@@ -349,6 +470,8 @@ def classify_with_ollama(
             raise ClassificationError(f"Repair failed: {exc}") from exc
         body = {"initial_response": body, "repair_response": repair_body}
     parsed["raw_response"] = body
+    parsed["model_provider"] = "ollama"
+    parsed["model_name"] = selected_model
     return parsed
 
 
@@ -390,8 +513,8 @@ def upsert_classification(engine, article_id: str, result: dict, *, provider: st
     row.update(
         {
             "article_id": article_id,
-            "model_provider": provider,
-            "model_name": model or ollama_model(),
+            "model_provider": result.get("model_provider") or provider,
+            "model_name": result.get("model_name") or model or ollama_model(),
             "classified_at": datetime.now(timezone.utc),
             "raw_response": json.dumps(result.get("raw_response") or {}, default=str),
         }

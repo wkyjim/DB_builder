@@ -8,49 +8,25 @@ import _bootstrap  # noqa: F401
 from db_builder.config import local_engine
 from db_builder.news_classifier import (
     ClassificationError,
+    classify_with_hermes,
     classify_with_ollama,
+    classifier_available,
     ollama_model,
-    ollama_url,
     persist_classification,
     record_classification_failure,
     reset_new_for_premium_sources,
     select_articles_for_classification,
+    selected_model,
+    selected_provider,
 )
 
 
-def ollama_available(timeout_seconds: float = 3.0) -> bool:
-    """Quick availability probe of the configured Ollama service.
-
-    Performs a cheap GET against the Ollama base URL (stripping the
-    /api/chat path) with a short timeout. Used as a circuit breaker so an
-    offline local classifier does not burn minutes of per-article retries:
-    when this returns False, news_classify exits cleanly and the caller
-    marks the news_classify source DEGRADED for the cycle.
-    """
-    import os
-    from urllib.parse import urlsplit
-
-    import requests as _requests
-
-    url = ollama_url()
-    parts = urlsplit(url)
-    base = f"{parts.scheme}://{parts.netloc}"
-    probe_path = os.getenv("OLLAMA_PROBE_PATH", "/api/tags")
-    try:
-        response = _requests.get(base + probe_path, timeout=timeout_seconds)
-        # Any HTTP response (even 404 on odd builds) proves the service is
-        # listening; connection errors are the unavailability signal.
-        return True
-    except Exception:
-        return False
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Classify local news articles with Ollama/DeepSeek.")
+    parser = argparse.ArgumentParser(description="Classify local news articles via the Hermes proxy (OpenAI-compatible) or Ollama.")
     parser.add_argument("--limit", type=int, default=5, help="Limit articles classified.")
     parser.add_argument("--article-id", default=None, help="Classify one article UUID.")
-    parser.add_argument("--timeout", type=int, default=120, help="Ollama request timeout in seconds.")
-    parser.add_argument("--model", default=None, help="Ollama model override; defaults to OLLAMA_FAST_MODEL.")
+    parser.add_argument("--timeout", type=int, default=120, help="Classifier request timeout in seconds.")
+    parser.add_argument("--model", default=None, help="Model override; defaults to the selected provider's model (HERMES_MODEL or OLLAMA_FAST_MODEL).")
     parser.add_argument("--max-seconds", type=float, default=None, help="Stop cleanly after this many elapsed seconds.")
     parser.add_argument("--min-importance", type=float, default=None, help="Only classify articles at or above this importance score.")
     parser.add_argument("--source-priority-min", type=float, default=None, help="Only classify sources at or above this priority.")
@@ -153,10 +129,10 @@ def main() -> None:
     # can mark news_classify DEGRADED and continue with raw news —
     # instead of spending minutes in per-article connection retries.
     # ------------------------------------------------------------------
-    if not ollama_available():
+    if not classifier_available():
         print(
-            "[OLLAMA UNAVAILABLE] Ollama service not reachable at "
-            f"{ollama_url()}; skipping classification this cycle. "
+            f"[CLASSIFIER UNAVAILABLE] {selected_provider()} classifier not reachable at "
+            f"{selected_url()}; skipping classification this cycle. "
             "Caller should mark news_classify as DEGRADED and continue "
             "with fetched raw news."
         )
@@ -195,7 +171,8 @@ def main() -> None:
     if dry_run:
         print("[dry-run] classifications will not be written")
 
-    model = args.model or ollama_model()
+    model = args.model or selected_model()
+    classify_fn = classify_with_hermes if selected_provider() != "ollama" else classify_with_ollama
     classify_articles(
         engine,
         articles,
@@ -204,6 +181,7 @@ def main() -> None:
         timeout=args.timeout,
         repair=not args.no_repair,
         max_seconds=args.max_seconds,
+        classify_fn=classify_fn,
     )
     print("News classification complete.")
 
