@@ -145,6 +145,10 @@ Selected tables are synced from local PostgreSQL to Neon via `pgSQL_daily_bulk_s
 
 Sync uses `public.sync_state` table to track latest synced dates. Idempotent upserts via temp staging tables.
 
+`macro` (historical macro data, including oil spot) is synced to Neon separately by `sync_recent_macro_to_neon()` in `scripts/macro_data_fetch.py` (recent-window `ON CONFLICT (date, symbol)` upsert; checkpointed in `public.sync_state`).
+
+- **Oil sources:** `BRENT_OILPRICE` / `WTI_OILPRICE` are OilPriceAPI spot prices from `/prices/latest`; the historical-plan trial ended ~Oct 2026, so only single-bar latest observations are returned and they flow through the `allow_missing_prior` live-snapshot path into `macro` and `macro_live`. `BZ=F` / `CL=F` are yfinance continuous futures.
+
 ## 5. Component Details
 
 ### 5.1 Ingestion Layer (`scripts/`)
