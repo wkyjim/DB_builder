@@ -3658,7 +3658,12 @@ def calculate_rows_for_symbol(df, symbol, name, asset_type,
     with ``prev_close``/``change``/``pct_chg``/``amplitude`` set to NULL rather
     than a stale positional value. The historical path never sets this flag.
     """
-    if df.empty or len(df) < 2:
+    # A single-observation spot frame (e.g. OilPriceAPI /prices/latest) has no
+    # positional prior, but the live-snapshot path still needs to emit it so the
+    # daily spot bar is not silently dropped. allow_missing_prior carries the
+    # prev_close=NULL emission semantics; historical callers leave it False and
+    # keep the >=2-row requirement.
+    if df.empty or (len(df) < 2 and not allow_missing_prior):
         return []
 
     df = df.sort_values("Date").copy()
@@ -4862,6 +4867,10 @@ def process_oilpriceapi_symbol(symbol, meta, *, start_date=None, observed_at=Non
             symbol=symbol,
             name=meta["name"],
             asset_type=meta["asset_type"],
+            # OilPriceAPI /prices/latest yields a single spot observation per
+            # fetch; allow it to emit one bar without a positional prior so the
+            # daily spot bar is no longer silently dropped by the >=2-row guard.
+            allow_missing_prior=True,
         )
         rows = filter_rows_to_target_window(
             rows=rows, target_start_date=target_start)
