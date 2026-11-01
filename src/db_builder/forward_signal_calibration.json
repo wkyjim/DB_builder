@@ -3,74 +3,74 @@
   "sample": {
     "engine": "market_regime_v2 / AEGIS attribution",
     "start": "2025-10-21",
-    "end": "2026-08-02",
-    "n_dates": 115,
+    "end": "2026-08-03",
+    "n_dates": 116,
     "note": "reconstructed ratings, bull-market window"
   },
   "buckets": [
     {
       "lo": 0,
       "hi": 40,
-      "n": 8,
-      "mean_5d": 0.8936,
-      "mean_20d": 6.787,
-      "mean_60d": 10.3981
+      "n": 9,
+      "mean_5d": 0.7494,
+      "mean_20d": 6.4908,
+      "mean_60d": 9.7806
     },
     {
       "lo": 40,
       "hi": 45,
-      "n": 10,
-      "mean_5d": 0.2473,
-      "mean_20d": 2.5166,
-      "mean_60d": 7.2902
+      "n": 11,
+      "mean_5d": 0.6136,
+      "mean_20d": 2.9352,
+      "mean_60d": 7.795
     },
     {
       "lo": 45,
       "hi": 50,
-      "n": 11,
-      "mean_5d": 1.4126,
-      "mean_20d": 2.9181,
-      "mean_60d": 5.6459
+      "n": 9,
+      "mean_5d": 1.2963,
+      "mean_20d": 2.3175,
+      "mean_60d": 4.9357
     },
     {
       "lo": 50,
       "hi": 55,
-      "n": 12,
-      "mean_5d": 0.5745,
-      "mean_20d": 1.5247,
-      "mean_60d": 4.9604
+      "n": 13,
+      "mean_5d": 0.6863,
+      "mean_20d": 1.5027,
+      "mean_60d": 4.7006
     },
     {
       "lo": 55,
       "hi": 60,
-      "n": 12,
-      "mean_5d": 0.197,
-      "mean_20d": -0.9543,
-      "mean_60d": 3.6899
+      "n": 8,
+      "mean_5d": 0.117,
+      "mean_20d": -1.6275,
+      "mean_60d": 5.072
     },
     {
       "lo": 60,
       "hi": 65,
-      "n": 20,
-      "mean_5d": -0.1091,
-      "mean_20d": -0.3023,
-      "mean_60d": 1.84
+      "n": 17,
+      "mean_5d": 0.3394,
+      "mean_20d": -0.1689,
+      "mean_60d": 1.9189
     },
     {
       "lo": 65,
       "hi": 70,
       "n": 24,
-      "mean_5d": -0.0043,
-      "mean_20d": 0.1399,
-      "mean_60d": 1.4126
+      "mean_5d": -0.045,
+      "mean_20d": 0.1797,
+      "mean_60d": 1.4727
     },
     {
       "lo": 70,
       "hi": 101,
-      "n": 18,
-      "mean_5d": 0.4694,
-      "mean_20d": 2.5414,
-      "mean_60d": 2.9646
+      "n": 25,
+      "mean_5d": 0.1161,
+      "mean_20d": 1.7272,
+      "mean_60d": 2.3921
     }
   ],
   "method": "Analyst inference/estimate (historical bucket calibration)",
@@ -82,11 +82,11 @@
   "spread_60d": {
     "low_bucket": "<45",
     "high_bucket": ">=65",
-    "spread_pp": 6.59,
-    "t_stat": 5.17,
+    "spread_pp": 6.7467,
+    "t_stat": 5.6226,
     "boot_ci95": [
-      1.88,
-      10.3
+      1.9169,
+      10.7592
     ],
     "p_spread_le_0": 0.0
   }

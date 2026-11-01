@@ -5,18 +5,18 @@ descriptor: it says how risk-on the market looks right now. It is NOT a forward
 return forecast, and the OOS evidence says its LEVEL is contrarian at longer
 horizons:
 
-    2025-10-21 .. 2026-08-02, 115 daily origins (AEGIS attribution table)
+    2025-10-21 .. 2026-08-03, 116 daily origins (AEGIS attribution table)
     60D forward SPY return by score bucket:
-        <40   +10.40%  (n=8)
-        40-45  +7.29%  (n=10)
-        45-50  +5.65%  (n=11)
-        50-55  +4.96%  (n=12)
-        55-60  +3.69%  (n=12)
-        60-65  +1.84%  (n=20)
-        65-70  +1.41%  (n=24)
-        70+    +2.96%  (n=18)
-    long-short spread (score<45 minus score>=65) = +6.59pp, t=5.17,
-    block-bootstrap 95% CI [+1.88, +10.30], P(spread<=0)=0.000.
+        <40   +9.78%   (n=9)
+        40-45  +7.80%  (n=11)
+        45-50  +4.94%  (n=9)
+        50-55  +4.70%  (n=13)
+        55-60  +5.07%  (n=8)
+        60-65  +1.92%  (n=17)
+        65-70  +1.47%  (n=24)
+        70+    +2.39%  (n=25)
+    long-short spread (score<45 minus score>=65) = +6.75pp, t=5.62,
+    block-bootstrap 95% CI [+1.92, +10.76], P(spread<=0)=0.000.
 
 Same monotone-declining shape appears in the production engine's own weekly
 sample (58 origins) and in both halves of the sample separately.
@@ -58,7 +58,7 @@ BUCKETS: tuple[tuple[float, float], ...] = (
 METHOD_LABEL = "Analyst inference/estimate (historical bucket calibration)"
 
 LIMITATIONS = [
-    "sample covers a bull-market window (2025-10-21..2026-08-02); no bear-market stress test is possible with current data",
+    "sample covers a bull-market window (2025-10-21..2026-08-03); no bear-market stress test is possible with current data",
     "60D forward windows overlap heavily; bootstrap CI is block-adjusted but effective sample size is small",
     "low-score buckets hold few observations (n=8 daily) so the contrarian edge is directionally clear but imprecise",
 ]
