@@ -31,7 +31,8 @@ Design rules:
     reads a cached JSON snapshot. Callers decide which to use.
   * Every output carries ``method`` and ``n`` so the report can label it
     "Analyst inference/estimate (historical bucket calibration)".
-  * Default OFF in the report: ``AEGIS_REPORT_FORWARD_SIGNAL=1`` opts in.
+  * Default ON in the report since the 116-date bootstrap validation passed;
+    ``AEGIS_REPORT_FORWARD_SIGNAL=0`` is the explicit kill switch.
 
 Known limits (do not hide):
   * Sample is a bull-market window; no bear-market stress test is possible with
@@ -60,19 +61,19 @@ METHOD_LABEL = "Analyst inference/estimate (historical bucket calibration)"
 LIMITATIONS = [
     "sample covers a bull-market window (2025-10-21..2026-08-03); no bear-market stress test is possible with current data",
     "60D forward windows overlap heavily; bootstrap CI is block-adjusted but effective sample size is small",
-    "low-score buckets hold few observations (n=8 daily) so the contrarian edge is directionally clear but imprecise",
+    "low-score buckets hold few observations (n=9 daily in the <40 bucket) so the contrarian edge is directionally clear but imprecise",
 ]
 
 
 def forward_signal_enabled() -> bool:
-    """Whether the optional forward-signal section renders in the report.
+    """Whether the forward-signal section renders in the report.
 
-    Default OFF so scheduled production output stays byte-identical until the
-    calibration has been reviewed. ``AEGIS_REPORT_FORWARD_SIGNAL=1`` (or
-    true/yes/on) turns it on.
+    Default ON since the 116-date bootstrap validation passed (95% CI
+    [+1.92, +10.76], P(spread<=0)=0.0000). Set ``AEGIS_REPORT_FORWARD_SIGNAL=0``
+    (or false/no/off) to suppress the section without a code change.
     """
-    return str(os.environ.get("AEGIS_REPORT_FORWARD_SIGNAL", "")).strip().lower() in {
-        "1", "true", "yes", "on",
+    return str(os.environ.get("AEGIS_REPORT_FORWARD_SIGNAL", "1")).strip().lower() not in {
+        "0", "false", "no", "off",
     }
 
 

@@ -359,3 +359,51 @@ def _minimal_report_scores() -> dict:
         "broad_dispersion": {},
         "sector_dispersion": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# Forward signal section (default ON, kill switch AEGIS_REPORT_FORWARD_SIGNAL=0)
+# ---------------------------------------------------------------------------
+def test_forward_signal_enabled_by_default(_mock_and_import_renderer, monkeypatch):
+    monkeypatch.delenv("AEGIS_REPORT_FORWARD_SIGNAL", raising=False)
+    assert _mock_and_import_renderer.forward_signal_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off"])
+def test_forward_signal_disabled_by_falsey_flag(_mock_and_import_renderer, monkeypatch, value):
+    monkeypatch.setenv("AEGIS_REPORT_FORWARD_SIGNAL", value)
+    assert _mock_and_import_renderer.forward_signal_enabled() is False
+
+
+def test_forward_signal_renders_when_enabled(_mock_and_import_renderer, monkeypatch):
+    monkeypatch.delenv("AEGIS_REPORT_FORWARD_SIGNAL", raising=False)
+    rendered = _mock_and_import_renderer.render_rule_based_market_update(
+        _minimal_report_data(), _minimal_report_scores()
+    )
+    assert "## Forward Signal (Score" in rendered
+    assert "Read-only mapping" in rendered
+    assert "| Horizon | Bucket | Historical mean | n | Direction |" in rendered
+    # 50.0 falls in the 50-55 bucket of the shipped 116-date calibration.
+    assert "50-55" in rendered
+    assert "Analyst inference/estimate" in rendered
+
+
+def test_forward_signal_omitted_when_flag_off(_mock_and_import_renderer, monkeypatch):
+    monkeypatch.setenv("AEGIS_REPORT_FORWARD_SIGNAL", "0")
+    rendered = _mock_and_import_renderer.render_rule_based_market_update(
+        _minimal_report_data(), _minimal_report_scores()
+    )
+    assert "## Forward Signal (Score" not in rendered
+
+
+def test_forward_signal_block_carries_sample_and_limitations(_mock_and_import_renderer):
+    text = "\n".join(_mock_and_import_renderer._forward_signal_lines(50.0))
+    assert "2025-10-21" in text and "2026-08-03" in text
+    assert "block-bootstrap 95% CI" in text
+    assert "Limitation:" in text
+    assert "not a forecast" in text
+
+
+def test_forward_signal_block_missing_calibration_returns_empty(_mock_and_import_renderer, monkeypatch):
+    monkeypatch.setattr(_mock_and_import_renderer, "load_calibration", lambda: None)
+    assert _mock_and_import_renderer._forward_signal_lines(50.0) == []

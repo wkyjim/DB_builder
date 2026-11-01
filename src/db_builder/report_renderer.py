@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from db_builder.contradiction_audit import audit_report_scores
 from db_builder.etf_flow.report_adapter import etf_flow_report_lines
+from db_builder.forward_signal import expected_forward, forward_signal_enabled, load_calibration
 from db_builder.market_dispersion import compute_broad_market_dispersion, compute_sector_constituent_dispersion
 from db_builder.market_strength import flt
 from db_builder.news_scoring import score_news
@@ -652,6 +653,73 @@ def _factor_attribution_lines(payload: dict | None) -> list[str]:
     return out
 
 
+def _forward_signal_lines(regime_score: float) -> list[str]:
+    """Format the score -> forward-return calibration block.
+
+    Reads the shipped calibration JSON (no DB, no network) and maps the current
+    regime score to historical 5D/20D/60D forward SPY returns. This is a
+    read-only restatement of the past, not a forecast, and it never feeds back
+    into the score.
+    """
+    calibration = load_calibration()
+    if not calibration:
+        return []
+    out = ["", "## Forward Signal (Score \u2192 Expected Return)", ""]
+    out.append(
+        "Read-only mapping. The regime score is a *state* descriptor, not a "
+        "forecast; this table states what that score level has historically "
+        "implied for forward SPY returns."
+    )
+    out.append("")
+    rows = []
+    contrarian = None
+    for horizon in (5, 20, 60):
+        info = expected_forward(regime_score, horizon, calibration)
+        if contrarian is None and info.get("contrarian") is not None:
+            contrarian = bool(info["contrarian"])
+        expected = info.get("expected_pct")
+        rows.append([
+            "%dD" % horizon,
+            info.get("bucket") or "n/a",
+            ("%s%%" % fmt(expected)) if expected is not None else "n/a",
+            info.get("n") or 0,
+            info.get("direction", "none"),
+        ])
+    out.extend(table(["Horizon", "Bucket", "Historical mean", "n", "Direction"], rows))
+
+    sample = calibration.get("sample") or {}
+    if sample:
+        out.append("")
+        out.append(
+            "Sample: %s \u2192 %s, %s daily origins."
+            % (sample.get("start", "?"), sample.get("end", "?"), sample.get("n_dates", "?"))
+        )
+    spread = calibration.get("spread_60d") or {}
+    if spread:
+        ci = spread.get("boot_ci95") or []
+        line = "Bottom-vs-top spread at 60D: **%s pp**" % fmt(spread.get("spread_pp"))
+        if len(ci) == 2:
+            line += " (block-bootstrap 95%% CI [%s, %s]" % (fmt(ci[0]), fmt(ci[1]))
+            p = spread.get("p_spread_le_0")
+            if p is not None:
+                p_txt = "<0.0001" if float(p) < 0.0001 else fmt(p, 4)
+                line += ", P(spread<=0)=%s" % p_txt
+            line += ")"
+        out.append(line)
+    if contrarian:
+        out.append(
+            "Shape: contrarian across buckets at this horizon \u2014 higher score "
+            "buckets have historically shown *lower* forward returns. The Direction "
+            "column is the sign of the expected return for this specific bucket, not "
+            "a statement that a high score is bullish."
+        )
+    out.append("")
+    out.append("Method: %s." % calibration.get("method", "historical bucket calibration"))
+    for note in (calibration.get("limitations") or [])[:4]:
+        out.append("- Limitation: %s" % note)
+    return out
+
+
 def render_rule_based_market_update(data: dict, scores: dict | None = None) -> str:
     scores = scores or score_all(data)
     generated_at = data.get("generated_at")
@@ -688,6 +756,11 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
         "",
     ]
     lines.extend(table(["Metric", "Value", "Driver / Interpretation"], _regime_score_rows(regime)))
+
+    # Score -> forward-return calibration. Default ON; AEGIS_REPORT_FORWARD_SIGNAL=0
+    # suppresses it. Never recomputes or alters the regime score itself.
+    if forward_signal_enabled():
+        lines.extend(_forward_signal_lines(regime["score"]))
 
     lines.extend(["", "## US Equity Strength Score", ""])
     lines.extend(table(["Component", "Score"], [[key, fmt(value)] for key, value in strength["decomposition"].items()]))

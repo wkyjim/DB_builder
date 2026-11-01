@@ -137,17 +137,19 @@ class TestBuildCalibration:
 
 
 class TestEnabledFlag:
+    """Default ON since the 116-date bootstrap validation passed; the env var is a kill switch."""
+
     @pytest.mark.parametrize("value,expected", [
-        ("1", True), ("true", True), ("TRUE", True), ("yes", True), ("on", True),
-        ("0", False), ("false", False), ("", False), ("no", False),
+        ("1", True), ("true", True), ("TRUE", True), ("yes", True), ("on", True), ("", True),
+        ("0", False), ("false", False), ("FALSE", False), ("no", False), ("off", False),
     ])
     def test_env_parsing(self, monkeypatch, value, expected):
         monkeypatch.setenv("AEGIS_REPORT_FORWARD_SIGNAL", value)
         assert forward_signal_enabled() is expected
 
-    def test_unset_is_off(self, monkeypatch):
+    def test_unset_is_on(self, monkeypatch):
         monkeypatch.delenv("AEGIS_REPORT_FORWARD_SIGNAL", raising=False)
-        assert forward_signal_enabled() is False
+        assert forward_signal_enabled() is True
 
 
 class TestLoadCalibration:

@@ -75,9 +75,9 @@
   ],
   "method": "Analyst inference/estimate (historical bucket calibration)",
   "limitations": [
-    "sample covers a bull-market window (2025-10-21..2026-08-02); no bear-market stress test is possible with current data",
+    "sample covers a bull-market window (2025-10-21..2026-08-03); no bear-market stress test is possible with current data",
     "60D forward windows overlap heavily; bootstrap CI is block-adjusted but effective sample size is small",
-    "low-score buckets hold few observations (n=8 daily) so the contrarian edge is directionally clear but imprecise"
+    "low-score buckets hold few observations (n=9 daily in the <40 bucket) so the contrarian edge is directionally clear but imprecise"
   ],
   "spread_60d": {
     "low_bucket": "<45",
