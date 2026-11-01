@@ -1,0 +1,93 @@
+{
+  "schema": "aegis-forward-signal-v1",
+  "sample": {
+    "engine": "market_regime_v2 / AEGIS attribution",
+    "start": "2025-10-21",
+    "end": "2026-08-02",
+    "n_dates": 115,
+    "note": "reconstructed ratings, bull-market window"
+  },
+  "buckets": [
+    {
+      "lo": 0,
+      "hi": 40,
+      "n": 8,
+      "mean_5d": 0.8936,
+      "mean_20d": 6.787,
+      "mean_60d": 10.3981
+    },
+    {
+      "lo": 40,
+      "hi": 45,
+      "n": 10,
+      "mean_5d": 0.2473,
+      "mean_20d": 2.5166,
+      "mean_60d": 7.2902
+    },
+    {
+      "lo": 45,
+      "hi": 50,
+      "n": 11,
+      "mean_5d": 1.4126,
+      "mean_20d": 2.9181,
+      "mean_60d": 5.6459
+    },
+    {
+      "lo": 50,
+      "hi": 55,
+      "n": 12,
+      "mean_5d": 0.5745,
+      "mean_20d": 1.5247,
+      "mean_60d": 4.9604
+    },
+    {
+      "lo": 55,
+      "hi": 60,
+      "n": 12,
+      "mean_5d": 0.197,
+      "mean_20d": -0.9543,
+      "mean_60d": 3.6899
+    },
+    {
+      "lo": 60,
+      "hi": 65,
+      "n": 20,
+      "mean_5d": -0.1091,
+      "mean_20d": -0.3023,
+      "mean_60d": 1.84
+    },
+    {
+      "lo": 65,
+      "hi": 70,
+      "n": 24,
+      "mean_5d": -0.0043,
+      "mean_20d": 0.1399,
+      "mean_60d": 1.4126
+    },
+    {
+      "lo": 70,
+      "hi": 101,
+      "n": 18,
+      "mean_5d": 0.4694,
+      "mean_20d": 2.5414,
+      "mean_60d": 2.9646
+    }
+  ],
+  "method": "Analyst inference/estimate (historical bucket calibration)",
+  "limitations": [
+    "sample covers a bull-market window (2025-10-21..2026-08-02); no bear-market stress test is possible with current data",
+    "60D forward windows overlap heavily; bootstrap CI is block-adjusted but effective sample size is small",
+    "low-score buckets hold few observations (n=8 daily) so the contrarian edge is directionally clear but imprecise"
+  ],
+  "spread_60d": {
+    "low_bucket": "<45",
+    "high_bucket": ">=65",
+    "spread_pp": 6.59,
+    "t_stat": 5.17,
+    "boot_ci95": [
+      1.88,
+      10.3
+    ],
+    "p_spread_le_0": 0.0
+  }
+}
