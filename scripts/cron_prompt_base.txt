@@ -1,0 +1,108 @@
+Generate the market-intelligence HTML report in the ORIGINAL 24-SECTION structure with PURE AI NARRATIVE and AI RE-RATING of judgment scores.
+
+WORKSPACE
+- Repo: DB_builder/market-dashboard. Authorized Windows path: C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard. Same repo mounted in the container at /workspace/DB_builder/market-dashboard. Run all commands from the repo root.
+- Authoritative procedure: market-intelligence-report-prompt-authorized.txt at the DB_builder root, plus the loaded skill market-intelligence-report. Follow both in full.
+- Single primary data source: market-dashboard/data/latest-report.md (written hourly by hourly_full_pipeline.ps1). No fallback, no stale mirror.
+
+CRITICAL DISTINCTION - FACTS vs JUDGMENTS
+latest-report.md contains FACTS that update continuously: market data (prices, % changes), macro data (yields, spreads, DXY, oil, gold), economic data, technical indicators (breadth, momentum, vol). These FACTS are authoritative and frozen for the run.
+latest-report.md ALSO contains rule-based JUDGMENT scores: Regime Score (44.82 currently) and 11 GICS Sector Ratings. These are NOT facts - they are mechanical derivations. YOU must independently review and adjust them using your own online research and analysis.
+
+HARD RULE - THE SHORTCUT IS FORBIDDEN
+The bare-script path is disabled and fails closed (exit code 5). You MUST supply an AI narrative AND an AI re-rating.
+- NEVER run scripts/generate_final_report.py without --narrative.
+- NEVER publish a report whose footer says "this is a programmatic report".
+- NEVER hand-write the HTML and bypass the generator; the deterministic builder owns every number.
+
+EXTERNAL RESEARCH IS MANDATORY
+A report that cites only latest-report.md is a restatement of the rule engine and is not acceptable. You MUST do independent external research on every run: BLS (CPI/PPI/employment), BEA (GDP/PCE), Federal Reserve (FOMC statement/minutes/dot plot), U.S. Treasury (quarterly refunding/auction calendar), current index levels and moves, credit spreads (IG/HY), rates curve, dollar, oil, gold, positioning and flow commentary, sell-side consensus where material, and news drivers for any move you describe. Cite institution + document/release name + date + URL for every material external claim. Never fabricate URLs; if a URL cannot be verified, cite the document by name without a link and say so. Distinguish pipeline facts (latest-report.md) from externally researched material in the prose.
+
+The narrative JSON MUST include a "sources" array with at least 3 distinct external http(s) URLs. The generator (report_narrative.validate_narrative) enforces this floor and HALTs when it is not met. Schema shown in step 1d below.
+
+EVIDENCE DENSITY AND SPECIFICITY (quality bar)
+The report must read like an experienced CIO who has limited time and must decide where to allocate risk. Vague, directional prose is a defect. Every narrative section must carry concrete evidence:
+- Anchor claims to a DATE ("on 30 October", "Q3 2026", "September CPI").
+- Quote SPECIFIC figures ("Nasdaq fell 2.86%", "core PCE 3.1%", "target 3.75-4.00%").
+- State the CAUSAL CHAIN explicitly (what happened -> why it matters -> what it implies).
+- Name a TRADEABLE EXPRESSION where relevant ("RSP over QQQ", "short duration", "quality over beta").
+Numbers that come from outside latest-report.md MUST be declared in external_claims[] with their source. The validator accepts those values and rejects undeclared ones, so declaring them is what allows precision. Do NOT soften an exact figure into "near", "around" or "roughly" to dodge validation - declare it instead.
+Target depth: roughly 350+ numeric mentions and 15+ date anchors across the report, matching the depth of the October 31 institutional edition. A report materially thinner than that is a failed run.
+
+MANDATORY WORKFLOW (GENERATE -> VALIDATE -> ADVERSARIAL REVIEW -> FIX -> REVALIDATE -> COMMIT -> PUSH)
+
+1. GENERATE
+   a. Read data/latest-report.md and the authorized prompt. Freeze the baseline: source timestamp, per-series observation dates, run ID. Never blend runs.
+   b. Do the AI research and analysis the prompt requires: reconcile against the database/API, refresh public sources (news, central bank communications, credit spreads, positioning data, analyst consensus), verify material claims (section 17 Evidence Verification). Classify Fact / Source-derived signal / Estimate / Interpretation / Conclusion. Do not fabricate.
+   c. PHASE 1 - evidence probe (read-only, does NOT touch the published HTML):
+      python scripts/generate_final_report.py --report data/latest-report.md --evidence-out <temp>/market_evidence.json
+      It prints EVIDENCE-ONLY and exits 0 without writing HTML. Read that JSON: it is the frozen set of 200 metrics you may quote.
+   d. AUTHOR THE NARRATIVE JSON at <temp>/market_narrative.json with BOTH narrative sections AND AI re-rating adjustments. ALL 23 narrative sections are REQUIRED; a missing or empty section fails validation. Schema:
+      {"schema": "aegis-narrative-v1",
+       "source": {"latest_report_sha256": "<copy source_sha256 from the evidence pack>"},
+       "sections": {
+         "exec_summary": ["p1", "p2", "p3"],
+         "cio_dashboard": ["p"],
+         "what_matters": ["item1", "item2", "item3", "item4", "item5"],
+         "risk_opportunity": [{"label": "<Opportunity: X or Risk: Y>", "why": "<evidence with a date and a number>", "priced": "<what appears priced in>", "view": "<our judgment>", "expression": "<portfolio expression>", "changes_view": "<what invalidates this>"}],
+         "historical_analogs": ["p"],
+         "scorecard": ["p"],
+         "scenarios_narrative": ["p"],
+         "macro_narrative": ["p"],
+         "cross_asset_narrative": ["p"],
+         "equities_view": ["p"],
+         "price_action": ["p"],
+         "flows_narrative": ["p"],
+         "portfolio_posture": ["p"],
+         "sector_narrative": ["p"],
+         "themes_narrative": ["p"],
+         "style_rotation": ["p"],
+         "factor_style": [{"factor": "<Quality/Value/Momentum/Size/...>", "signal": "<Positive/Negative/Neutral>", "exposure": "<signed number, e.g. +1.5>", "notes": "<evidence-backed note>"}],
+         "trades_narrative": ["p"],
+         "heat_st_narrative": ["p"],
+         "heat_lt_narrative": ["p"],
+         "catalysts_narrative": ["p"],
+         "risk_narrative": ["p"],
+         "conclusions": ["p"]
+       },
+NOTE ON TABLE SECTIONS: risk_opportunity and factor_style are NOT prose. They must be arrays of row objects (see schema above) because the renderer emits real HTML tables for them. Emit 4-6 risk_opportunity rows and 5-7 factor_style rows. A single prose string in these slots renders as a paragraph and loses the table formatting.
+       "adjustments": {
+         "regime_score": <number 0-100, your independent judgment>,
+         "regime_label": "<short label, max 60 chars>",
+         "rationale": "<80-2000 chars explaining WHY you adjusted the regime and sectors based on your research>",
+         "sector_scores": {"<sector name>": <number 0-100>, ... all 11 sectors required}
+       },
+       "sources": [
+         {"label": "<institution + document name>", "url": "https://...", "note": "<what this source supports, max 400 chars>"}
+       ],
+       "external_claims": [
+         {"value": <number>, "text": "<what the figure is>", "source": "<institution + document + date, or URL>"}
+       ],
+       "claims": []}
+      AI RE-RATING RULES:
+      - You MUST fill adjustments.regime_score and all 11 adjustments.sector_scores. These are YOUR independent judgments, not copies of the source values.
+      - Regime score: may deviate up to 25 points from source. Sector scores: up to 30 points from source. Larger deviations are rejected as unanchored.
+      - adjustments.rationale MUST cite the specific research evidence (news, data releases, spreads, positioning) that justifies your divergence from the mechanical score.
+      - Every decimal in prose must exist in the evidence pack OR be one of your adjusted values OR be declared in claims[] as {"path": "<evidence path>", "value": <number>}.
+      - Max 2000 chars per narrative section, 24000 total. Plain text only, no HTML tags.
+      If latest-report.md changed since the probe (sha mismatch), re-run phase 1 and rebuild the narrative.
+   e. PHASE 2 - render and publish:
+      python scripts/generate_final_report.py --report data/latest-report.md --evidence-out <temp>/market_evidence.json --narrative <temp>/market_narrative.json --push
+      The script validates narrative AND adjustments against the frozen evidence pack, then renders all 24 sections with BOTH source-derived and AI-adjusted scores disclosed side by side (54A 16). On failure it HALTs and writes nothing: read the NARRATIVE FAIL lines, fix the JSON, re-run (max 2 fix attempts, then report the blocker).
+
+2. VALIDATE (54A 15-17): require QC 0 failures; require all 24 anchors present; confirm 11 GICS sectors and 13 themes; verify AI-adjusted regime/sector values appear in the output.
+
+3. ADVERSARIAL REVIEW (54A 18): for each high-conviction idea give the strongest bear case, the catalyst, the return mechanism, and a measurable invalidation trigger. Challenge your own re-rating: if your adjusted score diverges materially from the mechanical score, document the specific evidence that makes the mechanical score wrong.
+
+4. FIX -> REVALIDATE (54A 19): check internal consistency across exec summary, scorecard, sector and theme rankings, ST/LT probabilities (each totals 100 percent), trade ideas, heat maps (net to 0), portfolio posture. Any residual inconsistency halts COMMIT.
+
+5. COMMIT / PUSH: only after every gate passes. Stage ONLY data/market-intelligence-report.html. Push via the market_dashboard deploy key. Never force push. Preserve unrelated working-tree changes.
+
+6. DELIVER: short Telegram summary - run ID, data cutoff, sections rendered, regime source->AI-adjusted delta, sector adjustments count, QC result, commit hash.
+
+FAILURE POLICY
+- Any 54A control failure: fix and re-run. Never commit a failing report.
+- Never degrade to the compact programmatic report to get a green run.
+- If the narrative or re-rating cannot be completed after honest attempts, HALT and report the exact blocker. Do not publish a degraded report.
+
+Model: keep reflection/beam-1.0-501b-a23b:free.
