@@ -27,11 +27,32 @@ def clean_html(value: str | None) -> str:
 
 
 def parse_entry_datetime(entry: dict):
+    """Parse a feed entry timestamp.
+
+    Modern feeds overwhelmingly emit ISO 8601 (``2026-06-05T21:59:42Z``), which
+    ``parsedate_to_datetime`` cannot read — it expects RFC 822. Relying on it
+    alone left 74.6% of ``news_articles.published_at`` NULL even though every
+    raw payload carried a usable date. Try ISO first, then RFC 822.
+    """
     value = entry.get("published") or entry.get("updated")
     if not value:
         return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # ISO 8601: "Z" suffix, offsets, and the space-separated variant.
     try:
-        parsed = parsedate_to_datetime(value)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        pass
+
+    # RFC 822: "Mon, 08 Jun 2026 22:11:39 GMT"
+    try:
+        parsed = parsedate_to_datetime(text)
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
