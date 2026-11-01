@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -569,6 +570,88 @@ def _constituent_leaders_for_sector(sector_name: str, sector_dispersion: list[di
     return []
 
 
+def factor_attribution_enabled() -> bool:
+    """Whether the optional Factor Attribution / Model Validation section renders.
+
+    Defaults to OFF so scheduled production reports stay byte-identical to what they
+    emit today. Enable with ``AEGIS_REPORT_FACTOR_ATTRIBUTION=1`` (also accepts
+    true/yes/on). The section only formats a payload that was already computed and
+    stored elsewhere; it never recomputes scores, so turning it on cannot move the
+    production regime score or sector rating.
+    """
+    return str(os.environ.get("AEGIS_REPORT_FACTOR_ATTRIBUTION", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _attribution_block_lines(title: str, block: dict | None) -> list[str]:
+    """Format one attribution block (regime or sector) as markdown lines."""
+    out = [f"", f"### {title}", ""]
+    if not block:
+        out.append("No payload for this model in the current run.")
+        return out
+
+    factors = block.get("factors") or {}
+    if factors:
+        rows = []
+        for name, info in factors.items():
+            rows.append([
+                name,
+                fmt(info.get("score")),
+                fmt(info.get("weight")),
+                fmt(info.get("contribution")),
+                fmt(info.get("delta_since_prev")),
+            ])
+        out.extend(table(["Factor", "Score", "Weight", "Contribution", "Change vs prev run"], rows))
+
+    predictive = block.get("predictive") or {}
+    if predictive:
+        out.extend(["", "Historical predictive performance (rank IC by horizon):", ""])
+        rows = []
+        for name, by_h in predictive.items():
+            rows.append([name, fmt(by_h.get("5")), fmt(by_h.get("20")), fmt(by_h.get("60")),
+                         by_h.get("n") if by_h.get("n") is not None else "n/a"])
+        out.extend(table(["Factor", "IC 5D", "IC 20D", "IC 60D", "OOS obs"], rows))
+
+    ablation = block.get("ablation") or {}
+    if ablation:
+        out.extend(["", "Ablation impact (change in IC when the factor is removed):", ""])
+        rows = []
+        for name, by_h in ablation.items():
+            rows.append([name, fmt(by_h.get("5")), fmt(by_h.get("20")), fmt(by_h.get("60")),
+                         by_h.get("n") if by_h.get("n") is not None else "n/a"])
+        out.extend(table(["Factor", "dIC 5D", "dIC 20D", "dIC 60D", "OOS obs"], rows))
+
+    challengers = block.get("challengers") or []
+    if challengers:
+        out.extend(["", "Existing versus challenger models:", ""])
+        rows = [[c.get("model", "?"), c.get("metric", "?"), fmt(c.get("existing")),
+                 fmt(c.get("challenger")), c.get("verdict", "")] for c in challengers]
+        out.extend(table(["Model", "Metric", "Existing", "Challenger", "Verdict"], rows))
+
+    for note in (block.get("limitations") or [])[:8]:
+        out.append(f"- Limitation: {note}")
+    return out
+
+
+def _factor_attribution_lines(payload: dict | None) -> list[str]:
+    """Gated Factor Attribution / Model Validation section."""
+    out = ["", "## Factor Attribution & Model Validation", ""]
+    if not payload:
+        out.append("No attribution payload was supplied for this run; section skipped.")
+        return out
+    out.append("Read-only diagnostics. These numbers do not feed back into the production "
+               "regime score or sector rating.")
+    for label, key in (("Market Regime", "regime"), ("Sector Rating", "sector")):
+        out.extend(_attribution_block_lines(label, payload.get(key)))
+    dq = payload.get("data_quality") or {}
+    if dq:
+        out.extend(["", "### Data Quality / Confidence", ""])
+        for k, v in list(dq.items())[:10]:
+            out.append(f"- {k}: {v}")
+    return out
+
+
 def render_rule_based_market_update(data: dict, scores: dict | None = None) -> str:
     scores = scores or score_all(data)
     generated_at = data.get("generated_at")
@@ -711,6 +794,12 @@ def render_rule_based_market_update(data: dict, scores: dict | None = None) -> s
     lines.extend([f"- Technical rows loaded: `{len(data.get('technicals', []))}`", f"- S&P 500 constituent technical rows loaded: `{len(data.get('sp500_technicals', []))}`", f"- Macro rows loaded: `{len(data.get('macro', []))}`", f"- Live macro rows used: `{live_count}`", f"- Economic rows loaded: `{len(data.get('economic', []))}`", f"- News rows loaded: `{len(data.get('news', []))}`", f"- Positioning/flow rows loaded: `{len(data.get('positioning_flow', []))}`"])
     for warning in confidence["warning_flags"][:8]:
         lines.append(f"- {warning}")
+
+    # Optional, default-off. Production output stays byte-identical unless the
+    # operator explicitly opts in with AEGIS_REPORT_FACTOR_ATTRIBUTION=1.
+    if factor_attribution_enabled():
+        lines.extend(_factor_attribution_lines(data.get("factor_attribution")))
+
     return "\n".join(lines).rstrip() + "\n"
 
 

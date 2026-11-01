@@ -20,6 +20,45 @@ MACRO_SYMBOLS = ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX", "^MOVE", "NQ=F", "ES=
 RISK_ON_THEMES = {"AI", "Market Sentiment", "Mergers & Acquisitions", "Technology", "Semiconductors", "Financials", "Consumer Discretionary"}
 RISK_OFF_THEMES = {"Geopolitics", "Oil", "Inflation", "Interest Rates", "Monetary Policy", "Regulation", "Credit Stress", "Trade Policy", "Tariffs"}
 
+# Single source of truth for the composite. ``factor_attribution.REGIME_FACTORS``
+# mirrors these numbers and must be kept in step (that module is stdlib-only and
+# cannot import this one, which pulls in pandas).
+REGIME_FACTOR_WEIGHTS = {
+    "technical": 0.25,
+    "momentum": 0.20,
+    "risk_appetite": 0.20,
+    "breadth": 0.15,
+    "macro": 0.10,
+    "news": 0.10,
+}
+
+
+def weighted_regime_score(scores: dict, available: set | None = None) -> tuple[float, dict]:
+    """Weighted composite over the factors that actually carry data.
+
+    A scorer with a missing feed returns its 50 neutral default. Keeping the full
+    weight on that 50 drags the whole score toward the middle by exactly that
+    factor's weight, so a run without a feed and a run with one are not
+    comparable, and the resulting number understates conviction. Factors listed
+    as unavailable are dropped and the remaining weights renormalized to 1.0.
+
+    ``available`` defaults to "everything present", which reproduces the original
+    fixed-weight assembly exactly.
+    """
+    keys = list(REGIME_FACTOR_WEIGHTS)
+    if available is None:
+        available = set(keys)
+    use = [k for k in keys if k in available]
+    if not use:
+        return 50.0, {"weights": {}, "dropped": keys}
+    total = sum(REGIME_FACTOR_WEIGHTS[k] for k in use)
+    weights = {k: REGIME_FACTOR_WEIGHTS[k] / total for k in use}
+    score = sum(scores[k] * weights[k] for k in use)
+    return round(_clamp(score), 4), {
+        "weights": {k: round(v, 6) for k, v in weights.items()},
+        "dropped": [k for k in keys if k not in available],
+    }
+
 
 def setup_market_regime_v2_schema(engine) -> None:
     sql = f"""
@@ -263,9 +302,15 @@ def score_macro(macro_df: pd.DataFrame) -> tuple[float, list[str]]:
     return round(_clamp(score), 4), drivers[:8]
 
 
-def score_news(news_df: pd.DataFrame) -> tuple[float, list[str]]:
+def score_news(news_df: pd.DataFrame) -> tuple[float, list[str], bool]:
+    """Return ``(score, drivers, available)``.
+
+    ``available`` is False when there is no usable news signal, either because the
+    feed is empty or because no tracked theme appears in the window. Callers use it
+    to drop the news weight instead of letting a neutral 50 bias the composite.
+    """
     if news_df.empty:
-        return 50.0, ["news signals missing; neutral score"]
+        return 50.0, ["news signals missing; neutral score"], False
     risk_on = 0.0
     risk_off = 0.0
     drivers = []
@@ -280,9 +325,36 @@ def score_news(news_df: pd.DataFrame) -> tuple[float, list[str]]:
         if theme in RISK_ON_THEMES | RISK_OFF_THEMES:
             drivers.append(f"{theme} opp={round(_float(row.get('opportunity_score')), 2)} risk={round(_float(row.get('risk_score')), 2)}")
     if risk_on + risk_off == 0:
-        return 50.0, drivers[:8]
+        return 50.0, drivers[:8], False
     score = 50 + ((risk_on - risk_off) / (risk_on + risk_off)) * 50
-    return round(_clamp(score), 4), drivers[:8]
+    return round(_clamp(score), 4), drivers[:8], True
+
+
+def factor_availability(technical_df: pd.DataFrame, macro_df: pd.DataFrame,
+                        news_available: bool) -> set:
+    """Which factors have real data behind them.
+
+    Mirrors the "data missing; neutral score" guards inside the scorers so the
+    composite only averages over feeds that actually produced numbers. Keep this
+    in step when a scorer's guard changes.
+    """
+    rows = [] if technical_df is None or technical_df.empty else technical_df.to_dict(orient="records")
+    key_rows = [r for r in rows if r.get("ticker") in KEY_ETFS]
+    breadth_rows = [r for r in rows
+                    if _float(r.get("close")) and _float(r.get("ma_50")) and _float(r.get("ma_200"))]
+    macro_ok = macro_df is not None and not macro_df.empty
+    available = set()
+    if key_rows:
+        available.update({"technical", "momentum"})
+    if breadth_rows:
+        available.add("breadth")
+    if key_rows or macro_ok:
+        available.add("risk_appetite")
+    if macro_ok:
+        available.add("macro")
+    if news_available:
+        available.add("news")
+    return available
 
 
 def classify_market_regime(score: float) -> str:
@@ -338,15 +410,21 @@ def build_market_regime_v2(
     breadth_score, breadth_state, breadth_drivers = score_breadth(technical_df)
     risk_appetite_score, risk_appetite_state, volatility_state, risk_drivers = score_risk_appetite(macro_df, technical_df)
     macro_score, macro_drivers = score_macro(macro_df)
-    news_score, news_drivers = score_news(news_df)
-    bullish_score = round(
-        (technical_score * 0.25)
-        + (momentum_score * 0.20)
-        + (risk_appetite_score * 0.20)
-        + (breadth_score * 0.15)
-        + (macro_score * 0.10)
-        + (news_score * 0.10),
-        4,
+    news_score, news_drivers, news_available = score_news(news_df)
+    # Average only over feeds that produced data. A missing feed used to keep its
+    # full weight on the 50 neutral default, which silently pulled the composite
+    # toward 50 -- so a run without news and a run with news were not comparable.
+    available = factor_availability(technical_df, macro_df, news_available)
+    bullish_score, weight_info = weighted_regime_score(
+        {
+            "technical": technical_score,
+            "momentum": momentum_score,
+            "risk_appetite": risk_appetite_score,
+            "breadth": breadth_score,
+            "macro": macro_score,
+            "news": news_score,
+        },
+        available,
     )
     bearish_score = round(100 - bullish_score, 4)
     regime = classify_market_regime(bullish_score)
@@ -360,6 +438,8 @@ def build_market_regime_v2(
         "risk_appetite": risk_drivers,
         "macro": macro_drivers,
         "news": news_drivers,
+        "weights_used": weight_info["weights"],
+        "dropped_factors": weight_info["dropped"],
     }
     return {
         "signal_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"db_builder.market_regime_v2:{key}")),

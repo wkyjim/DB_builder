@@ -260,3 +260,102 @@ def test_scores_to_json_handles_empty_dict(_mock_and_import_renderer):
     result = json.loads(_mock_and_import_renderer.scores_to_json({}))
 
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Factor attribution / model validation section (default off)
+# ---------------------------------------------------------------------------
+def test_factor_attribution_disabled_by_default(_mock_and_import_renderer, monkeypatch):
+    monkeypatch.delenv("AEGIS_REPORT_FACTOR_ATTRIBUTION", raising=False)
+    assert _mock_and_import_renderer.factor_attribution_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " On "])
+def test_factor_attribution_enabled_by_truthy_flag(_mock_and_import_renderer, monkeypatch, value):
+    monkeypatch.setenv("AEGIS_REPORT_FACTOR_ATTRIBUTION", value)
+    assert _mock_and_import_renderer.factor_attribution_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "random"])
+def test_factor_attribution_disabled_by_falsey_flag(_mock_and_import_renderer, monkeypatch, value):
+    monkeypatch.setenv("AEGIS_REPORT_FACTOR_ATTRIBUTION", value)
+    assert _mock_and_import_renderer.factor_attribution_enabled() is False
+
+
+def test_attribution_section_skips_cleanly_without_payload(_mock_and_import_renderer):
+    text = "\n".join(_mock_and_import_renderer._factor_attribution_lines(None))
+    assert "Factor Attribution" in text
+    assert "skipped" in text
+
+
+def test_attribution_section_renders_factors_and_caveats(_mock_and_import_renderer):
+    payload = {
+        "regime": {
+            "factors": {
+                "technical_score": {"score": 42.0, "weight": 0.25,
+                                    "contribution": 10.5, "delta_since_prev": -1.2},
+            },
+            "predictive": {"technical_score": {"5": -0.09, "20": -0.25, "60": -0.42, "n": 39}},
+            "ablation": {"technical_score": {"5": 0.01, "20": 0.02, "60": 0.03, "n": 39}},
+            "challengers": [{"model": "equal_weight", "metric": "IC 20D",
+                             "existing": -0.25, "challenger": -0.26, "verdict": "no gain"}],
+            "limitations": ["60D has only 4 non-overlapping observations"],
+        },
+        "sector": {"factors": {"rsi14": {"score": 55.0, "weight": 0.08,
+                                         "contribution": 4.4, "delta_since_prev": 0.0}}},
+        "data_quality": {"n_regime_dates": 115, "n_sector_dates": 115},
+    }
+    text = "\n".join(_mock_and_import_renderer._factor_attribution_lines(payload))
+    assert "Market Regime" in text
+    assert "technical_score" in text
+    assert "Historical predictive performance" in text
+    assert "Ablation impact" in text
+    assert "existing versus challenger" in text.lower()
+    assert "Limitation:" in text
+    assert "Sector Rating" in text
+    assert "Read-only diagnostics" in text
+
+
+def test_render_omits_attribution_section_when_flag_off(_mock_and_import_renderer, monkeypatch):
+    """Production output must not grow the new section unless explicitly opted in."""
+    monkeypatch.delenv("AEGIS_REPORT_FACTOR_ATTRIBUTION", raising=False)
+    rendered = _mock_and_import_renderer.render_rule_based_market_update(
+        _minimal_report_data(), _minimal_report_scores()
+    )
+    assert "Factor Attribution & Model Validation" not in rendered
+
+
+def _minimal_report_data() -> dict:
+    return {
+        "generated_at": "2026-11-01T02:16:00Z",
+        "window_hours": 24,
+        "macro": [],
+        "technicals": [],
+        "sp500_technicals": [],
+        "economic": [],
+        "news": [],
+        "positioning_flow": [],
+        "etf_flow_analytics": {},
+        "factor_attribution": {"regime": {"factors": {"x": {"score": 1}}}},
+    }
+
+
+def _minimal_report_scores() -> dict:
+    return {
+        "regime": {"score": 50.0, "label": "Neutral", "components": {}, "drivers": []},
+        "market_strength": {
+            "score": 50.0, "label": "neutral", "decomposition": {},
+            "breadth": {"label": "narrow", "above_50d_pct": 40.0,
+                        "above_200d_pct": 53.0, "positive_20d_pct": 45.0},
+        },
+        "confidence": {"score": 70.0, "agreement_ratio": 0.5, "contradiction_count": 0,
+                       "missing_indicators": [], "warning_flags": []},
+        "sectors": [],
+        "themes": [],
+        "sector_theme_alignment": [],
+        "news": {"score": 45.0, "sentiment_counts": {}, "top_headlines": [],
+                 "noisy_headlines": []},
+        "audit_flags": [],
+        "broad_dispersion": {},
+        "sector_dispersion": [],
+    }

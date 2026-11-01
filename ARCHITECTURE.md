@@ -135,7 +135,60 @@ Each ingestion script follows a common pattern:
 - **Short Analytics:** Short interest metrics, days to cover, short volume ratios, composite scoring, regime classification
 - **Market Regime:** Weighted composite of equity trend, momentum, breadth, volatility, rates, credit, dollar, commodity, ETF flow, news
 
-### 4.5 Sync to Neon
+### 4.5 Factor Attribution and Model Validation (`factor_attribution.py`)
+
+Read-only analytics layer over the two production scoring models. It does not
+produce or change any production score.
+
+| Aspect | Regime (`market_regime_v2`) | Sector (`rate_sector`) |
+|--------|---------------------------|------------------------|
+| Attribution | Exact decomposition of `bullish_score` into `w_i × score_i` (weights 0.25/0.20/0.20/0.15/0.10/0.10); residual is reported and must stay ~0 | Exact term-by-term decomposition of the 50 + 6 component points, with the [0,100] clip isolated as `clip_adjustment` |
+| Change attribution | Per-factor Δ contribution between consecutive production rows, reconciling to Δ score | Per-sector rating/rank change between panel origins |
+| Predictive tests | Rank IC / sign hit / Brier / drawdown IC per factor at 5D/20D/60D; one-at-a-time ablation (`neutral_fill`, `renormalize`) | Cross-sectional Rank IC vs `sec_h − spy_h`, Top–Bottom spread, OW/UW hit rate, active alpha; per-component IC and ablation rank churn |
+| Challengers | Equal-weight, shrinkage-50, IC-weighted regularized vs production | Equal-weight, IC-weighted regularized, regime overlay, momentum-flip (mean reversion), unclipped |
+| Safeguards | Point-in-time inputs; non-overlapping evaluation samples; purged chronological walk-forward; weights fitted on train only | Same |
+
+Outputs land in `reports/aegis_factor_attribution_<cmd>_<timestamp>.md|.json`
+(gitignored, matching the `rule_based_market_update_*` convention).
+
+**Persisted attribution dataset** (opt-in, additive, no production table touched):
+
+| Table | Grain | Key columns |
+|-------|-------|-------------|
+| `public.aegis_regime_attribution` | one row per origin date | `score`, `f_*` (6 factor scores), `w_*` (6 weights), `c_*` (6 contributions), `residual`, `spy_5d/20d/60d`, `dd_5d/20d/60d`, `label_5d/20d/60d`, `source` |
+| `public.aegis_sector_backtest` (existing) | one row per (date, sector) | original 11 columns unchanged, plus `c_*` (6 component points), `clip_adj`, `rating_raw`, `rank`, `n_sectors`, `regime_score`, `regime_label` |
+
+Storing weights per row makes a future weight change auditable instead of
+retroactively rewriting history; `source='reconstruction'` marks dates before
+`market_regime_v2`'s stored history (2026-06-07), which are re-simulated rather
+than published.
+
+Commands: `python -m db_builder.factor_attribution {regime|sector|all|store|weights|ddl|selftest}`.
+`store` upserts the dataset (idempotent; `--dry-run` validates identities without
+writing). `weights` reads it back and proposes IC-proportional regularized
+weights with a hard per-factor cap, fitted on purged train blocks only; the
+recommendation is gated on ≥2 evaluable blocks, ≥10 OOS dates, ≥0.02 IC gain and
+a majority-of-blocks win, and otherwise returns *do not change weights*.
+
+### 4.6 Factor Composition & Weight Study (`factor_optimization.py`)
+
+Read-only study over the tables above; changes no production score.
+
+- **Impact diagnostics** per factor: univariate IC, incremental IC (blend with vs
+  without the factor), and first-half/second-half IC with a `stable_sign` flag.
+- **Composition search**: every subset of ≥2 factors (57 per model) × 3 schemes
+  (`equal`, `ic_pos`, `ic_signed` — the signed scheme gives an anti-predictive
+  factor a negative weight instead of flooring it to zero).
+- **Nested validation**: candidates are ranked on all walk-forward blocks except
+  the last two; those two are held out and never used for selection. Each block
+  fits on purged train dates and scores non-overlapping eval dates.
+- **Verdict**: recommends a composition only if it beats both production and
+  equal-weight-all on the confirmation blocks, is positive in every confirmation
+  block, and clears the sample-size/gain gates; otherwise *do not change production*.
+
+Run: `python -m db_builder.factor_optimization [--start YYYY-MM-DD] [--out FILE] [--json FILE]`.
+
+### 4.7 Sync to Neon
 
 Selected tables are synced from local PostgreSQL to Neon via `pgSQL_daily_bulk_sync_to_neon.py`:
 - `us_equities` — equity raw data
