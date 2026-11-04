@@ -1,4 +1,4 @@
-Generate the market-intelligence HTML report in the ORIGINAL 24-SECTION structure with PURE AI NARRATIVE and AI RE-RATING of judgment scores.
+Generate the market-intelligence HTML report in the AI-FIRST structure: AI Regime Scorecard (AI score headline + one-line source disclosure + full factor/weight audit table), Forward Signal restatement, AI Sector Ratings table (AI values only, each row with its own rationale) plus a separate Source vs AI sector comparison table, and the 20 remaining narrative sections. The AI re-rating is a TWO-STEP calculation: AI factor scores x AI weights.
 
 WORKSPACE
 - Repo: DB_builder/market-dashboard. Authorized Windows path: C:\Users\User\OneDrive\Coding\Hermes_PM\DB_builder\market-dashboard. Same repo mounted in the container at /workspace/DB_builder/market-dashboard. Run all commands from the repo root.
@@ -7,7 +7,7 @@ WORKSPACE
 
 CRITICAL DISTINCTION - FACTS vs JUDGMENTS
 latest-report.md contains FACTS that update continuously: market data (prices, % changes), macro data (yields, spreads, DXY, oil, gold), economic data, technical indicators (breadth, momentum, vol). These FACTS are authoritative and frozen for the run.
-latest-report.md ALSO contains rule-based JUDGMENT scores: Regime Score (44.82 currently) and 11 GICS Sector Ratings. These are NOT facts - they are mechanical derivations. YOU must independently review and adjust them using your own online research and analysis.
+latest-report.md ALSO contains rule-based JUDGMENT scores: the Regime Score (always read the CURRENT value from the file; never hardcode a prior run's number) and 11 GICS Sector Ratings. These are NOT facts - they are mechanical derivations. YOU must independently re-rate them in two steps: first your own factor scores for all 10 regime factors, then your own weights that sum to 100 points, then the computed AI regime score; and your own sector ratings for all 11 GICS sectors.
 
 HARD RULE - THE SHORTCUT IS FORBIDDEN
 The bare-script path is disabled and fails closed (exit code 5). You MUST supply an AI narrative AND an AI re-rating.
@@ -18,7 +18,7 @@ The bare-script path is disabled and fails closed (exit code 5). You MUST supply
 EXTERNAL RESEARCH IS MANDATORY
 A report that cites only latest-report.md is a restatement of the rule engine and is not acceptable. You MUST do independent external research on every run: BLS (CPI/PPI/employment), BEA (GDP/PCE), Federal Reserve (FOMC statement/minutes/dot plot), U.S. Treasury (quarterly refunding/auction calendar), current index levels and moves, credit spreads (IG/HY), rates curve, dollar, oil, gold, positioning and flow commentary, sell-side consensus where material, and news drivers for any move you describe. Cite institution + document/release name + date + URL for every material external claim. Never fabricate URLs; if a URL cannot be verified, cite the document by name without a link and say so. Distinguish pipeline facts (latest-report.md) from externally researched material in the prose.
 
-The narrative JSON MUST include a "sources" array with at least 3 distinct external http(s) URLs. The generator (report_narrative.validate_narrative) enforces this floor and HALTs when it is not met. Schema shown in step 1d below.
+The narrative JSON MUST include a "sources" array with at least 10 distinct external http(s) URLs spanning at least 4 distinct registered domains. The generator (report_narrative.validate_narrative) enforces these floors and HALTs when either is not met. Schema shown in step 1d below.
 
 EVIDENCE DENSITY AND SPECIFICITY (quality bar)
 The report must read like an experienced CIO who has limited time and must decide where to allocate risk. Vague, directional prose is a defect. Every narrative section must carry concrete evidence:
@@ -34,21 +34,33 @@ MANDATORY WORKFLOW (GENERATE -> VALIDATE -> ADVERSARIAL REVIEW -> FIX -> REVALID
 1. GENERATE
    a. Read data/latest-report.md and the authorized prompt. Freeze the baseline: source timestamp, per-series observation dates, run ID. Never blend runs.
    b. Do the AI research and analysis the prompt requires: reconcile against the database/API, refresh public sources (news, central bank communications, credit spreads, positioning data, analyst consensus), verify material claims (section 17 Evidence Verification). Classify Fact / Source-derived signal / Estimate / Interpretation / Conclusion. Do not fabricate.
+   b2. RESEARCH MANDATE — FORWARD-LOOKING FUNDAMENTAL WORK, NOT MODEL TUNING:
+      - Read latest-report.md completely first; it is the quantitative baseline, not the answer.
+      - Do independent research on company filings (10-K/10-Q/8-K), earnings releases, guidance, transcripts, industry data, economic releases and authoritative sources.
+      - Check the existing PostgreSQL data and architecture before sourcing new data; reuse existing capabilities.
+      - Build a forward view on growth, inflation, Fed policy, rates, liquidity, credit, USD and commodities over 1-3M and 6-12M, with drivers, alternative outcomes and invalidation triggers.
+      - Screen 8-15 candidates from latest-report.md sector rankings, technicals, earnings/news and macro signals. Compare them within and across sectors, then select 3-5 highest-quality ideas (fewer if evidence is insufficient). Include long, short, reduce and no-trade verdicts where justified.
+      - Reassess the previous published report's stock ideas: mark each KEEP, UPGRADE, DOWNGRADE, EXIT or REPLACE; new ideas are NEW. At least 2 of the 3-5 selected ideas must be NEW versus the previous report; carryovers are capped so the screen stays dynamic. Previous ideas may remain as watchlist candidates but must be independently re-researched.
+      - For each shortlisted idea research the latest company earnings, guidance, revenue/EPS growth, margins, FCF, valuation, competition, catalysts and market expectations from filings, investor relations and authoritative data; verify publication dates.
+      - For each idea state recommendation, horizon, thesis, assumptions, bull/base/bear targets, upside/downside, risk/reward, catalysts, risks, entry condition, exit, invalidation and the strongest opposing argument.
+      - Evaluate correlation and overlapping exposures across ideas; size positions and name hedges. Distinguish model portfolio from actual holdings.
+      - Never invent missing forecasts or market data. Cite primary sources with dates. Separate verified facts, model estimates and AI judgments.
    c. PHASE 1 - evidence probe (read-only, does NOT touch the published HTML):
       python scripts/generate_final_report.py --report data/latest-report.md --evidence-out <temp>/market_evidence.json
       It prints EVIDENCE-ONLY and exits 0 without writing HTML. Read that JSON: it is the frozen set of 200 metrics you may quote.
-   d. AUTHOR THE NARRATIVE JSON at <temp>/market_narrative.json with BOTH narrative sections AND AI re-rating adjustments. ALL 23 narrative sections are REQUIRED; a missing or empty section fails validation. Schema:
+   d. AUTHOR THE NARRATIVE JSON at <temp>/market_narrative.json with BOTH narrative sections AND the two-step AI scoring block. ALL 27 narrative sections are REQUIRED; a missing or empty section fails validation. Schema:
       {"schema": "aegis-narrative-v1",
        "source": {"latest_report_sha256": "<copy source_sha256 from the evidence pack>"},
        "sections": {
          "exec_summary": ["p1", "p2", "p3"],
-         "cio_dashboard": ["p"],
          "what_matters": ["item1", "item2", "item3", "item4", "item5"],
          "risk_opportunity": [{"label": "<Opportunity: X or Risk: Y>", "why": "<evidence with a date and a number>", "priced": "<what appears priced in>", "view": "<our judgment>", "expression": "<portfolio expression>", "changes_view": "<what invalidates this>"}],
          "historical_analogs": ["p"],
          "scorecard": ["p"],
+         "forward_signal": ["5D +0.69%, 20D +1.50%, 60D +4.70% at the 50-55 bucket; ..."],
          "scenarios_narrative": ["p"],
          "macro_narrative": ["p"],
+         "macro_outlook": [{"factor": "Growth", "view_1_3m": "<view>", "view_6_12m": "<view>", "drivers": "<evidence>", "invalidation": "<what breaks it>"}],
          "cross_asset_narrative": ["p"],
          "equities_view": ["p"],
          "price_action": ["p"],
@@ -59,18 +71,38 @@ MANDATORY WORKFLOW (GENERATE -> VALIDATE -> ADVERSARIAL REVIEW -> FIX -> REVALID
          "style_rotation": ["p"],
          "factor_style": [{"factor": "<Quality/Value/Momentum/Size/...>", "signal": "<Positive/Negative/Neutral>", "exposure": "<signed number, e.g. +1.5>", "notes": "<evidence-backed note>"}],
          "trades_narrative": ["p"],
+         "candidate_screen": [{"ticker": "<TICKER>", "name": "<company>", "sector": "<GICS sector>", "signal": "<technical/fundamental signal>", "verdict": "<Selected|Watchlist|Rejected|No-Trade>", "reason": "<why selected or rejected>"}],
+         "stock_ideas": [{"ticker": "<TICKER>", "name": "<company>", "sector": "<GICS sector>", "security_type": "Stock", "recommendation": "Buy", "horizon": "6-12M", "current_price": <number>, "price_date": "YYYY-MM-DD", "entry_price": <number>, "base_target": <number>, "bull_target": <number>, "bear_target": <number>, "upside_pct": <number>, "downside_pct": <number>, "return_from_current_pct": <number>, "risk_reward": <number>, "thesis": "<why>", "assumptions": "<explicit EPS/revenue/multiple assumptions>", "why_vs_alternatives": "<why this name versus the other candidates>", "contrary": "<the strongest contrary evidence you found>", "catalysts": "<dated catalysts>", "risks": "<key risks>", "entry_condition": "<when to enter>", "exit": "<exit trigger>", "invalidation": "<measurable invalidation>", "opposing": "<strongest bear case>", "reassess": "<NEW|KEEP|UPGRADE|DOWNGRADE|EXIT|REPLACE>", "verification": "<Verified|Estimate|Unverified>", "sources": ["https://..."]}],
          "heat_st_narrative": ["p"],
          "heat_lt_narrative": ["p"],
          "catalysts_narrative": ["p"],
          "risk_narrative": ["p"],
+         "portfolio_risk": [{"risk": "Concentration", "exposure": "<top ideas share of active risk>", "correlation": "<0-1 or qualitative>", "sizing": "<position sizing guidance>", "hedge": "<hedge or none>", "notes": "<evidence>"}],
          "conclusions": ["p"]
        },
 NOTE ON TABLE SECTIONS: risk_opportunity and factor_style are NOT prose. They must be arrays of row objects (see schema above) because the renderer emits real HTML tables for them. Emit 4-6 risk_opportunity rows and 5-7 factor_style rows. A single prose string in these slots renders as a paragraph and loses the table formatting.
+NOTE ON FORWARD SIGNAL: forward_signal must restate the 5D, 20D and 60D percentages from the "## Forward Signal (Score → Expected Return)" table in latest-report.md, each horizon followed by its percentage. It is a read-only restatement of the source calibration and must NOT feed back into the AI score.
+PRICE VERIFICATION (BLOCKING): For every stock idea call
+GET https://api.138.2.69.165.sslip.io/equities/latest/<TICKER> and use the returned
+`close` as current_price and `date` as price_date. current_price must be within 3% of
+that close and price_date must equal that close date; entry_price must be within 25%
+of it. Any other price source is rejected by the blocking price audit. If the endpoint
+fails or the ticker is absent, HALT — do not substitute a remembered or estimated price.
+
+NOTE ON RESEARCH SECTIONS: macro_outlook, candidate_screen, stock_ideas and portfolio_risk are structured arrays, not prose.
+- macro_outlook: 6-8 rows covering Growth, Inflation, Fed policy, Rates/curve, Liquidity/credit, USD/commodities. Each row states the 1-3M view, 6-12M view, drivers and invalidation.
+- candidate_screen: 8-15 candidates drawn from this run's latest-report.md sector rankings, technicals, earnings/news and macro signals. Mark each Selected, Watchlist, Rejected or No-Trade with a reason. Exactly 3-5 must be Selected, and the Selected tickers must match stock_ideas.
+- stock_ideas: 3-5 ideas, at least 3 individual stocks (security_type='Stock'), at most 2 ETFs, at least one Sell/Reduce/Hold. Every field is required. current_price must equal the market API's latest verified close (within 3%) and price_date must equal that close date; entry_price must be within 25% of that verified close. upside_pct = (base_target/entry_price-1)*100, downside_pct = (bear_target/entry_price-1)*100, return_from_current_pct = (base_target/current_price-1)*100, risk_reward = upside_pct/abs(downside_pct). Buy/Add requires base > current, bull > base and bear < current; Sell/Reduce requires bull > current > base > bear. reassess marks the prior view (NEW for new ideas); verification is Verified/Estimate/Unverified. Each idea must cite at least one company-specific research source (filing, IR, earnings release or guidance) whose global note names the ticker or company and a fiscal period/year (e.g. 'COP Q3 2026 10-Q') and links to a specific filing/results page (SEC 10-Q/10-K/8-K or a dated earnings release). An IR homepage, a generic article or the market API/OpenAPI spec is rejected.
+- portfolio_risk: 4-6 rows covering concentration, factor, rates, macro and correlation risk, with sizing and hedge guidance. Distinguish model portfolio from actual holdings.
+
+The example row uses placeholders only. Do NOT copy any ticker, price or target from the example; every value must come from this run's research.
        "adjustments": {
-         "regime_score": <number 0-100, your independent judgment>,
+         "factor_scores": {"equity_trend": <0-100>, "equity_momentum": <0-100>, ... all 10 regime factors},
+         "weights": {"equity_trend": <points>, ... all 10 regime factors, sum = 100},
          "regime_label": "<short label, max 60 chars>",
-         "rationale": "<80-2000 chars explaining WHY you adjusted the regime and sectors based on your research>",
-         "sector_scores": {"<sector name>": <number 0-100>, ... all 11 sectors required}
+         "rationale": "<80-2000 chars: WHERE you moved factor scores and weights and WHY>",
+         "sector_scores": {"<sector name>": <0-100>, ... all 11 sectors required},
+         "sector_rationale": {"<sector name>": "<one line: why the AI rating differs from source>", ... optional}
        },
        "sources": [
          {"label": "<institution + document name>", "url": "https://...", "note": "<what this source supports, max 400 chars>"}
@@ -79,20 +111,23 @@ NOTE ON TABLE SECTIONS: risk_opportunity and factor_style are NOT prose. They mu
          {"value": <number>, "text": "<what the figure is>", "source": "<institution + document + date, or URL>"}
        ],
        "claims": []}
-      AI RE-RATING RULES:
-      - You MUST fill adjustments.regime_score and all 11 adjustments.sector_scores. These are YOUR independent judgments, not copies of the source values.
-      - Regime score: may deviate up to 25 points from source. Sector scores: up to 30 points from source. Larger deviations are rejected as unanchored.
-      - adjustments.rationale MUST cite the specific research evidence (news, data releases, spreads, positioning) that justifies your divergence from the mechanical score.
+      AI SCORING RULES — TWO STEPS, FULLY AUDITABLE:
+      - STEP 1 factor_scores: score all 10 regime factors yourself on 0-100. Each AI factor score may deviate at most 30 points from the source factor score in the evidence pack (regime_factors.<factor>).
+      - STEP 2 weights: weight those factors yourself in points. Weights must total 100 +/- 0.5. Each AI weight may deviate at most 10 points from the source weight in the evidence pack (regime_weights.<factor>).
+      - The AI regime score is COMPUTED as sum(factor_score x weight)/100. If you also set adjustments.regime_score it must equal that computation within 0.5; the computed value is what the report publishes. The computed score may deviate at most 25 points from the source rule-based regime score.
+      - Fill all 11 adjustments.sector_scores; each may deviate at most 30 points from the source sector score. Each sector needs its OWN 40-300 character rationale naming the sector-specific evidence; copy-pasted rationales across sectors are rejected. A uniform offset applied to every sector is rejected as un-researched.
+      - adjustments.rationale must name the factor scores and weights you moved and the specific research evidence (news, data releases, spreads, positioning) that justifies it. That is the audit trail published under the scorecard.
+      - The report headline carries the AI regime score as one number, with the source rule-based score in one small line beneath it. Do NOT reintroduce a CIO weighted scorecard or a separate AI re-rating table.
       - Every decimal in prose must exist in the evidence pack OR be one of your adjusted values OR be declared in claims[] as {"path": "<evidence path>", "value": <number>}.
       - Max 2000 chars per narrative section, 24000 total. Plain text only, no HTML tags.
       If latest-report.md changed since the probe (sha mismatch), re-run phase 1 and rebuild the narrative.
    e. PHASE 2 - render and publish:
       python scripts/generate_final_report.py --report data/latest-report.md --evidence-out <temp>/market_evidence.json --narrative <temp>/market_narrative.json --push
-      The script validates narrative AND adjustments against the frozen evidence pack, then renders all 24 sections with BOTH source-derived and AI-adjusted scores disclosed side by side (54A 16). On failure it HALTs and writes nothing: read the NARRATIVE FAIL lines, fix the JSON, re-run (max 2 fix attempts, then report the blocker).
+      The script validates the narrative AND the two-step scoring block against the frozen evidence pack, then renders the AI regime scorecard (AI score headline + source disclosure line + full factor/weight audit table), the forward signal, and the AI sector ratings table. It does NOT render a CIO weighted scorecard or a separate AI re-rating table. On failure it HALTs and writes nothing: read the NARRATIVE FAIL lines, fix the JSON, re-run (max 2 fix attempts, then report the blocker).
 
-2. VALIDATE (54A 15-17): require QC 0 failures; require all 24 anchors present; confirm 11 GICS sectors and 13 themes; verify AI-adjusted regime/sector values appear in the output.
+2. VALIDATE (54A 15-17): require QC 0 failures; require all 24 anchors present; confirm 11 GICS sectors and 13 themes; verify the AI regime score, AI sector ratings, the 5D/20D/60D forward signal, macro_outlook, candidate_screen, stock_ideas and portfolio_risk appear in the output; require 8-15 candidates, 3-5 selected ideas, fresh price dates, arithmetic consistency and company-specific citations.
 
-3. ADVERSARIAL REVIEW (54A 18): for each high-conviction idea give the strongest bear case, the catalyst, the return mechanism, and a measurable invalidation trigger. Challenge your own re-rating: if your adjusted score diverges materially from the mechanical score, document the specific evidence that makes the mechanical score wrong.
+3. ADVERSARIAL REVIEW (54A 18): for each stock idea give the strongest bear case, the catalyst, the return mechanism, and a measurable invalidation trigger; check that bull/base/bear targets and risk/reward are internally consistent. Challenge your own re-rating: if your adjusted score diverges materially from the mechanical score, document the specific evidence that makes the mechanical score wrong.
 
 4. FIX -> REVALIDATE (54A 19): check internal consistency across exec summary, scorecard, sector and theme rankings, ST/LT probabilities (each totals 100 percent), trade ideas, heat maps (net to 0), portfolio posture. Any residual inconsistency halts COMMIT.
 

@@ -52,6 +52,37 @@ POST_REPLACEMENTS = [
         "(local file written hourly by hourly_full_pipeline.ps1; the published "
         "GitHub Pages copy is a mirror and may lag, so it is NOT the baseline)",
     ),
+    # The doctrine still speaks in CIO terms. The report no longer carries a CIO
+    # layer: the headline is the AI regime score and the comparison is Source vs
+    # AI. Reframe the kept doctrine text without editing the authorized file.
+    ("11. EXECUTIVE SUMMARY — CENTRAL CIO VIEW", "11. EXECUTIVE SUMMARY — AI VIEW"),
+    ("Begin with a concise CIO View of approximately 120–180 words.",
+     "Begin with a concise AI View of approximately 120–180 words."),
+    ("12. CIO DASHBOARD", "12. AI REGIME SCORECARD"),
+    ("- Overall Regime Score",
+     "- AI Regime Score (one number; the source rule-based value is disclosed in one small line beneath)"),
+    ("This section should function as the one-minute CIO summary.",
+     "This section should function as the one-minute AI summary."),
+    ("CIO Dashboard\nCIO View", "AI Regime Scorecard\nAI View"),
+    (
+        "16. PYTHON VS CIO ATTRIBUTION (REVALIDATE cross-check) - The quantitative rules-based engine "
+        "(sector / factor / theme scores, Source Regime Score) and the CIO qualitative stance are DIFFERENT "
+        "methodologies and must never be conflated. When they disagree materially, explicitly disclose: "
+        "(a) the inputs each derives from, (b) the horizon each targets, (c) the risk-based override or "
+        "qualitative filter justifying the divergence, and (d) the expected reconciliation window. Never "
+        "present a score difference as a mathematical adjustment when the underlying methodologies are "
+        "incompatible. If no reconciliation is possible, disclose the residual disagreement.",
+        "16. SOURCE VS AI ATTRIBUTION (REVALIDATE cross-check) - The quantitative rules-based engine "
+        "(sector / factor / theme scores, Source Regime Score) and the AI two-step re-rating are DIFFERENT "
+        "methodologies and must never be conflated. The report headline carries the AI regime score as one "
+        "number, computed as sum(AI factor score x AI weight)/100, with the source rule-based score disclosed "
+        "in one small line beneath it. When they disagree materially, disclose in adjustments.rationale: "
+        "(a) the inputs each derives from, (b) which factor scores and weights the AI moved and by how much, "
+        "(c) the research evidence justifying each material divergence, and (d) the expected reconciliation "
+        "window. Never present the source score as a CIO layer, and never reintroduce a CIO weighted scorecard "
+        "or a separate AI re-rating table.",
+    ),
+    ("Executive Summary / CIO scorecard", "Executive Summary / AI regime scorecard"),
 ]
 
 RENDER_NOTE = """RENDERING AND PUBLICATION — THE BUILDER OWNS THE HTML
