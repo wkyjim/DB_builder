@@ -106,7 +106,7 @@ FUNDAMENTAL DATA INTEGRITY (BLOCKING):
 - ttm_eps_source must be a dated 10-Q/10-K/earnings URL listed in global sources.
 - If h1_eps_reported is provided, FY2027 EPS must equal H1 reported + h2_eps_forecast (2% tolerance). A full-year estimate below already-reported H1 is rejected. If H2 is below half of H1, h2_rationale must explain the collapse (e.g. export restriction, one-off charge).
 - If fy2027_eps_method is AI_FORECAST, provide fy_revenue, fy_net_margin_pct, fy_tax_rate_pct and fy_diluted_shares; EPS must equal revenue x margin x (1-tax) / diluted shares (5% tolerance).
-- valuation_provenance must label every material field VERIFIED_FACT, CONSENSUS, AI_FORECAST or UNAVAILABLE. verification=Verified is only allowed when TTM EPS, forward EPS, P/E history, revisions and targets are VERIFIED_FACT or CONSENSUS. Never label a card Verified just because its arithmetic passes.
+- valuation_provenance must label every material field VERIFIED_FACT, CONSENSUS, AI_FORECAST or UNAVAILABLE. A CONSENSUS label requires a real consensus_source URL; without one, label the field AI_FORECAST. verification=Verified is only allowed when TTM EPS, forward EPS, P/E history, revisions and targets are VERIFIED_FACT or CONSENSUS. Never label a card Verified just because its arithmetic passes.
 - If 5Y P/E stats are present, pe_history_source and pe_history_years>=5 are required. If eps_revision_pct is present, eps_revision_source is required. Otherwise use N/A.
 
 VALUATION (BLOCKING, deterministic): every idea must carry a full valuation block.
