@@ -55,3 +55,9 @@ Desktop.ini
 neon-api/
 market-dashboard/
 market-intelligence-telegram-bot/
+
+# Container-local authorized prompt mirror (NOT the skill source of truth)
+market-intelligence-report-prompt-authorized.txt
+
+# Local mobile status dashboard (generated, not for repo)
+project_status.html
