@@ -96,6 +96,11 @@ NOTE ON RESEARCH SECTIONS: macro_outlook, candidate_screen, stock_ideas and port
 - portfolio_risk: 4-6 rows covering concentration, factor, rates, macro and correlation risk, with sizing and hedge guidance. Distinguish model portfolio from actual holdings.
 
 - Every idea MUST populate revenue_ttm, operating_margin_pct, ps_ratio, pb_ratio and fy2027_revenue_consensus from fundamentals_web.py; N/A blocks publication. forward annual P/E only (no quarterly P/E).
+CALENDARS AND STOCK SPLITS (BLOCKING):
+- Economic dates: run `python scripts/calendar_web.py econ` and cite the Yahoo URL for any event you list. Yahoo's page returns the current session only; for future FOMC/CPI dates use federalreserve.gov / bls.gov and cite them. Never invent a date.
+- Stock splits: run `python scripts/calendar_web.py splits --from <60d ago> --to <today> --ticker <TICKER>`. If a split occurred within 120 days, all prices and per-share figures must be split-adjusted (Massive grouped daily already uses adjusted=true; SEC XBRL EPS is as reported post-split). Set split_adjusted=true and state the ratio in valuation_assumptions.
+- Earnings dates: `python scripts/calendar_web.py earnings --from <date> --to <date>` for catalysts.
+
 FORWARD CONSENSUS AND FUNDAMENTALS (BLOCKING):
 - Run `python scripts/fundamentals_web.py --ticker <TICKER>`; it now also returns `yahoo` (finance.yahoo.com/quote/<T>/analysis): eps_current_year, eps_next_year, revenue_current_year, revenue_next_year, plus CMC `latest` revenue / operating-margin / P-S / P-B.
 - Fill fy2027_eps_consensus, fy2028_eps_consensus, fy2027_revenue_consensus, fy2028_revenue_consensus from those values; set consensus_source to the Yahoo analysis URL. Fill revenue_ttm, operating_margin_pct, ps_ratio, pb_ratio from CMC `latest`; set fundamentals_source to the CMC page URL. Compute revenue_growth_2027_2028_pct = (FY28 revenue / FY27 revenue - 1) * 100.
