@@ -97,7 +97,7 @@ NOTE ON RESEARCH SECTIONS: macro_outlook, candidate_screen, stock_ideas and port
 
 - Every idea MUST populate revenue_ttm, operating_margin_pct, ps_ratio, pb_ratio and fy2027_revenue_consensus from fundamentals_web.py; N/A blocks publication. forward annual P/E only (no quarterly P/E).
 CALENDARS AND STOCK SPLITS (BLOCKING):
-- Economic dates: run `python scripts/calendar_web.py econ` and cite the Yahoo URL for any event you list. Yahoo's page returns the current session only; for future FOMC/CPI dates use federalreserve.gov / bls.gov and cite them. Never invent a date.
+- Economic dates: run `python scripts/calendar_web.py econ --from YYYY-MM-DD --to YYYY-MM-DD`; it renders the Yahoo range via r.jina.ai and returns the first day's events with a date field. Cite the Yahoo URL and still verify FOMC/CPI dates against federalreserve.gov / bls.gov. Never invent a date.
 - Stock splits: run `python scripts/calendar_web.py splits --from <60d ago> --to <today> --ticker <TICKER>`. If a split occurred within 120 days, all prices and per-share figures must be split-adjusted (Massive grouped daily already uses adjusted=true; SEC XBRL EPS is as reported post-split). Set split_adjusted=true and state the ratio in valuation_assumptions.
 - Earnings dates: `python scripts/calendar_web.py earnings --from <date> --to <date>` for catalysts.
 
