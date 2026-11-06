@@ -82,6 +82,8 @@ MANDATORY WORKFLOW (GENERATE -> VALIDATE -> ADVERSARIAL REVIEW -> FIX -> REVALID
        },
 NOTE ON TABLE SECTIONS: risk_opportunity and factor_style are NOT prose. They must be arrays of row objects (see schema above) because the renderer emits real HTML tables for them. Emit 4-6 risk_opportunity rows and 5-7 factor_style rows. A single prose string in these slots renders as a paragraph and loses the table formatting.
 NOTE ON FORWARD SIGNAL: forward_signal must restate the 5D, 20D and 60D percentages from the "## Forward Signal (Score → Expected Return)" table in latest-report.md, each horizon followed by its percentage. It is a read-only restatement of the source calibration and must NOT feed back into the AI score.
+FREEZE THE INPUT: at run start copy data/latest-report.md to .scratchpad/latest-report.frozen.md and use that frozen file for both --report and evidence. The hourly pipeline rewrites the live file mid-run, which breaks the sha match. Do not re-read the live file after freezing.
+
 PRICE VERIFICATION (BLOCKING): For every stock idea call
 GET https://api.138.2.69.165.sslip.io/equities/latest/<TICKER> and use the returned
 `close` as current_price and `date` as price_date. price_date must be the actual observation date of the price used; a one-trading-day lag behind the latest verified close is EXPECTED and must not be treated as a failure (Python allows up to 2 trading days and warns). current_price must be within 3% same-day (6% when lagging); entry_price must be within 25%
