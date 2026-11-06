@@ -100,6 +100,11 @@ CALENDARS AND STOCK SPLITS (BLOCKING):
 - Stock splits: run `python scripts/calendar_web.py splits --from <60d ago> --to <today> --ticker <TICKER>`. If a split occurred within 120 days, all prices and per-share figures must be split-adjusted (Massive grouped daily already uses adjusted=true; SEC XBRL EPS is as reported post-split). Set split_adjusted=true and state the ratio in valuation_assumptions.
 - Earnings dates: `python scripts/calendar_web.py earnings --from <date> --to <date>` for catalysts.
 
+VALUATION LABELS (BLOCKING):
+- In valuation_assumptions, "FY2027 EPS" must equal fy2027_eps_consensus and "FY2028 EPS" must equal fy2028_eps_consensus. Never shift a year (LLY: FY2027 35.35, FY2028 50.15; COP: FY2027 11.46, FY2028 10.92).
+- P/E on FY2027 must equal fwd_pe_2027. Never describe a rise from 23.4x to 30x as "compression"; expansion means the multiple rises.
+- Every target is EPS x P/E from unrounded inputs; display at 2 decimals but do not round the inputs.
+
 SECTOR ALLOCATION (BLOCKING):
 - `sector_allocation` must list exactly 11 unique GICS sectors with benchmark_weight, portfolio_weight, active_weight and a sizing rationale. Benchmark and portfolio weights each sum to 100; active_weight = portfolio - benchmark; active weights sum to 0. Include unchanged sectors at 0 active weight (do not omit them). Portfolio weight 0 is allowed only with an explicit rationale. Each row's rationale must be specific to that sector (at least 6 distinct sentences; repeated generic text blocks).
 
