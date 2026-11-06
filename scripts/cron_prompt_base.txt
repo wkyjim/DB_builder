@@ -100,6 +100,11 @@ CALENDARS AND STOCK SPLITS (BLOCKING):
 - Stock splits: run `python scripts/calendar_web.py splits --from <60d ago> --to <today> --ticker <TICKER>`. If a split occurred within 120 days, all prices and per-share figures must be split-adjusted (Massive grouped daily already uses adjusted=true; SEC XBRL EPS is as reported post-split). Set split_adjusted=true and state the ratio in valuation_assumptions.
 - Earnings dates: `python scripts/calendar_web.py earnings --from <date> --to <date>` for catalysts.
 
+RESEARCH DEPTH (BLOCKING):
+- thesis >= 160 chars; peer_comparison >= 100 chars naming at least two peers and their multiples; sector_context >= 100 chars explaining why this is a Buy/Add when its GICS sector rating is low (e.g. NVDA/MSFT Buy vs Technology 26); conclusion >= 80 chars; contrary >= 80 chars; catalysts must list at least two dated events.
+- pe_history_basis must equal eps_basis (GAAP or non-GAAP). Historical and forward P/E may only be compared on the same EPS definition and period.
+- Official dates: December 2026 FOMC is Dec 8-9; October 2026 CPI is released Nov 10. Verify at federalreserve.gov / bls.gov; a wrong date blocks publication.
+
 FORWARD CONSENSUS AND FUNDAMENTALS (BLOCKING):
 - Run `python scripts/fundamentals_web.py --ticker <TICKER>`; it now also returns `yahoo` (finance.yahoo.com/quote/<T>/analysis): eps_current_year, eps_next_year, revenue_current_year, revenue_next_year, plus CMC `latest` revenue / operating-margin / P-S / P-B.
 - Fill fy2027_eps_consensus, fy2028_eps_consensus, fy2027_revenue_consensus, fy2028_revenue_consensus from those values; set consensus_source to the Yahoo analysis URL. Fill revenue_ttm, operating_margin_pct, ps_ratio, pb_ratio from CMC `latest`; set fundamentals_source to the CMC page URL. Compute revenue_growth_2027_2028_pct = (FY28 revenue / FY27 revenue - 1) * 100.
