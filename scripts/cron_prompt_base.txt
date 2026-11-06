@@ -108,7 +108,7 @@ VALUATION LABELS (BLOCKING):
 - Every target is EPS x P/E from unrounded inputs; display at 2 decimals but do not round the inputs.
 
 SECTOR ALLOCATION (BLOCKING):
-- `sector_allocation` must list exactly 11 unique GICS sectors with benchmark_weight, portfolio_weight, active_weight and a sizing rationale. Benchmark and portfolio weights each sum to 100; active_weight = portfolio - benchmark; active weights sum to 0. Include unchanged sectors at 0 active weight (do not omit them). Portfolio weight 0 is allowed only with an explicit rationale. Each row's rationale must be specific to that sector (at least 6 distinct sentences; repeated generic text blocks).
+- `sector_allocation` must contain 22 rows: 11 GICS sectors for horizon ST and the same 11 for horizon LT. Each row has horizon, sector, benchmark_weight, portfolio_weight, active_weight and a sizing rationale. Within each horizon, benchmark and portfolio weights sum to 100, active = portfolio - benchmark, and active sums to 0. Include unchanged sectors at 0 active weight in both horizons (do not omit them). Portfolio weight 0 is allowed only with an explicit rationale. Each row's rationale must be specific to that sector (at least 6 distinct sentences; repeated generic text blocks).
 
 RESEARCH DEPTH (BLOCKING):
 - thesis >= 160 chars; peer_comparison >= 100 chars naming at least two peers and their multiples; sector_context >= 100 chars explaining why this is a Buy/Add when its GICS sector rating is low (e.g. NVDA/MSFT Buy vs Technology 26); conclusion >= 80 chars; contrary >= 80 chars; catalysts must list at least two dated events.
