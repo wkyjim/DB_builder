@@ -123,6 +123,16 @@ FORWARD CONSENSUS AND FUNDAMENTALS (BLOCKING):
 - Fill fy2027_eps_consensus, fy2028_eps_consensus, fy2027_revenue_consensus, fy2028_revenue_consensus from those values; set consensus_source to the Yahoo analysis URL. Fill revenue_ttm, operating_margin_pct, ps_ratio, pb_ratio from CMC `latest`; set fundamentals_source to the CMC page URL. Compute revenue_growth_2027_2028_pct = (FY28 revenue / FY27 revenue - 1) * 100.
 - Python re-fetches Yahoo and blocks EPS/revenue consensus that differs by more than 5%; a CONSENSUS label without a Yahoo source fails.
 
+CANONICAL FUNDAMENTALS — COPY EXACTLY (BLOCKING)
+
+TTM EPS and quarterly sums below are SEC XBRL verified. Use these exact values in ttm_eps_diluted and ttm_eps_quarters; never rebuild or re-round them. Cite the listed source.
+
+COP: TTM 9.53 = 1.18 + 1.78 + 3.23 + 3.34; H1 6.57; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0001163165.json ; CMC https://companiesmarketcap.com/hkd/conocophillips/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/COP/analysis/
+COST: TTM 20.76 = 4.50 + 4.58 + 4.93 + 6.75; H1 9.51; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000909832.json ; CMC https://companiesmarketcap.com/hkd/costco/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/COST/analysis/
+LLY: TTM 30.81 = 7.39 + 8.26 + 7.94 + 7.22; H1 15.16; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000059478.json ; CMC https://companiesmarketcap.com/hkd/eli-lilly/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/LLY/analysis/
+MSFT: TTM 19.15 = 5.16 + 4.27 + 4.80 + 4.92; H1 9.19; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000789019.json ; CMC https://companiesmarketcap.com/hkd/microsoft/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/MSFT/analysis/
+XOM: TTM NOT AVAILABLE — SEC quarterly series has gaps (no 2025-Q4 and no 2026-Q1). Do NOT select XOM; choose another ticker.
+
 HISTORICAL P/E AND EPS HISTORY (BLOCKING):
 - Run `python scripts/fundamentals_web.py --ticker <TICKER>` before writing each idea. It returns pe_stats (5Y median/min/max/percentile), eps_history, revenue_history and operating_margin_history from companiesmarketcap.com.
 - Set pe_5y_median/min/max/percentile from that output, and set pe_history_source to the returned pe-ratio URL (must contain companiesmarketcap.com). Python re-fetches and blocks values that differ by more than 10% (median), 15% (min/max) or 20 points (percentile).
