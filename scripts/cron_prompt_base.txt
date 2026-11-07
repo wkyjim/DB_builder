@@ -133,6 +133,8 @@ LLY: TTM 30.81 = 7.39 + 8.26 + 7.94 + 7.22; H1 15.16; SEC https://data.sec.gov/a
 MSFT: TTM 19.15 = 5.16 + 4.27 + 4.80 + 4.92; H1 9.19; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000789019.json ; CMC https://companiesmarketcap.com/hkd/microsoft/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/MSFT/analysis/
 FY2026 consensus is N/A for COP and LLY; never copy FY2027 into FY2026 — a duplicated FY2026 blocks publication.
 
+REGN: TTM 45.21 = 7.78 + 6.75 + 12.23 + 18.45; H1 30.68; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000872589.json ; CMC https://companiesmarketcap.com/hkd/regeneron/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/REGN/analysis/
+NVDA: TTM 7.91 = 1.30 + 1.76 + 2.39 + 2.46; H1 4.85; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0001045810.json ; CMC https://companiesmarketcap.com/hkd/nvidia/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/NVDA/analysis/
 XOM: TTM NOT AVAILABLE — SEC quarterly series has gaps (no 2025-Q4 and no 2026-Q1). Do NOT select XOM; choose another ticker.
 
 HISTORICAL P/E AND EPS HISTORY (BLOCKING):
