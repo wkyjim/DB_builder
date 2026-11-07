@@ -24,6 +24,7 @@ EVIDENCE DENSITY AND SPECIFICITY (quality bar)
 The report must read like an experienced CIO who has limited time and must decide where to allocate risk. Vague, directional prose is a defect. Every narrative section must carry concrete evidence:
 - Anchor claims to a DATE ("on 30 October", "Q3 2026", "September CPI").
 - Quote SPECIFIC figures ("Nasdaq fell 2.86%", "core PCE 3.1%", "target 3.75-4.00%").
+- Always name the Nasdaq index explicitly: "Nasdaq Composite" (^IXIC). Never write bare "Nasdaq"; use "Nasdaq 100" only when discussing NDX/QQQ, and never cite both in the same report.
 - State the CAUSAL CHAIN explicitly (what happened -> why it matters -> what it implies).
 - Name a TRADEABLE EXPRESSION where relevant ("RSP over QQQ", "short duration", "quality over beta").
 Numbers that come from outside latest-report.md MUST be declared in external_claims[] with their source. The validator accepts those values and rejects undeclared ones, so declaring them is what allows precision. Do NOT soften an exact figure into "near", "around" or "roughly" to dodge validation - declare it instead.
