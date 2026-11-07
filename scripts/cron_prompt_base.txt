@@ -131,6 +131,8 @@ COP: TTM 9.53 = 1.18 + 1.78 + 3.23 + 3.34; H1 6.57; SEC https://data.sec.gov/api
 COST: TTM 20.76 = 4.50 + 4.58 + 4.93 + 6.75; H1 9.51; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000909832.json ; CMC https://companiesmarketcap.com/hkd/costco/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/COST/analysis/
 LLY: TTM 30.81 = 7.39 + 8.26 + 7.94 + 7.22; H1 15.16; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000059478.json ; CMC https://companiesmarketcap.com/hkd/eli-lilly/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/LLY/analysis/
 MSFT: TTM 19.15 = 5.16 + 4.27 + 4.80 + 4.92; H1 9.19; SEC https://data.sec.gov/api/xbrl/companyfacts/CIK0000789019.json ; CMC https://companiesmarketcap.com/hkd/microsoft/pe-ratio/ ; Yahoo https://finance.yahoo.com/quote/MSFT/analysis/
+FY2026 consensus is N/A for COP and LLY; never copy FY2027 into FY2026 — a duplicated FY2026 blocks publication.
+
 XOM: TTM NOT AVAILABLE — SEC quarterly series has gaps (no 2025-Q4 and no 2026-Q1). Do NOT select XOM; choose another ticker.
 
 HISTORICAL P/E AND EPS HISTORY (BLOCKING):
