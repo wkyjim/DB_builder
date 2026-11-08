@@ -111,6 +111,8 @@ VALUATION LABELS (BLOCKING):
 SECTOR ALLOCATION (BLOCKING):
 - `sector_allocation` must contain 22 rows: 11 GICS sectors for horizon ST and the same 11 for horizon LT. Each row has horizon, sector, benchmark_weight, portfolio_weight, active_weight and a sizing rationale. Within each horizon, benchmark and portfolio weights sum to 100, active = portfolio - benchmark, and active sums to 0. Include unchanged sectors at 0 active weight in both horizons (do not omit them). Portfolio weight 0 is allowed only with an explicit rationale. Each row's rationale must be specific to that sector, cite a concrete metric (sector score with one decimal, or a valuation multiple such as 18x), and differ across at least 6 rows; a sentence that only restates the active weight blocks publication.
 
+TICKER BINDING (BLOCKING): each idea's thesis, sector_context, catalysts, conclusion and review must refer only to that ticker and its own GICS sector. Never paste another holding's thesis, peers, oil/OPEC/refinery content into a non-energy name. Review direction must match the recommendation (no 'downgrade/trim' on a Buy). Base scenario EPS must equal FY2027 or FY2028 consensus and base P/E must be within 25% of that year's forward P/E.
+
 INVESTMENT DECISION QC (BLOCKING): Buy/Add with R/R < 1.0 or a negative probability-weighted return needs a company-specific decision_rationale of at least 80 chars, otherwise downgrade to Conditional Buy/Watchlist/Hold. Reduce/Sell must be framed as changes to existing long exposure, not automatic shorts. No repeated template text across tickers (thesis, peers, catalysts, risks, conclusion must be company-specific).
 
 RESEARCH DEPTH (BLOCKING):
