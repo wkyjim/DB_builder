@@ -1,3 +1,28 @@
+AUTHORITATIVE PIPELINE — THIS OVERRIDES ANY LATER SECTION THAT TELLS YOU TO AUTHOR A FULL NARRATIVE JSON
+
+You must use the hybrid builder. Do NOT write 27 sections by hand.
+
+1. Freeze data/latest-report.md to .scratchpad/latest-report.frozen.md once and use only that file.
+2. Write .scratchpad/ideas.json with this shape:
+   {"ideas":[{"ticker":"...","sector":"...","recommendation":"Buy|Hold|Reduce|Watchlist",
+              "research":{thesis, peer_comparison, sector_context, catalysts, risks, conclusion,
+                          decision_rationale, assumptions, contrary, why_vs_alternatives,
+                          entry_condition, exit, invalidation, opposing},
+              "sources":["https://..."],
+              "scenario":{"bull":{"eps":0,"pe":0,"prob":0.25,"rationale":"40+ chars"},
+                          "base":{"eps":0,"pe":0,"prob":0.5,"rationale":"40+ chars"},
+                          "bear":{"eps":0,"pe":0,"prob":0.25,"rationale":"40+ chars"}}}],
+    "candidate_screen":[...8-15 rows...],
+    "factor_scores":{...},"factor_weights":{...},"sector_scores":{...},
+    "benchmark_weights":{...11 GICS...},
+    "portfolio_weights":{"ST":{...11...},"LT":{...11...}}}
+   Do not supply P/E, targets, returns, allocation active weights or scores that Python can compute.
+3. Run: python scripts/validate_ideas.py --ideas .scratchpad/ideas.json --template data/narrative_template.json --evidence .scratchpad/market_evidence.json
+4. Fix every reported error and rerun until it prints IDEAS VALID (exit 0). Each bull/base/bear needs a 40+ char rationale and bull > base > bear.
+5. Run: python scripts/build_from_ideas.py --ideas .scratchpad/ideas.json --template data/narrative_template.json --evidence .scratchpad/market_evidence.json --out .scratchpad/narrative.json
+6. Run: python scripts/generate_final_report.py --report .scratchpad/latest-report.frozen.md --evidence-out .scratchpad/market_evidence.json --narrative .scratchpad/narrative.json --push
+7. FAILURE POLICY: if steps 3-6 fail, HALT. Never fall back to an old narrative or template, never publish a degraded report, never hand-edit the HTML.
+
 Generate the market-intelligence HTML report in the AI-FIRST structure: AI Regime Scorecard (AI score headline + one-line source disclosure + full factor/weight audit table), Forward Signal restatement, AI Sector Ratings table (AI values only, each row with its own rationale) plus a separate Source vs AI sector comparison table, and the 20 remaining narrative sections. The AI re-rating is a TWO-STEP calculation: AI factor scores x AI weights.
 
 WORKSPACE
@@ -113,6 +138,8 @@ SECTOR ALLOCATION (BLOCKING):
 
 TICKER BINDING (BLOCKING): each idea's thesis, sector_context, catalysts, conclusion and review must refer only to that ticker and its own GICS sector. Never paste another holding's thesis, peers, oil/OPEC/refinery content into a non-energy name. Review direction must match the recommendation (no 'downgrade/trim' on a Buy). Base scenario EPS must equal FY2027 or FY2028 consensus and base P/E must be within 25% of that year's forward P/E.
 
+AI SELF-VALIDATION (BLOCKING): after writing ideas.json, run `python scripts/validate_ideas.py --ideas <ideas.json> --template <template> --evidence <evidence>` and fix every reported error, then rerun until it prints IDEAS VALID (exit 0). Never publish with an invalid ideas file. Each bull/base/bear case needs a 40+ char rationale (drivers and what must happen); scenario ordering must satisfy bull > base > bear; a Buy with R/R < 1 needs an 80+ char decision_rationale or a downgrade.
+
 INVESTMENT DECISION QC (BLOCKING): Buy/Add with R/R < 1.0 or a negative probability-weighted return needs a company-specific decision_rationale of at least 80 chars, otherwise downgrade to Conditional Buy/Watchlist/Hold. Reduce/Sell must be framed as changes to existing long exposure, not automatic shorts. No repeated template text across tickers (thesis, peers, catalysts, risks, conclusion must be company-specific).
 
 RESEARCH DEPTH (BLOCKING):
@@ -128,6 +155,8 @@ FORWARD CONSENSUS AND FUNDAMENTALS (BLOCKING):
 CANONICAL FUNDAMENTALS (BLOCKING)
 
 TTM EPS, the four quarterly values and H1 are auto-filled from SEC XBRL by the generator (enrich_ideas) for every ticker you select. Do not reconstruct them, do not import values from another ticker, and do not hardcode a fixed ticker list. Select any companies the research supports; if a ticker's SEC quarterly series has a gap, the idea is blocked — choose another ticker. FY2026 consensus is often N/A; never copy FY2027 into FY2026.
+
+SOURCE FREEZE (BLOCKING): at the start, copy data/latest-report.md to .scratchpad/latest-report.frozen.md ONCE and use only that frozen path for evidence AND narrative. Never re-read data/latest-report.md after freezing; its sha must match the narrative's source.latest_report_sha256.
 
 HISTORICAL P/E AND EPS HISTORY (BLOCKING):
 - Run `python scripts/fundamentals_web.py --ticker <TICKER>` before writing each idea. It returns pe_stats (5Y median/min/max/percentile), eps_history, revenue_history and operating_margin_history from companiesmarketcap.com.
