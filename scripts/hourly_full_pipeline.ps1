@@ -261,6 +261,14 @@ try {
             $failOutput = if (Test-Path (Join-Path $Root 'reports\state\logs\pgSQL_equities_auto.log')) { Get-Content (Join-Path $Root 'reports\state\logs\pgSQL_equities_auto.log') -Raw -ErrorAction SilentlyContinue } else { 'No log' }
             return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('FAIL: pgSQL_equities_auto failed after 3 attempts | ' + $failOutput); ExitCode=-1; Error=$null }
         }
+        if ((Get-Date).DayOfWeek -eq 'Saturday') {
+            try {
+                $spOut = & $Python (Join-Path $Root 'scripts\update_sp500_constituents.py') --weekly 2>&1
+                $attemptOutput = "$attemptOutput`nS&P 500 membership: $spOut"
+            } catch {
+                $attemptOutput = "$attemptOutput`nS&P 500 membership warning: $($_.Exception.Message)"
+            }
+        }
         $sw.Stop()
         [pscustomobject]@{ Branch='A_equities'; Ok=$true; Seconds=$sw.Elapsed.TotalSeconds; ExitCode=0; Error=$null; Output=$attemptOutput }
     } -ArgumentList $Root, $Python, $Log, $DryRun

@@ -77,7 +77,7 @@ def score_all(data: dict) -> dict:
     }
     from db_builder.market_strength import compute_market_strength
 
-    market_strength = compute_market_strength(technicals)
+    market_strength = compute_market_strength(technicals, data.get("sp500_technicals") or None)
     regime = compute_regime(technicals, macro, news_rows, market_strength, etf_flow)
     confidence = compute_confidence(regime, market_strength, technicals, macro, news_rows)
     sectors = rank_sectors(technicals, news_signals, flow_by_exposure)
@@ -145,7 +145,7 @@ def _regime_score_rows(regime: dict) -> list[list]:
     interpretations = {
         "equity_trend": "Core equity ETFs versus moving averages.",
         "equity_momentum": "5D/20D/60D return momentum across SPY, QQQ, IWM, and SMH.",
-        "market_breadth": "Participation breadth from tracked equity/ETF rows.",
+        "market_breadth": "S&P 500 constituent breadth using index membership as of the observation date.",
         "volatility": "VIX level and change; higher score means calmer volatility conditions.",
         "rates_yield_curve": "Treasury yield pressure and curve shape; higher score means less rates pressure.",
         "credit_proxy": "Credit-market proxy; currently neutral when no direct spread signal is available.",

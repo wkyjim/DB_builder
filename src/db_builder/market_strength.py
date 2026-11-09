@@ -137,10 +137,10 @@ def missing_indicator_warnings(rows: list[dict]) -> list[str]:
     return warnings
 
 
-def compute_market_strength(rows: list[dict]) -> dict:
+def compute_market_strength(rows: list[dict], breadth_rows: list[dict] | None = None) -> dict:
     indices = [row_by_ticker(rows, ticker) for ticker in ["SPY", "QQQ", "IWM", "SMH"]]
     indices = [row for row in indices if row]
-    breadth = market_breadth(rows)
+    breadth = market_breadth(breadth_rows if breadth_rows else rows)
     decomposition = {
         "indices_above_moving_averages": avg([score_above_ma(row) for row in indices]),
         "sp500_trend": score_above_ma(row_by_ticker(rows, "SPY")),

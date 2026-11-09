@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pandas as pd
 from sqlalchemy import text
@@ -219,19 +219,22 @@ def fetch_economic_snapshot(engine, *, series_ids: list[str] | None = None) -> p
     return _safe_read_sql(engine, sql, {"series_ids": selected})
 
 
-def fetch_sp500_constituent_technicals(engine) -> pd.DataFrame:
+def fetch_sp500_constituent_technicals(engine, as_of: date | None = None) -> pd.DataFrame:
+    as_of = as_of or date.today()
     sql = """
         WITH active_constituents AS (
-            SELECT ticker, company_name, sector, industry
-            FROM public.security_classification
-            WHERE is_sp500 = true
-              AND is_active = true
+            SELECT DISTINCT m.ticker, m.company_name, c.sector, c.industry
+            FROM public.sp500_membership_history m
+            LEFT JOIN public.security_classification c ON c.ticker = m.ticker
+            WHERE m.start_date <= :as_of
+              AND (m.end_date IS NULL OR m.end_date > :as_of)
         ),
         latest_raw AS (
             SELECT DISTINCT ON (ticker)
                 ticker, name, date, close, pct_chg, volume, turnover, mkt_cap
             FROM public.us_equities
             WHERE ticker IN (SELECT ticker FROM active_constituents)
+              AND date <= :as_of
             ORDER BY ticker, date DESC
         ),
         latest_indicators AS (
@@ -244,6 +247,7 @@ def fetch_sp500_constituent_technicals(engine) -> pd.DataFrame:
                 return_5d, return_20d, return_60d, volatility_20d
             FROM public.us_equities_indicators
             WHERE ticker IN (SELECT ticker FROM active_constituents)
+              AND date <= :as_of
             ORDER BY ticker, date DESC
         )
         SELECT
@@ -281,7 +285,7 @@ def fetch_sp500_constituent_technicals(engine) -> pd.DataFrame:
         LEFT JOIN latest_indicators i ON i.ticker = c.ticker
         ORDER BY c.sector, c.ticker
     """
-    return _safe_read_sql(engine, sql)
+    return _safe_read_sql(engine, sql, {"as_of": as_of})
 
 
 def collect_rule_based_inputs(engine, *, window_hours: int) -> dict:
