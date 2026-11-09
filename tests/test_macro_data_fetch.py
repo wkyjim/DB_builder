@@ -611,7 +611,7 @@ def test_coverage_summary_all_provider_success():
     assert summary.coverage_pct == 100.0
     # Phase A (additive): the official CMT series adds a third provider.
     assert summary.provider_failure_counts == (
-        ("investing.com", 0), ("oilpriceapi.com", 0),
+        ("investing.com", 0),
         ("treasury.gov", 0), ("yfinance", 0))
     assert summary.exit_code == 0
 
@@ -1311,15 +1311,13 @@ class TestOilPriceAPIQuotaThrottle:
         """Eight pages fetched ~800 rows to use ~10 of them."""
         assert macro_data_fetch.OILPRICEAPI_HISTORY_PAGES == 1
 
-    def test_process_symbol_raises_skip_when_throttled(self, engine):
-        macro_data_fetch.oilpriceapi_record_call(engine, "BRENT_CRUDE_USD", 1)
-        with pytest.raises(macro_data_fetch.OilPriceAPISkipped) as exc:
+    def test_process_symbol_rejects_disabled_provider(self, engine):
+        with pytest.raises(ValueError, match="not enabled"):
             macro_data_fetch.process_oilpriceapi_symbol(
                 "BRENT_OILPRICE",
                 {"name": "Brent", "asset_type": "oil_price"},
                 engine=engine,
             )
-        assert "throttled for BRENT_CRUDE_USD" in str(exc.value)
 
     def test_min_interval_is_ninety_minutes(self):
         assert macro_data_fetch.OILPRICEAPI_MIN_INTERVAL_SECONDS == 90 * 60

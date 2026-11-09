@@ -75,7 +75,7 @@ EXCHANGE_BY_SYMBOL: Dict[str, str] = {
 CBOE_ICE_SYMBOLS: Set[str] = {"^VIX", "^SKEW", "^MOVE", "^FVX", "^TNX", "^TYX"}
 
 CRYPTO_SYMBOLS: Set[str] = {"BTC-USD", "ETH-USD"}
-OILPRICEAPI_SYMBOLS: Set[str] = {"BRENT_OILPRICE", "WTI_OILPRICE"}
+OILPRICEAPI_SYMBOLS: Set[str] = set()
 
 FX_SYMBOLS: Set[str] = {
     "AUDUSD=X", "CHFUSD=X", "CNY=X", "EURUSD=X", "GBPUSD=X",
@@ -194,6 +194,7 @@ SOURCE_DEF_YFINANCE_FX_DAILY = "YFINANCE_FX_DAILY"
 SOURCE_DEF_YFINANCE_CASH_EQUITY_DAILY = "YFINANCE_CASH_EQUITY_DAILY"
 SOURCE_DEF_MASSIVE_UST_EOD = "MASSIVE_UST_EOD"
 SOURCE_DEF_OILPRICEAPI_SPOT = "OILPRICEAPI_SPOT_INDICATIVE_USD_PER_BARREL"
+SOURCE_DEF_FRED_DAILY = "FRED_DAILY"
 
 # Per-symbol *primary* historical source definition. This records which source
 # definition the stored series belongs to; it is not itself the convention.
@@ -233,9 +234,9 @@ SOURCE_DEFINITION_BY_SYMBOL: Dict[str, str] = {
     "US5YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
     "US10YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
     "US30YT_MASSIVE": SOURCE_DEF_MASSIVE_UST_EOD,
-    # New independent OilPriceAPI spot price series (additive, not replacement)
-    "BRENT_OILPRICE": SOURCE_DEF_OILPRICEAPI_SPOT,
-    "WTI_OILPRICE": SOURCE_DEF_OILPRICEAPI_SPOT,
+    # FRED daily breakeven inflation series.
+    "T5YIE": SOURCE_DEF_FRED_DAILY,
+    "T10YIE": SOURCE_DEF_FRED_DAILY,
 }
 
 # Every source definition this build recognises. A candidate carrying an

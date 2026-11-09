@@ -324,6 +324,13 @@ try {
         $errText = $p.StandardError.ReadToEnd()
         "$outText`n$errText" | Out-File -FilePath $branchLog -Encoding utf8 -Force
         $out = $outText
+        # FRED breakeven inflation (T5YIE/T10YIE): release-gated, no-op when current.
+        try {
+            $fredOut = & $Python (Join-Path $Root 'scripts\fred_macro_fetch.py') --daily 2>&1
+            $out = "$out`n$fredOut"
+        } catch {
+            $out = "$out`nFRED macro sync warning: $($_.Exception.Message)"
+        }
         $sw.Stop()
         [pscustomobject]@{ Branch='B_macro'; Ok=($p.ExitCode -eq 0); Seconds=$sw.Elapsed.TotalSeconds; Output=$out; ExitCode=$p.ExitCode; Error=$null }
     } -ArgumentList $Root, $Python, $MacroTimeoutSeconds, $DryRun

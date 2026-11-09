@@ -343,7 +343,6 @@ APPROVED_MACRO_SYMBOLS = frozenset(
         "US30YT=X", "US2YT_CMT", "US3YT_CMT", "US5YT_CMT", "US7YT_CMT",
         "US10YT_CMT", "US20YT_CMT", "US30YT_CMT", "HK50", "KOR200c1",
         "CIHc1", "ES=F", "NQ=F", "YM=F", "RTY=F", "NIY=F", "GC=F", "SI=F",
-        "BRENT_OILPRICE", "WTI_OILPRICE",
         "HG=F", "NG=F", "BZ=F", "CL=F", "BTC-USD", "ETH-USD", "AUDUSD=X",
         "CHFUSD=X", "CNY=X", "EURUSD=X", "GBPUSD=X", "HKD=X", "JPY=X",
         "NZDUSD=X", "SGD=X", "^FVX", "^TNX", "^TYX", "DX-Y.NYB",
@@ -367,10 +366,7 @@ ASIA_INDEX_YFINANCE_FALLBACK_SYMBOLS = frozenset(ASIA_INDEX_YFINANCE_FALLBACK_MA
 # OilPriceAPI spot/indicative series. Deliberately a SEPARATE provider phase:
 # these are spot indicative USD/barrel quotes, NOT futures settlement prices, so
 # they must never be mixed with BZ=F / CL=F (yfinance futures).
-OILPRICEAPI_MAPPING = {
-    "BRENT_OILPRICE": "BRENT_CRUDE_USD",
-    "WTI_OILPRICE": "WTI_USD",
-}
+OILPRICEAPI_MAPPING = {}
 OILPRICEAPI_ASSETS = frozenset(OILPRICEAPI_MAPPING)
 OILPRICEAPI_BASE_URL = "https://api.oilpriceapi.com/v1"
 OILPRICEAPI_RATE_LIMIT_SECONDS = 2.0
@@ -602,9 +598,6 @@ ASSETS = [
     ("SI=F", "Silver Future", "futures"),
     ("NG=F", "Natural Gas Future", "futures"),
 
-    # OilPriceAPI spot/indicative series (distinct from the futures symbols above).
-    ("BRENT_OILPRICE", "Brent Crude Oil Spot (OilPriceAPI)", "oil_price"),
-    ("WTI_OILPRICE", "WTI Crude Oil Spot (OilPriceAPI)", "oil_price"),
 
     ("^FVX", "Treasury Yield 5 Years", "ust_yield"),
     ("^TNX", "Treasury Yield 10 Years", "ust_yield"),
@@ -766,11 +759,6 @@ SYMBOL_CLOSE_MAP = {
     "HG=F": {"tz": "America/New_York", "close_time": "17:00"},
     "SI=F": {"tz": "America/New_York", "close_time": "17:00"},
     "NG=F": {"tz": "America/New_York", "close_time": "17:00"},
-
-    # OilPriceAPI is an indicative spot quote, not an exchange-traded session;
-    # US/Eastern is used only as the reference for "is the quote current".
-    "BRENT_OILPRICE": {"tz": "America/New_York", "close_time": "17:00"},
-    "WTI_OILPRICE": {"tz": "America/New_York", "close_time": "17:00"},
 
     "^FVX": {"tz": "America/New_York", "close_time": "16:00"},
     "^TNX": {"tz": "America/New_York", "close_time": "16:00"},
