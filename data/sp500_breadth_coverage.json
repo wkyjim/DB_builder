@@ -1,0 +1,16 @@
+{
+  "start": "2025-01-02",
+  "end": "2026-11-06",
+  "trading_dates": 464,
+  "constituents_min": 503,
+  "constituents_max": 525,
+  "coverage_avg_pct": 94.92,
+  "coverage_min_pct": 93.12,
+  "dates_coverage_below_90_pct": 0,
+  "missing_observations_total": 12331,
+  "missing_first_date": 36,
+  "missing_last_date": 0,
+  "first_pct_above_50d": "2025-03-17",
+  "first_pct_above_200d": "2025-10-20",
+  "first_pct_positive_20d": "2025-02-03"
+}
