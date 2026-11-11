@@ -1,0 +1,118 @@
+{
+  "registry_version": "phase5e-2026-11-09",
+  "created_at_utc": "2026-11-11T11:57:57.332321+00:00",
+  "as_of_date": "2026-11-09",
+  "training_cutoff": "2026-11-02",
+  "data_source": "public.research_core_hist",
+  "target": "future 5D realized volatility: std(spy ret[t+1..t+5], ddof=1)*sqrt(252)",
+  "features": [
+    "vixcls",
+    "spy_vol_20d",
+    "iwm_vol_20d",
+    "dd252",
+    "credit_proxy",
+    "spy_ret_20d"
+  ],
+  "scaler": {
+    "mean": {
+      "vixcls": 18.052306721363205,
+      "spy_vol_20d": 0.14450209355143373,
+      "iwm_vol_20d": 0.1967544028006035,
+      "dd252": -0.036079108837099576,
+      "credit_proxy": 0.0009108246656453466,
+      "spy_ret_20d": 0.0112469152246242
+    },
+    "std": {
+      "vixcls": 6.830078165866911,
+      "spy_vol_20d": 0.09452427477816583,
+      "iwm_vol_20d": 0.09734691994272775,
+      "dd252": 0.05134580062772965,
+      "credit_proxy": 0.016141136780151034,
+      "spy_ret_20d": 0.04217646598643371
+    }
+  },
+  "vol_model": {
+    "version": "vol5_ols_v1",
+    "intercept": 0.1358887908280251,
+    "coefficients": {
+      "vixcls": 0.07134617712372732,
+      "spy_vol_20d": 0.012715831504178706,
+      "iwm_vol_20d": -0.022751654783501957,
+      "dd252": -0.009032278473005334,
+      "credit_proxy": -0.008143951917244038,
+      "spy_ret_20d": -0.01249188569122468
+    },
+    "train_n": 3169,
+    "oos_2018_2026_r2": 0.4826,
+    "oos_mae": 0.0564,
+    "oos_rmse": 0.0878
+  },
+  "spike_model": {
+    "version": "spike_logit_v1",
+    "intercept": -1.7244833755716007,
+    "coefficients": {
+      "vixcls": 1.1925169752559592,
+      "spy_vol_20d": -0.11165106626581377,
+      "iwm_vol_20d": -0.20504620049377217,
+      "dd252": -0.4898700740944382,
+      "credit_proxy": -0.06071121210802693,
+      "spy_ret_20d": -0.28660211613946257
+    },
+    "threshold": 0.18495572148412626,
+    "threshold_rule": "train-only 80th percentile of future 5D volatility",
+    "train_n": 3169
+  },
+  "baselines": {
+    "hist20": {
+      "version": "hist20_v1",
+      "definition": "trailing 20D realized vol * sqrt(252)"
+    },
+    "ewma": {
+      "version": "ewma_v1",
+      "lambda": 0.06,
+      "definition": "RiskMetrics EWMA daily variance, annualized"
+    }
+  },
+  "code": {
+    "git_head": "50db4f352ebfecc7fbb8144e607186413102d595",
+    "scripts": {
+      "phase5a_risk.py": "b0a1a638e66595d06cf30ad99982e433aac4b4fc4c3181f55d634ff9b22074e2",
+      "phase5aqc_vol_audit.py": "d7ba83505d97ba5715f041134c53c7445f8323c419fb55413bbc3a6ba50db746",
+      "phase5b_vol_robustness.py": "8c35dac4c3cf9a6ab77ac4a2cc1eaff00dd096e95766fd7cfbf89394ea985485",
+      "phase5c_tail.py": "a50ea71ca69c1fcc68c8a2c5f3bf723f3ec966b2db43e07b18642d6567d7fa58",
+      "phase5d_early_warning.py": "b9a5f7ac0177198578b0f53bc49af686711d64a854389f88054e37497ed2057c",
+      "phase5e_qc.py": "0141d48e58d0e47bee56926148dd1ae1bf1b514284628ff4307bee214ad58e35",
+      "phase5e_freeze.py": "7a69bae79238f479f7e150cdc4ac7c2955f7c5b5fc74d734e555dd017fb6ab4b",
+      "phase5e_shadow_forecast.py": "8ad10e750341acd8f61131c35b52dfde954293244433b081e726aee35f5fe68f",
+      "phase5e_shadow_outcomes.py": "636b8f663e3765c3d812b58948b082322611ec606297dd4f64395deb8235b074",
+      "phase5f_repro_check.py": "e27e2a0d18ec880794ea2781553607f019c4d8f87164f644a3fa00c4d3887506",
+      "phase5f_shadow_qc.py": "0b65994660ab6356bd43feb60988a0e4edf52d1e11885f0241b662654c0b6702",
+      "phase5f_daily_shadow.py": "1718fa1682b72b0fb12d773e6069223eb9195b5d05227867d74d86f745728924",
+      "phase5f_update_registry.py": "043c6ffbb0beaa4b144bd6f9cf5735af0c7707aee83ca418f007c20a71617237"
+    },
+    "notes": "Phase 5C/5D scripts are not committed; hashes identify frozen code.",
+    "note": "Base commit before Phase 5F freeze commit; scripts and registry are committed in the Phase 5F commit."
+  },
+  "target_definitions": {
+    "spike_80th": "future 5D realized volatility >= train-only 80th-percentile threshold",
+    "fixed_20": "future 5D realized volatility >= 20% annualized",
+    "onset_20": "current 5D realized volatility < 20% and future 5D realized volatility >= 20%",
+    "persistence_20": "current 5D realized volatility >= 20% and future 5D realized volatility >= 20%"
+  },
+  "spike_target_definition": "future 5D realized volatility >= 18.4956% (train-only 80th percentile)",
+  "fixed_stress_threshold": 0.2,
+  "data_snapshot": {
+    "table": "public.research_core_hist",
+    "rows": 3233,
+    "start": "2014-01-02",
+    "end": "2026-11-09",
+    "sha256_csv": "5a25a145607a0a34364b54081157a1c94b748e5152243c35f66da82ad426bb12"
+  },
+  "dependencies": {
+    "python": "3.14.4",
+    "pandas": "3.0.3",
+    "numpy": "2.4.6",
+    "scipy": "1.17.1",
+    "sqlalchemy": "2.0.50"
+  }
+}
