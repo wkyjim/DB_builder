@@ -9,6 +9,7 @@ from sqlalchemy import text
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 from db_builder.config import local_engine  # noqa: E402
+from session_calendar import last_completed_session, next_sessions, session_open_utc
 
 LOG=ROOT/"data"/"phase5h_shadow_runs.log"; SCHEMA="aegis_shadow"
 def main():
@@ -19,15 +20,25 @@ def main():
         rec.update({"status":"failed","reason":"refresh_failed","stderr":r.stderr[-1000:]})
     else:
         d=pd.read_sql(text(f"select max(date) latest from {SCHEMA}.inference_daily"),local_engine()).iloc[0]
-        latest=pd.Timestamp(d.latest).normalize(); start=pd.bdate_range(latest,periods=2)[1].date()
-        open_utc=datetime.combine(start,datetime.min.time(),tzinfo=timezone.utc).replace(hour=14,minute=30)
-        rec.update({"as_of":str(latest.date()),"target_start":str(start)})
-        if datetime.now(timezone.utc)>=open_utc:
-            rec.update({"status":"skipped","reason":"retrospective_window_not_eligible"})
+        latest=pd.Timestamp(d.latest).normalize()
+        last=last_completed_session()
+        rec.update({"as_of":str(latest.date()),"last_completed_session":str(last)})
+        if latest.date() < last:
+            rec.update({"status":"skipped","reason":"stale_latest_session"})
         else:
-            ins=subprocess.run([py,str(ROOT/"scripts"/"phase5g_shadow_db.py"),"insert",str(latest.date()),"inference"],capture_output=True,text=True)
-            out=subprocess.run([py,str(ROOT/"scripts"/"phase5g_outcomes.py")],capture_output=True,text=True)
-            rec.update({"status":"completed" if ins.returncode==0 and out.returncode==0 else "failed","insert":ins.stdout[-1000:],"outcomes":out.stdout[-1000:]})
+            maxasof=pd.read_sql(text(f"select max(as_of_date) m from {SCHEMA}.forecasts"),local_engine()).iloc[0].m
+            if maxasof is not None and pd.Timestamp(maxasof).date() >= latest.date():
+                rec.update({"status":"skipped","reason":"already_forecast"})
+            else:
+                start=next_sessions(latest.date(),1)[0]
+                open_utc=session_open_utc(start)
+                rec.update({"target_start":str(start),"target_open_utc":open_utc.isoformat()})
+                if datetime.now(timezone.utc)>=open_utc:
+                    rec.update({"status":"skipped","reason":"retrospective_window_not_eligible"})
+                else:
+                    ins=subprocess.run([py,str(ROOT/"scripts"/"phase5g_shadow_db.py"),"insert",str(latest.date()),"inference"],capture_output=True,text=True)
+                    out=subprocess.run([py,str(ROOT/"scripts"/"phase5g_outcomes.py")],capture_output=True,text=True)
+                    rec.update({"status":"completed" if ins.returncode==0 and out.returncode==0 else "failed","insert":ins.stdout[-1000:],"outcomes":out.stdout[-1000:]})
     LOG.open("a").write(json.dumps(rec)+"\n")
     with local_engine().begin() as c:
         c.execute(text(f"INSERT INTO {SCHEMA}.run_log(as_of_date,status,reason,details) VALUES (:d,:s,:r,cast(:j as jsonb))"),

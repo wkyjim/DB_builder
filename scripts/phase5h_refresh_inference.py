@@ -11,7 +11,8 @@ from sqlalchemy import text
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
-from db_builder.config import local_engine  # noqa: E402
+from db_builder.config import local_engine
+from session_calendar import last_completed_session  # noqa: E402
 
 SCHEMA="aegis_shadow"; START="2013-01-01"
 
@@ -43,6 +44,7 @@ def main():
         vix_fred=pd.Series(dtype=float)
     px=pd.concat([spy,iwm,hyg,lqd],axis=1).sort_index().ffill(limit=2)
     df=pd.DataFrame(index=px.index)
+    df["spy_close"]=px.SPY
     df["spy_ret_1d"]=px.SPY.pct_change()
     df["spy_ret_20d"]=px.SPY.pct_change(20)
     df["spy_vol_20d"]=df.spy_ret_1d.rolling(20,min_periods=20).std()*math.sqrt(252)
@@ -57,6 +59,8 @@ def main():
     df["vixcls"]=vix_yf.reindex(df.index)
     feats=["vixcls","spy_vol_20d","iwm_vol_20d","dd252","credit_proxy","spy_ret_20d"]
     df=df.dropna(subset=feats)
+    last=last_completed_session()
+    df=df[df.index.date <= last]
     latest=df.index.max().normalize()
     # Overlap comparison; FRED is reference only and cannot block inference.
     comp={"n":0,"mae":None,"max_abs":None,"corr":None,"latest_diff":None,"qc":"NO_FRED_REFERENCE"}
@@ -83,18 +87,19 @@ def main():
         c.execute(text(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.inference_daily (
           date date PRIMARY KEY,vixcls double precision,spy_vol_20d double precision,iwm_vol_20d double precision,
           dd252 double precision,credit_proxy double precision,spy_ret_20d double precision,
-          hist20 double precision,hist5 double precision,ewma double precision,
+          spy_close double precision,hist20 double precision,hist5 double precision,ewma double precision,
           source_json jsonb,refreshed_at timestamptz DEFAULT clock_timestamp())"""))
+        c.execute(text(f"ALTER TABLE {SCHEMA}.inference_daily ADD COLUMN IF NOT EXISTS spy_close double precision"))
         row=df.loc[latest]
         c.execute(text(f"DELETE FROM {SCHEMA}.inference_daily WHERE date > :d"),{"d":latest.date()})
-        c.execute(text(f"""INSERT INTO {SCHEMA}.inference_daily(date,vixcls,spy_vol_20d,iwm_vol_20d,dd252,credit_proxy,spy_ret_20d,hist20,hist5,ewma,source_json)
-          VALUES (:d,:v,:s,:i,:dd,:c,:m,:h20,:h5,:e,cast(:j as jsonb))
+        c.execute(text(f"""INSERT INTO {SCHEMA}.inference_daily(date,vixcls,spy_vol_20d,iwm_vol_20d,dd252,credit_proxy,spy_ret_20d,spy_close,hist20,hist5,ewma,source_json)
+          VALUES (:d,:v,:s,:i,:dd,:c,:m,:pc,:h20,:h5,:e,cast(:j as jsonb))
           ON CONFLICT (date) DO UPDATE SET vixcls=EXCLUDED.vixcls,spy_vol_20d=EXCLUDED.spy_vol_20d,
           iwm_vol_20d=EXCLUDED.iwm_vol_20d,dd252=EXCLUDED.dd252,credit_proxy=EXCLUDED.credit_proxy,
-          spy_ret_20d=EXCLUDED.spy_ret_20d,hist20=EXCLUDED.hist20,hist5=EXCLUDED.hist5,ewma=EXCLUDED.ewma,
+          spy_ret_20d=EXCLUDED.spy_ret_20d,spy_close=EXCLUDED.spy_close,hist20=EXCLUDED.hist20,hist5=EXCLUDED.hist5,ewma=EXCLUDED.ewma,
           source_json=EXCLUDED.source_json,refreshed_at=clock_timestamp()"""),
           {"d":latest.date(),"v":float(row.vixcls),"s":float(row.spy_vol_20d),"i":float(row.iwm_vol_20d),
-           "dd":float(row.dd252),"c":float(row.credit_proxy),"m":float(row.spy_ret_20d),"h20":float(row.hist20),
+           "dd":float(row.dd252),"c":float(row.credit_proxy),"m":float(row.spy_ret_20d),"pc":float(row.spy_close),"h20":float(row.hist20),
            "h5":float(row.hist5),"e":float(row.ewma),"j":json.dumps(src)})
     print(json.dumps({"latest_market_date":str(latest.date()),"source_latest":src,"vix_comparison":comp,
                       "rows":len(df),"features":feats,"refreshed":True},indent=2))

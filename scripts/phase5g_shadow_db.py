@@ -98,9 +98,8 @@ def setup():
           VALUES (:v,cast(:r as jsonb),:h) ON CONFLICT (model_version) DO NOTHING"""),{"v":REG["registry_version"],"r":reg_json,"h":h})
     print("schema ready",SCHEMA)
 
-def business_days(start, n):
-    return pd.bdate_range(start, periods=n+1)[1:n+1].date.tolist()
-
+def business_days(start,n):
+    return next_sessions(start,n)
 def compute(as_of, d):
     row=d[d.date==pd.Timestamp(as_of)]
     if row.empty: raise ValueError("as_of row missing")
@@ -133,7 +132,7 @@ def main(cmd="status", as_of=None, source="core"):
     feats=REG["features"]; fjson={k:float(r[k]) for k in feats}
     target_start=business_days(as_of,1)[0]; target_end=business_days(as_of,5)[-1]
     now=datetime.now(timezone.utc)
-    open_utc=datetime.combine(target_start,datetime.min.time(),tzinfo=timezone.utc).replace(hour=14,minute=30)
+    open_utc=session_open_utc(target_start)
     status="prospective" if now<open_utc else "retrospective_shadow"
     snap=hashlib.sha256(raw.to_csv(index=False).encode()).hexdigest()
     fid=hashlib.sha256(f"{REG['registry_version']}|{as_of}|{snap}".encode()).hexdigest()[:16]
