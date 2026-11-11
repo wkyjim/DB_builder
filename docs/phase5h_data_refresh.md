@@ -41,19 +41,22 @@ must exist on the same date.
 
 ## Latest refresh status
 
-```text
-SPY latest:    2026-11-10
-IWM latest:    2026-11-10
-HYG latest:    2026-11-10
-LQD latest:    2026-11-10
-VIXCLS latest: 2026-11-09
+Primary VIX source is yfinance ^VIX close. FRED VIXCLS is training/reference only.
 
-Latest complete feature date: 2026-11-09
-Required next session:        2026-11-10
-Forecast eligibility:         BLOCKED — missing same-date VIXCLS
+```text
+SPY latest:        2026-11-10
+IWM latest:        2026-11-10
+HYG latest:        2026-11-10
+LQD latest:        2026-11-10
+^VIX latest:       2026-11-11 (not used for 11-10)
+FRED VIXCLS latest:2026-11-09
+
+Latest complete feature date: 2026-11-10
+All six features:              PASS
+First prospective forecast:    4483e85bf2b109fe
 ```
 
-No forecast is issued from the incomplete 2026-11-10 row.
+No forecast is issued from an incomplete session.
 
 ## Daily workflow
 

@@ -34,7 +34,13 @@ def fred_vix():
     raise RuntimeError("FRED VIXCLS unavailable")
 
 def main():
-    spy=fetch("SPY"); iwm=fetch("IWM"); hyg=fetch("HYG"); lqd=fetch("LQD"); vix=fred_vix()
+    spy=fetch("SPY"); iwm=fetch("IWM"); hyg=fetch("HYG"); lqd=fetch("LQD")
+    vix_yf=fetch("^VIX")
+    try:
+        vix_fred=fred_vix()
+    except Exception as exc:
+        print("FRED comparison unavailable", exc)
+        vix_fred=pd.Series(dtype=float)
     px=pd.concat([spy,iwm,hyg,lqd],axis=1).sort_index().ffill(limit=2)
     df=pd.DataFrame(index=px.index)
     df["spy_ret_1d"]=px.SPY.pct_change()
@@ -46,15 +52,34 @@ def main():
     df["credit_proxy"]=px.HYG.pct_change(20)-px.LQD.pct_change(20)
     df["hist20"]=df.spy_vol_20d; df["hist5"]=df.spy_ret_1d.rolling(5,min_periods=5).std()*math.sqrt(252)
     df["ewma"]=np.sqrt(df.spy_ret_1d.pow(2).ewm(alpha=.06,adjust=False).mean()*252)
-    # Do not forward-fill VIXCLS across a missing session: the frozen feature
-    # requires a same-date FRED observation.
-    df["vixcls"]=vix.reindex(df.index)
+    # Primary daily inference source: yfinance ^VIX close.  FRED VIXCLS is
+    # retained for training/backtests only; never forward-fill VIX.
+    df["vixcls"]=vix_yf.reindex(df.index)
     feats=["vixcls","spy_vol_20d","iwm_vol_20d","dd252","credit_proxy","spy_ret_20d"]
     df=df.dropna(subset=feats)
     latest=df.index.max().normalize()
+    # Overlap comparison; FRED is reference only and cannot block inference.
+    comp={"n":0,"mae":None,"max_abs":None,"corr":None,"latest_diff":None,"qc":"NO_FRED_REFERENCE"}
+    if len(vix_fred):
+        both=pd.concat([vix_yf.rename("yf"),vix_fred.rename("fred")],axis=1,join="inner").dropna()
+        if len(both):
+            diff=both.yf-both.fred
+            comp={"n":int(len(both)),"mae":float(diff.abs().mean()),"max_abs":float(diff.abs().max()),
+                  "corr":float(both.yf.corr(both.fred)),"latest_diff":float(diff.iloc[-1]),
+                  "latest_date":str(both.index[-1].date()),"qc":"PASS" if diff.iloc[-1:].abs().max()<=0.5 else "MATERIAL_DISCREPANCY"}
     src={"spy":str(spy.index.max().date()),"iwm":str(iwm.index.max().date()),
-         "hyg":str(hyg.index.max().date()),"lqd":str(lqd.index.max().date()),"vixcls":str(vix.index.max().date())}
+         "hyg":str(hyg.index.max().date()),"lqd":str(lqd.index.max().date()),
+         "vix_primary":f"yfinance:^VIX {vix_yf.index.max().date()}",
+         "vix_training":"FRED:VIXCLS", "comparison":comp}
     with local_engine().begin() as c:
+        c.execute(text(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.vix_source_qc (
+          as_of date NOT NULL, yf_latest date, fred_latest date, n_overlap integer, mae double precision,
+          max_abs double precision, corr double precision, latest_diff double precision,
+          qc_status text, details jsonb, created_at timestamptz DEFAULT clock_timestamp())"""))
+        c.execute(text(f"INSERT INTO {SCHEMA}.vix_source_qc(as_of,yf_latest,fred_latest,n_overlap,mae,max_abs,corr,latest_diff,qc_status,details) VALUES (:a,:y,:f,:n,:mae,:mx,:c,:ld,:q,cast(:j as jsonb))"),
+                  {"a":latest.date(),"y":vix_yf.index.max().date(),"f":vix_fred.index.max().date() if len(vix_fred) else None,
+                   "n":comp["n"],"mae":comp["mae"],"mx":comp["max_abs"],"c":comp["corr"],"ld":comp["latest_diff"],
+                   "q":comp["qc"],"j":json.dumps(comp)})
         c.execute(text(f"""CREATE TABLE IF NOT EXISTS {SCHEMA}.inference_daily (
           date date PRIMARY KEY,vixcls double precision,spy_vol_20d double precision,iwm_vol_20d double precision,
           dd252 double precision,credit_proxy double precision,spy_ret_20d double precision,
@@ -71,7 +96,7 @@ def main():
           {"d":latest.date(),"v":float(row.vixcls),"s":float(row.spy_vol_20d),"i":float(row.iwm_vol_20d),
            "dd":float(row.dd252),"c":float(row.credit_proxy),"m":float(row.spy_ret_20d),"h20":float(row.hist20),
            "h5":float(row.hist5),"e":float(row.ewma),"j":json.dumps(src)})
-    print(json.dumps({"latest_market_date":str(latest.date()),"source_latest":src,"rows":len(df),
-                      "features":feats,"refreshed":True},indent=2))
+    print(json.dumps({"latest_market_date":str(latest.date()),"source_latest":src,"vix_comparison":comp,
+                      "rows":len(df),"features":feats,"refreshed":True},indent=2))
     return 0
 if __name__=="__main__": sys.exit(main())

@@ -140,10 +140,11 @@ def main(cmd="status", as_of=None, source="core"):
     payload={"fid":fid,"ver":REG["registry_version"],"as_of":as_of,"vol":vol,"prob":prob,"feats":fjson,
              "status":status,"target_start":str(target_start),"target_end":str(target_end),"snap":snap}
     rh=hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()
+    source_table = f"{SCHEMA}.inference_daily" if source=="inference" else "public.research_core_hist"
     with local_engine().begin() as c:
         c.execute(text(f"""INSERT INTO {SCHEMA}.data_snapshots(snapshot_id,source_table,max_date,row_count,snapshot_sha256)
-          VALUES (:s,'public.research_core_hist',:m,:n,:h) ON CONFLICT (snapshot_id) DO NOTHING"""),
-          {"s":snap,"m":latest,"n":len(raw),"h":snap})
+          VALUES (:s,:tbl,:m,:n,:h) ON CONFLICT (snapshot_id) DO NOTHING"""),
+          {"s":snap,"tbl":source_table,"m":latest,"n":len(raw),"h":snap})
         c.execute(text(f"""INSERT INTO {SCHEMA}.forecasts(
           forecast_id,model_registry,model_version,as_of_date,feature_cutoff,target_start,target_end,forecast_origin,status,
           source_created_utc,data_snapshot_id,data_snapshot_sha256,feature_json,feature_completeness,qc_flags,
@@ -154,7 +155,9 @@ def main(cmd="status", as_of=None, source="core"):
            "cut":f"{as_of} 21:00:00+00","ts":target_start,"te":target_end,"status":status,"src":now,
            "snap":snap,"fj":json.dumps(fjson),"vol":vol,"prob":prob,
            "hist":float(r["hist20"]),"ewma":float(r["ewma"]),"rh":rh})
-    print(json.dumps({"status":"INSERTED_OR_EXISTING","forecast_id":fid,"forecast_status":status,"as_of":as_of,"target_window":[str(target_start),str(target_end)],"vol":vol,"prob":prob},indent=2))
+        existing=c.execute(text(f"select forecast_id,status from {SCHEMA}.forecasts where model_version=:v and as_of_date=:a"),
+                           {"v":REG["vol_model"]["version"],"a":as_of}).fetchone()
+    print(json.dumps({"status":"INSERTED_OR_EXISTING","forecast_id":existing[0] if existing else fid,"forecast_status":existing[1] if existing else status,"attempted_id":fid,"as_of":as_of,"target_window":[str(target_start),str(target_end)],"vol":vol,"prob":prob},indent=2))
     return 0
 
 if __name__=="__main__":
