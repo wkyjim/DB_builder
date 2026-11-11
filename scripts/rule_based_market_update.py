@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--publish-dashboard",
         action="store_true",
-        help="Copy the saved report to market-dashboard/data/latest-report.md.",
+        help="Copy the saved report to market-dashboard/data/latest-rule-report.md (audit only).",
     )
     parser.add_argument(
         "--dashboard-repo",
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--push-dashboard",
         action="store_true",
-        help="Commit and push the updated market-dashboard latest report.",
+        help="Commit and push the updated audit rule report.",
     )
     parser.add_argument(
         "--notify-telegram",
@@ -135,11 +135,11 @@ def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool 
     if not (dashboard_repo / ".git").exists():
         raise FileNotFoundError(f"Dashboard path is not a git repository: {dashboard_repo}")
 
-    target = dashboard_repo / "data" / "latest-report.md"
+    target = dashboard_repo / "data" / "latest-rule-report.md"
     if dry_run:
-        print(f"[DRY RUN] Would publish latest report to dashboard: {target}")
+        print(f"[DRY RUN] Would publish audit rule report: {target}")
         if push:
-            print("[DRY RUN] Would commit and push data/latest-report.md to market-dashboard.")
+            print("[DRY RUN] Would commit and push data/latest-rule-report.md to market-dashboard.")
         return target
 
     if push:
@@ -147,10 +147,10 @@ def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool 
 
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(report_path, target)
-    print(f"Published latest report to dashboard: {target}")
+    print(f"Published audit rule report: {target}")
 
     if push:
-        subprocess.run(["git", "-C", str(dashboard_repo), "add", "data/latest-report.md"], check=True)
+        subprocess.run(["git", "-C", str(dashboard_repo), "add", "data/latest-rule-report.md"], check=True)
         diff_result = subprocess.run(
             ["git", "-C", str(dashboard_repo), "diff", "--cached", "--quiet"],
             check=False,
@@ -159,21 +159,21 @@ def publish_to_dashboard(report_path: Path, dashboard_repo: Path, *, push: bool 
             print("Dashboard latest report unchanged; nothing to commit.")
         else:
             subprocess.run(
-                ["git", "-C", str(dashboard_repo), "commit", "-m", "Update latest market report"],
+                ["git", "-C", str(dashboard_repo), "commit", "-m", "Update audit rule report"],
                 check=True,
             )
             subprocess.run(["git", "-C", str(dashboard_repo), "push", "origin", "main"], check=True)
-            print("Pushed latest report to market-dashboard.")
+            print("Pushed audit rule report to market-dashboard.")
 
     return target
 
 
 def atomic_publish_to_dashboard(report_path: Path, dashboard_repo: Path) -> Path:
-    """Atomically replace latest-report.md (temp write + os.replace)."""
+    """Atomically replace the audit rule report (temp write + os.replace)."""
     import os
     import tempfile
 
-    target = dashboard_repo / "data" / "latest-report.md"
+    target = dashboard_repo / "data" / "latest-rule-report.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(target.parent), prefix=".latest-report.", suffix=".tmp"
@@ -221,9 +221,9 @@ def main() -> None:
             if args.push_dashboard:
                 _commit_and_push_dashboard(args.dashboard_repo)
         elif args.publish_dashboard:
-            print(f"[DRY RUN] Would atomically publish latest report to dashboard: {args.dashboard_repo / 'data' / 'latest-report.md'}")
+            print(f"[DRY RUN] Would atomically publish audit rule report: {args.dashboard_repo / 'data' / 'latest-rule-report.md'}")
             if args.push_dashboard:
-                print("[DRY RUN] Would commit and push data/latest-report.md to market-dashboard.")
+                print("[DRY RUN] Would commit and push data/latest-rule-report.md to market-dashboard.")
         if args.notify_telegram:
             from db_builder.telegram_bot import build_report_update_summary, send_telegram_message
 
@@ -246,7 +246,7 @@ def _commit_and_push_dashboard(dashboard_repo: Path) -> None:
     sync_dashboard_repo + push publishes the outstanding commit.
     """
     subprocess.run(
-        ["git", "-C", str(dashboard_repo), "add", "data/latest-report.md"],
+        ["git", "-C", str(dashboard_repo), "add", "data/latest-rule-report.md"],
         check=True,
     )
     diff_result = subprocess.run(

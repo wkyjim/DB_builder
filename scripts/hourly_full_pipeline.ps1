@@ -261,6 +261,12 @@ try {
             $failOutput = if (Test-Path (Join-Path $Root 'reports\state\logs\pgSQL_equities_auto.log')) { Get-Content (Join-Path $Root 'reports\state\logs\pgSQL_equities_auto.log') -Raw -ErrorAction SilentlyContinue } else { 'No log' }
             return [pscustomobject]@{ Branch='A_equities'; Ok=$false; Seconds=$sw.Elapsed.TotalSeconds; Output=('FAIL: pgSQL_equities_auto failed after 3 attempts | ' + $failOutput); ExitCode=-1; Error=$null }
         }
+        try {
+            $splitOut = & $Python (Join-Path $Root 'scripts\update_stock_splits.py') 2>&1
+            $attemptOutput = "$attemptOutput`nStock splits: $splitOut"
+        } catch {
+            $attemptOutput = "$attemptOutput`nStock splits warning: $($_.Exception.Message)"
+        }
         if ((Get-Date).DayOfWeek -eq 'Saturday') {
             try {
                 $spOut = & $Python (Join-Path $Root 'scripts\update_sp500_constituents.py') --weekly 2>&1
@@ -771,7 +777,7 @@ Write-Log 'BRANCHES' ("All branches complete. Max branch runtime: {0:N0}s" -f $B
     # -----------------------------------------------------------------------
     # Post-report: compute SHA, verify, write FINAL state
     # -----------------------------------------------------------------------
-    $DashboardReport = Join-Path $Root 'market-dashboard\data\latest-report.md'
+    $DashboardReport = Join-Path $Root 'market-dashboard\data\latest-rule-report.md'
     $ReportSha = $null
     $CommitHash = $null
     $Pushed = $false
