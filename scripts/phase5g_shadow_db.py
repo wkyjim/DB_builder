@@ -112,14 +112,20 @@ def compute(as_of, d):
     prob=float(1/(1+np.exp(-np.clip(logit,-30,30))))
     return r,vol,prob
 
-def main(cmd="status", as_of=None):
+def main(cmd="status", as_of=None, source="core"):
     setup()
-    d=pd.read_sql(text("select * from public.research_core_hist order by date"),local_engine())
-    d["date"]=pd.to_datetime(d.date).dt.normalize(); latest=str(d.date.max().date())
+    if source == "inference":
+        raw=pd.read_sql(text(f"select * from {SCHEMA}.inference_daily order by date"),local_engine())
+        if raw.empty: raise SystemExit("inference table empty; refresh first")
+        d=raw.copy(); d["date"]=pd.to_datetime(d.date).dt.normalize()
+    else:
+        raw=pd.read_sql(text("select * from public.research_core_hist order by date"),local_engine())
+        d=raw.copy(); d["date"]=pd.to_datetime(d.date).dt.normalize()
+    latest=str(d.date.max().date())
     if cmd=="status":
         print(json.dumps({"latest_data":latest,"registry":REG["registry_version"]},indent=2)); return 0
     if not as_of: raise SystemExit("--as-of required")
-    raw=d.copy(); d=add_data(d)
+    if source != "inference": d=add_data(d)
     if str(as_of)!=latest:
         with local_engine().begin() as c: c.execute(text(f"INSERT INTO {SCHEMA}.run_log(as_of_date,status,reason) VALUES (:d,'skipped','stale input: latest=%s' )"),{"d":as_of,"latest":latest}) if False else None
         print(json.dumps({"status":"SKIPPED","reason":"stale_input","as_of":as_of,"latest":latest},indent=2)); return 2
@@ -154,4 +160,5 @@ def main(cmd="status", as_of=None):
 if __name__=="__main__":
     cmd=sys.argv[1] if len(sys.argv)>1 else "status"
     asof=sys.argv[2] if len(sys.argv)>2 else None
-    sys.exit(main(cmd,asof))
+    source=sys.argv[3] if len(sys.argv)>3 else "core"
+    sys.exit(main(cmd,asof,source))
