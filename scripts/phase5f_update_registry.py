@@ -43,7 +43,8 @@ def main():
                  "phase5c_tail.py","phase5d_early_warning.py","phase5e_qc.py",
                  "phase5e_freeze.py","phase5e_shadow_forecast.py","phase5e_shadow_outcomes.py",
                  "phase5f_repro_check.py","phase5f_shadow_qc.py","phase5f_daily_shadow.py",
-                 "phase5f_update_registry.py"):
+                 "phase5f_update_registry.py","phase5g_shadow_db.py","phase5g_outcomes.py",
+                 "phase5g_daily_shadow.py"):
         p=ROOT/"scripts"/name
         if p.exists(): scripts[name]=sha(p)
     reg.setdefault("code",{})["scripts"]=scripts

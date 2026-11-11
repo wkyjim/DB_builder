@@ -74,7 +74,7 @@
     }
   },
   "code": {
-    "git_head": "2ce28fedea791fe102fb1117f9699e959c2fea8e",
+    "git_head": "50db4f352ebfecc7fbb8144e607186413102d595",
     "scripts": {
       "phase5a_risk.py": "b0a1a638e66595d06cf30ad99982e433aac4b4fc4c3181f55d634ff9b22074e2",
       "phase5aqc_vol_audit.py": "d7ba83505d97ba5715f041134c53c7445f8323c419fb55413bbc3a6ba50db746",
@@ -88,7 +88,10 @@
       "phase5f_repro_check.py": "e27e2a0d18ec880794ea2781553607f019c4d8f87164f644a3fa00c4d3887506",
       "phase5f_shadow_qc.py": "0b65994660ab6356bd43feb60988a0e4edf52d1e11885f0241b662654c0b6702",
       "phase5f_daily_shadow.py": "1718fa1682b72b0fb12d773e6069223eb9195b5d05227867d74d86f745728924",
-      "phase5f_update_registry.py": "043c6ffbb0beaa4b144bd6f9cf5735af0c7707aee83ca418f007c20a71617237"
+      "phase5f_update_registry.py": "7919cac5e49f5fc4e35ccb06ed6d40101a0a4ba5d0e40d30f5e0af2a7808489a",
+      "phase5g_shadow_db.py": "2142c411131ae1f25a4f7cc49605e1e90ffc441800b4435eaf7bd705c0da6506",
+      "phase5g_outcomes.py": "617a51a6c340072db267a8420704d94716e8ddbf0578bd9bc8b50cf8283b708c",
+      "phase5g_daily_shadow.py": "6c0cde242983c9ecdd4ddbc9fa7643ccc58ce57be9cb2e1c2e0c215c6857893e"
     },
     "notes": "Scripts, registry and documentation committed at freeze_commit 2ce28fe. Registry metadata update is the subsequent commit.",
     "note": "Base commit before Phase 5F freeze commit; scripts and registry are committed in the Phase 5F commit.",
