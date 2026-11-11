@@ -433,7 +433,13 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     ]
     for x in report.get("executive_summary", []):
         lines.append(f"- {x}")
-    lines += ["", "## Market Snapshot", "", "| Asset | Latest | Change | Observation |", "| --- | --- | --- | --- |"]
+    dq = evidence.get("data_qc", {})
+    lines += ["", "## Data QC", "",
+              f"- Status: **{dq.get('status', 'UNKNOWN')}**",
+              f"- Equity session: {dq.get('equity_lag_sessions')} completed session(s) behind inference date",
+              f"- Breadth lag: {dq.get('breadth_lag_sessions')} session(s); ETF-flow lag: {dq.get('flows_lag_sessions')} session(s)",
+              f"- Note: {dq.get('warning') or dq.get('warning_detail') or 'No material lag.'}", ""]
+    lines += ["## Market Snapshot", "", "| Asset | Latest | Change | Observation |", "| --- | --- | --- | --- |"]
     for row in report.get("market_snapshot", []):
         lines.append(f"| {row.get('asset','')} | {row.get('latest','')} | {row.get('change','')} | {row.get('observation','')} |")
     lines += ["", "## Macro, Fiscal, Rates, Liquidity and Credit", ""]
