@@ -74,7 +74,7 @@
     }
   },
   "code": {
-    "git_head": "50db4f352ebfecc7fbb8144e607186413102d595",
+    "git_head": "2ce28fedea791fe102fb1117f9699e959c2fea8e",
     "scripts": {
       "phase5a_risk.py": "b0a1a638e66595d06cf30ad99982e433aac4b4fc4c3181f55d634ff9b22074e2",
       "phase5aqc_vol_audit.py": "d7ba83505d97ba5715f041134c53c7445f8323c419fb55413bbc3a6ba50db746",
@@ -90,8 +90,10 @@
       "phase5f_daily_shadow.py": "1718fa1682b72b0fb12d773e6069223eb9195b5d05227867d74d86f745728924",
       "phase5f_update_registry.py": "043c6ffbb0beaa4b144bd6f9cf5735af0c7707aee83ca418f007c20a71617237"
     },
-    "notes": "Phase 5C/5D scripts are not committed; hashes identify frozen code.",
-    "note": "Base commit before Phase 5F freeze commit; scripts and registry are committed in the Phase 5F commit."
+    "notes": "Scripts, registry and documentation committed at freeze_commit 2ce28fe. Registry metadata update is the subsequent commit.",
+    "note": "Base commit before Phase 5F freeze commit; scripts and registry are committed in the Phase 5F commit.",
+    "base_git_head": "50db4f352ebfecc7fbb8144e607186413102d595",
+    "freeze_commit": "2ce28fedea791fe102fb1117f9699e959c2fea8e"
   },
   "target_definitions": {
     "spike_80th": "future 5D realized volatility >= train-only 80th-percentile threshold",

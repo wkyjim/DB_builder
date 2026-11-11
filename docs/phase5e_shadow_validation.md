@@ -18,6 +18,7 @@ Registry: `data/phase5e_model_registry.json`
 - Shadow forecast as-of: **2026-11-09**
 - Source: `public.research_core_hist`
 - Base Git commit: `50db4f352ebfecc7fbb8144e607186413102d595`
+- Freeze commit: `2ce28fedea791fe102fb1117f9699e959c2fea8e`
 - Phase 5C/5D/5E/5F scripts, registry and this document are frozen in the Phase 5F commit. Their SHA-256 hashes are in the registry.
 
 Target definitions:
