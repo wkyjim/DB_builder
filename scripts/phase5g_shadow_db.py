@@ -145,7 +145,7 @@ def main(cmd="status", as_of=None):
           VALUES (:fid,:reg,:ver,:asof,:cut,:ts,:te,'post_close',:status,:src,:snap,:snap,:fj,6,'OK',:vol,:prob,:hist,:ewma,:rh)
           ON CONFLICT (model_version,as_of_date) DO NOTHING"""),
           {"fid":fid,"reg":REG["registry_version"],"ver":REG["vol_model"]["version"],"asof":as_of,
-           "cut":f"{as_of} 21:00:00+00","ts":target_start,"te":target_end,"status":status,"src":None,
+           "cut":f"{as_of} 21:00:00+00","ts":target_start,"te":target_end,"status":status,"src":now,
            "snap":snap,"fj":json.dumps(fjson),"vol":vol,"prob":prob,
            "hist":float(r["hist20"]),"ewma":float(r["ewma"]),"rh":rh})
     print(json.dumps({"status":"INSERTED_OR_EXISTING","forecast_id":fid,"forecast_status":status,"as_of":as_of,"target_window":[str(target_start),str(target_end)],"vol":vol,"prob":prob},indent=2))
