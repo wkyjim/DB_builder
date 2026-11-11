@@ -238,12 +238,15 @@ def risk_state(as_of: date, publish: bool) -> dict:
 
 def outcomes_state() -> dict:
     rows = _query(
-        "select count(*), avg(abs_error), sqrt(avg(squared_error)), "
-        "avg(case when spike_outcome then 1 else 0 end) from aegis_shadow.outcomes"
+        "select count(*), avg(o.abs_error), sqrt(avg(o.squared_error)), "
+        "avg(case when o.spike_outcome then 1 else 0 end), "
+        "avg(power((case when o.spike_outcome then 1 else 0 end) - f.spike_probability, 2)) "
+        "from aegis_shadow.outcomes o join aegis_shadow.forecasts f using(forecast_id)"
     )[0]
     return {"count": int(rows[0]), "mae": float(rows[1]) if rows[1] is not None else None,
             "rmse": float(rows[2]) if rows[2] is not None else None,
-            "spike_rate": float(rows[3]) if rows[3] is not None else None}
+            "spike_rate": float(rows[3]) if rows[3] is not None else None,
+            "brier": float(rows[4]) if rows[4] is not None else None}
 
 
 def _ensure_proxy() -> None:
