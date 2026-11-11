@@ -12,6 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src")); sys.path.insert(0,str(ROOT/"scripts"))
 from db_builder.config import local_engine  # noqa: E402
 from phase5c_tail import add_data  # noqa: E402
+from session_calendar import next_sessions, session_open_utc  # noqa: E402
 
 SCHEMA="aegis_shadow"
 REG=json.loads((ROOT/"data"/"phase5e_model_registry.json").read_text())
