@@ -34,8 +34,8 @@ $VersionCommit = (& git -C $Root rev-parse HEAD 2>$null)
 if (-not $VersionCommit) { $VersionCommit = 'UNKNOWN' }
 Write-Log 'VERSION' ('commit=' + $VersionCommit + ' macro_data_fetch=' + (Get-BlobStatus 'scripts/macro_data_fetch.py') + ' freshness_check=' + (Get-BlobStatus 'scripts/freshness_check.py'))
 
-function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 600) {
-    for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 600, $MaxAttempts = 3) {
+    for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
         Write-Log 'START' ($Name + ' attempt ' + $Attempt)
         $Out = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.out.log')
         $Err = Join-Path $env:TEMP ([guid]::NewGuid().ToString() + '.err.log')
@@ -52,7 +52,7 @@ function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 6
             Write-Log 'TIMEOUT' ($Name + ' exceeded ' + $TimeoutSeconds + ' seconds')
             if (Test-Path $Out) { Get-Content $Out | Add-Content $Log }
             if (Test-Path $Err) { Get-Content $Err | Add-Content $Log }
-            if ($Attempt -lt 3) { Write-Log 'RETRY' ($Name + ' retrying after timeout in 60 seconds'); Start-Sleep -Seconds 60; continue }
+            if ($Attempt -lt $MaxAttempts) { Write-Log 'RETRY' ($Name + ' retrying after timeout in 60 seconds'); Start-Sleep -Seconds 60; continue }
             return $false
         }
         $P.WaitForExit()
@@ -67,7 +67,7 @@ function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 6
             return $true
         }
         Write-Log 'ERROR' ($Name + ' exited with code ' + $ExitCode)
-        if ($Attempt -lt 3) { Write-Log 'RETRY' ($Name + ' retrying after error in 60 seconds'); Start-Sleep -Seconds 60; continue }
+        if ($Attempt -lt $MaxAttempts) { Write-Log 'RETRY' ($Name + ' retrying after error in 60 seconds'); Start-Sleep -Seconds 60; continue }
         return $false
     }
 }
@@ -85,7 +85,7 @@ try {
         Write-Log 'START' 'auto_macro_db workflow'
         if (-not (Invoke-RetryPython 'scripts\health_check.py' 'health_check.py')) { Write-Log 'ERROR' 'health_check.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\security_classification_fetch.py' 'security_classification_fetch.py' '--upsert-local' 900)) { Write-Log 'ERROR' 'security_classification_fetch.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' '--skip-deferred-recovery' 600)) {
+        elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' '--skip-deferred-recovery' 1800 1)) {
             Write-Alert 'macro_data_fetch.py failed after 3 bounded attempts; attempting last-known-good AI report'
             $ExitCode = 1
             if (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 300) {
