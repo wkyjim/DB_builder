@@ -84,18 +84,24 @@ try {
         elseif (-not (Invoke-RetryPython 'scripts\finra_short_incremental.py' 'finra_short_incremental.py' '' 1800)) { Write-Log 'ERROR' 'finra_short_incremental.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\short_analytics_latest_sync.py' 'short_analytics_latest_sync.py' '' 1800)) { Write-Log 'ERROR' 'short_analytics_latest_sync.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\economic_data_fetch.py' 'economic_data_fetch.py' '--upsert-local')) { Write-Log 'ERROR' 'economic_data_fetch.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 900)) { Write-Log 'ERROR' 'global_economic_data_fetch.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\rule_based_market_update.py' 'rule_based_market_update.py' '--save --window-hours 24 --publish-dashboard --push-dashboard --notify-telegram' 900)) { Write-Log 'ERROR' 'rule_based_market_update.py failed after 3 retries'; $ExitCode = 1 }
         else {
-            Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation'
-            $FreshnessArgs = @('scripts\freshness_check.py','--datasets','Macro (close)','--require-critical')
-            $FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String)
-            Add-Content -LiteralPath $Log -Value $FreshnessOutput
-            $FreshnessExitCode = $LASTEXITCODE
-            if ($FreshnessExitCode -eq 2) { Write-Log 'FRESHNESS FAIL' 'Critical macro data failed freshness check'; $ExitCode = 2 }
-            elseif ($FreshnessExitCode -eq 3) { Write-Log 'FRESHNESS CONFIG ERROR' 'Freshness invocation/config error (usage or unknown dataset) - NOT stale data'; $ExitCode = 3 }
-            elseif ($FreshnessExitCode -eq 1) { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS WARN' 'Non-critical freshness warnings detected' }
-            else { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS OK' 'Macro data passed freshness check' }
+            $GlobalOk = Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 900
+            if (-not $GlobalOk) { Write-Log 'WARN' 'global_economic_data_fetch.py failed after 3 retries; continuing with available macro data' }
+            if (-not (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 1800)) {
+                Write-Log 'ERROR' 'hourly_ai_macro_run.py failed after 3 retries; previous report retained'
+                $ExitCode = 1
+            }
+            else {
+                Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation'
+                $FreshnessArgs = @('scripts\freshness_check.py','--datasets','Macro (close)','--require-critical')
+                $FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String)
+                Add-Content -LiteralPath $Log -Value $FreshnessOutput
+                $FreshnessExitCode = $LASTEXITCODE
+                if ($FreshnessExitCode -eq 2) { Write-Log 'FRESHNESS FAIL' 'Critical macro data failed freshness check'; $ExitCode = 2 }
+                elseif ($FreshnessExitCode -eq 3) { Write-Log 'FRESHNESS CONFIG ERROR' 'Freshness invocation/config error (usage or unknown dataset) - NOT stale data'; $ExitCode = 3 }
+                elseif ($FreshnessExitCode -eq 1) { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS WARN' 'Non-critical freshness warnings detected' }
+                else { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS OK' 'Macro data passed freshness check' }
+            }
         }
     }
 }
