@@ -5791,6 +5791,7 @@ def run_daily_update(
     etf_flow_start_date=None,
     etf_flow_tickers=None,
     update_live=True,
+    skip_deferred_recovery=False,
 ):
     # D2: one shared persistent deferred-history store for the whole cycle.
     # Deferrals are recorded in public.macro_deferred_history, never only in
@@ -6351,7 +6352,7 @@ def run_daily_update(
 
     # D2: bounded deferred-history recovery. Runs after ingestion so it can
     # retry sessions deferred by this cycle and by earlier cycles.
-    if not dry_run:
+    if not dry_run and not skip_deferred_recovery:
         run_production_deferred_recovery()
 
     # ------------------------------------------------------------------
@@ -6579,6 +6580,7 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="Fetch and calculate rows without upserting.")
     parser.add_argument("--skip-etf-flows", action="store_true", help="Skip local ETF daily flow refresh after macro update.")
     parser.add_argument("--skip-live-replace", action="store_true", help="Do not replace public.macro_live; useful for historical symbol-subset backfills.")
+    parser.add_argument("--skip-deferred-recovery", action="store_true", help="Skip the unbounded historical deferred-recovery pass in hourly runs.")
     parser.add_argument("--etf-flow-start-date", default=None, help="Optional ETF flow backfill start date in YYYY-MM-DD format.")
     parser.add_argument("--etf-flow-tickers", default=None, help="Optional comma-separated ETF subset for ETF flow refresh.")
     return parser.parse_args(argv)
@@ -6599,6 +6601,7 @@ def main(argv=None):
         etf_flow_start_date=etf_flow_start,
         etf_flow_tickers=etf_flow_tickers,
         update_live=not args.skip_live_replace,
+        skip_deferred_recovery=args.skip_deferred_recovery,
     )
     exit_code = summary.exit_code or _phase_a_safety_exit_code(summary)
     if exit_code == 0 and summary.coverage_satisfied:

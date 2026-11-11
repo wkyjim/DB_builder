@@ -5,6 +5,13 @@ $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Log = Join-Path $LogDir ('auto_macro_db_' + $Stamp + '.log')
+$AlertLog = Join-Path $LogDir 'auto_macro_alerts.log'
+
+function Write-Alert($Message) {
+    $Line = ('{0} [ALERT] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+    Add-Content -LiteralPath $AlertLog -Value $Line
+    Write-Log 'ALERT' $Message
+}
 
 function Write-Log($Level, $Message) {
     $Line = ('{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message)
@@ -78,17 +85,25 @@ try {
         Write-Log 'START' 'auto_macro_db workflow'
         if (-not (Invoke-RetryPython 'scripts\health_check.py' 'health_check.py')) { Write-Log 'ERROR' 'health_check.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\security_classification_fetch.py' 'security_classification_fetch.py' '--upsert-local' 900)) { Write-Log 'ERROR' 'security_classification_fetch.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' '' 1800)) { Write-Log 'ERROR' 'macro_data_fetch.py failed after 3 retries'; $ExitCode = 1 }
+        elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' '--skip-deferred-recovery' 600)) {
+            Write-Alert 'macro_data_fetch.py failed after 3 bounded attempts; attempting last-known-good AI report'
+            $ExitCode = 1
+            if (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 300) {
+                Write-Log 'DEGRADED' 'AI report completed on last-known-good data after macro ingestion failure'
+            } else {
+                Write-Alert 'AI report failed after macro ingestion failure; previous report retained'
+            }
+        }
         elseif (-not (Invoke-RetryPython 'scripts\recalc_all.py' 'recalc_all.py' '' 900)) { Write-Log 'ERROR' 'recalc_all.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\sync_macro_indicators_neon.py' 'sync_macro_indicators_neon.py' '' 1800)) { Write-Log 'ERROR' 'sync_macro_indicators_neon.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\finra_short_incremental.py' 'finra_short_incremental.py' '' 1800)) { Write-Log 'ERROR' 'finra_short_incremental.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\short_analytics_latest_sync.py' 'short_analytics_latest_sync.py' '' 1800)) { Write-Log 'ERROR' 'short_analytics_latest_sync.py failed after 3 retries'; $ExitCode = 1 }
+        elseif (-not (Invoke-RetryPython 'scripts\sync_macro_indicators_neon.py' 'sync_macro_indicators_neon.py' '' 900)) { Write-Log 'ERROR' 'sync_macro_indicators_neon.py failed after 3 retries'; $ExitCode = 1 }
+        elseif (-not (Invoke-RetryPython 'scripts\finra_short_incremental.py' 'finra_short_incremental.py' '' 900)) { Write-Log 'ERROR' 'finra_short_incremental.py failed after 3 retries'; $ExitCode = 1 }
+        elseif (-not (Invoke-RetryPython 'scripts\short_analytics_latest_sync.py' 'short_analytics_latest_sync.py' '' 900)) { Write-Log 'ERROR' 'short_analytics_latest_sync.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\economic_data_fetch.py' 'economic_data_fetch.py' '--upsert-local')) { Write-Log 'ERROR' 'economic_data_fetch.py failed after 3 retries'; $ExitCode = 1 }
         else {
-            $GlobalOk = Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 900
+            $GlobalOk = Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 600
             if (-not $GlobalOk) { Write-Log 'WARN' 'global_economic_data_fetch.py failed after 3 retries; continuing with available macro data' }
-            if (-not (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 1800)) {
-                Write-Log 'ERROR' 'hourly_ai_macro_run.py failed after 3 retries; previous report retained'
+            if (-not (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 300)) {
+                Write-Alert 'hourly_ai_macro_run.py failed after 3 retries; previous report retained'
                 $ExitCode = 1
             }
             else {
@@ -97,7 +112,7 @@ try {
                 $FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String)
                 Add-Content -LiteralPath $Log -Value $FreshnessOutput
                 $FreshnessExitCode = $LASTEXITCODE
-                if ($FreshnessExitCode -eq 2) { Write-Log 'FRESHNESS FAIL' 'Critical macro data failed freshness check'; $ExitCode = 2 }
+                if ($FreshnessExitCode -eq 2) { Write-Alert 'Critical macro data failed freshness check'; $ExitCode = 2 }
                 elseif ($FreshnessExitCode -eq 3) { Write-Log 'FRESHNESS CONFIG ERROR' 'Freshness invocation/config error (usage or unknown dataset) - NOT stale data'; $ExitCode = 3 }
                 elseif ($FreshnessExitCode -eq 1) { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS WARN' 'Non-critical freshness warnings detected' }
                 else { Write-Log 'SUCCESS' 'auto_macro_db workflow complete'; Write-Log 'FRESHNESS OK' 'Macro data passed freshness check' }

@@ -1,6 +1,6 @@
 """Append realized outcomes for AEGIS shadow forecasts; never updates forecasts."""
 from __future__ import annotations
-import hashlib, json, sys
+import hashlib, json, math, sys
 from pathlib import Path
 import pandas as pd
 from sqlalchemy import text
@@ -22,7 +22,7 @@ def main():
             if pd.Timestamp(hist[-1][0]) != pd.Timestamp(tend):
                 continue
             px=pd.Series([float(x[1]) for x in hist])
-            realized=float(px.pct_change().dropna().std(ddof=1)*np.sqrt(252))
+            realized=float(px.pct_change().dropna().std(ddof=1)*math.sqrt(252))
             h=hashlib.sha256(f"{fid}|{realized}|{THR}".encode()).hexdigest()
             c.execute(text(f"""INSERT INTO {SCHEMA}.outcomes(forecast_id,outcome_available_date,realized_vol_5d,squared_error,abs_error,spike_threshold,spike_outcome,record_sha256)
               VALUES (:fid,:d,:rv,:se,:ae,:thr,:so,:h) ON CONFLICT (forecast_id) DO NOTHING"""),

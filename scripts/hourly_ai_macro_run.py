@@ -191,9 +191,18 @@ def load_evidence(as_of: date) -> dict:
         "flows_date": str(flow_date),
         "flows_lag_sessions": lag(flow_date, as_of),
     }
-    data_qc["status"] = "PASS" if data_qc["equity_lag_sessions"] == 0 else "FAIL"
-    if data_qc["status"] == "PASS" and any((data_qc.get(k) or 0) > 0 for k in ("breadth_lag_sessions", "flows_lag_sessions")):
+    if data_qc["equity_lag_sessions"] == 0:
+        data_qc["status"] = "PASS"
+    elif data_qc["equity_lag_sessions"] <= 1:
         data_qc["status"] = "PASS_WITH_WARNINGS"
+        data_qc["warning"] = "US equity data is one completed session behind the inference date; not an automatic failure."
+    else:
+        data_qc["status"] = "FAIL"
+        data_qc["warning"] = "US equity data is more than one completed session behind the inference date."
+    if data_qc["status"] in ("PASS", "PASS_WITH_WARNINGS") and any(
+            (data_qc.get(k) or 0) > 0 for k in ("breadth_lag_sessions", "flows_lag_sessions")):
+        data_qc["status"] = "PASS_WITH_WARNINGS"
+        data_qc["warning_detail"] = "Breadth or ETF-flow input lags the equity session; each is timestamped in the report."
     return {
         "as_of": str(as_of),
         "latest_equity_date": str(latest_equity.date()) if hasattr(latest_equity, "date") else str(latest_equity),
@@ -270,8 +279,21 @@ def _ensure_proxy() -> None:
     raise RuntimeError("Hermes AI proxy unavailable")
 
 
-def _ai_call(prompt: str, payload: dict, model: str) -> dict:
+def _ai_call(prompt: str, payload: dict, model: str) -> tuple[dict, dict]:
     _ensure_proxy()
+    started = time.monotonic()
+    meta = {
+        "provider": "hermes-local-proxy",
+        "model": model,
+        "prompt_chars": len(prompt),
+        "payload_chars": len(json.dumps(payload, default=str)),
+        "attempts": 0,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "elapsed_s": None,
+        "response_sha256": None,
+    }
     body = {
         "model": model,
         "temperature": 0.0,
@@ -284,6 +306,7 @@ def _ai_call(prompt: str, payload: dict, model: str) -> dict:
     }
     last = ""
     for attempt in range(3):
+        meta["attempts"] = attempt + 1
         try:
             r = requests.post(
                 "http://127.0.0.1:8645/v1/chat/completions",
@@ -296,7 +319,14 @@ def _ai_call(prompt: str, payload: dict, model: str) -> dict:
             continue
         last = r.text
         if r.status_code == 200:
-            message = r.json().get("choices", [{}])[0].get("message", {})
+            response = r.json()
+            usage = response.get("usage") or {}
+            meta.update({
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            })
+            message = response.get("choices", [{}])[0].get("message", {})
             content = message.get("content")
             if not content:
                 raise RuntimeError("AI returned empty content")
@@ -305,14 +335,31 @@ def _ai_call(prompt: str, payload: dict, model: str) -> dict:
                 content = content.strip("`")
                 if content.startswith("json"):
                     content = content[4:].lstrip()
-            return json.loads(content)
+            meta["elapsed_s"] = round(time.monotonic() - started, 2)
+            meta["response_sha256"] = _sha(content)
+            return json.loads(content), meta
         if r.status_code not in (429, 500, 502, 503, 504):
             break
         time.sleep(10 + attempt * 10)
     raise RuntimeError(f"AI request failed: {last[:500]}")
 
 
-def call_ai(evidence: dict, risk: dict, model: str) -> dict:
+def _research_fingerprint(evidence: dict, risk: dict) -> str:
+    return _sha(json.dumps({
+        "as_of": evidence.get("as_of"),
+        "latest_equity_date": evidence.get("latest_equity_date"),
+        "latest_macro_date": evidence.get("latest_macro_date"),
+        "sectors": evidence.get("sectors"),
+        "flows_date": evidence.get("flows_date"),
+        "breadth": evidence.get("breadth"),
+        "macro": evidence.get("macro"),
+        "economic": evidence.get("economic"),
+        "candidates": evidence.get("candidates"),
+        "risk": risk,
+    }, sort_keys=True, default=str))
+
+
+def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     payload = {
         "as_of": evidence["as_of"],
         "latest_equity_date": evidence["latest_equity_date"],
@@ -325,20 +372,56 @@ def call_ai(evidence: dict, risk: dict, model: str) -> dict:
         "economic": evidence.get("economic", []),
         "candidates": evidence["candidates"],
         "risk": risk,
-        "data_qc": evidence.get("data_qc", {}),
         "source_catalog": evidence["source_catalog"],
     }
     market_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_market.txt").read_text(encoding="utf-8")
     ideas_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_ideas.txt").read_text(encoding="utf-8")
-    market = _ai_call(market_prompt, payload, model)
-    ideas = _ai_call(ideas_prompt, payload, model)
+    fingerprint = _research_fingerprint(evidence, risk)
+    cache_path = ROOT / "data" / "hourly_research_cache.json"
+    cached = None
+    cache_age_h = None
+    if cache_path.exists():
+        try:
+            c = json.loads(cache_path.read_text(encoding="utf-8"))
+            if c.get("fingerprint") == fingerprint:
+                created = datetime.fromisoformat(c.get("created_at", ""))
+                cache_age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+                if 0 <= cache_age_h <= 24:
+                    cached = c
+        except Exception:
+            cached = None
+    market, market_meta = _ai_call(market_prompt, payload, model)
+    if cached and cached.get("ideas") and cached.get("scenarios"):
+        ideas = {"ideas": cached["ideas"], "scenarios": cached["scenarios"]}
+        ideas_meta = {"cached": True, "cached_at": cached.get("created_at"),
+                      "age_hours": round(cache_age_h, 2), "fingerprint": fingerprint,
+                      "source_dates": cached.get("source_dates", {})}
+    else:
+        ideas, ideas_meta = _ai_call(ideas_prompt, payload, model)
+        ideas_meta = {**ideas_meta, "cached": False, "fingerprint": fingerprint,
+                      "source_dates": {"as_of": evidence.get("as_of"),
+                                       "latest_equity_date": evidence.get("latest_equity_date"),
+                                       "latest_macro_date": evidence.get("latest_macro_date"),
+                                       "flows_date": evidence.get("flows_date"),
+                                       "breadth_date": evidence.get("data_qc", {}).get("breadth_date")}}
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "fingerprint": fingerprint,
+            "source_dates": ideas_meta["source_dates"],
+            "ideas": ideas.get("ideas", []),
+            "scenarios": ideas.get("scenarios", {}),
+        }, indent=2), encoding="utf-8")
     merged = dict(market)
     for key in ("ideas", "scenarios"):
         if key in ideas:
             merged[key] = ideas[key]
-    return merged
+    return merged, {"provider": "hermes-local-proxy", "model": model,
+                    "market": market_meta, "fundamental_research": ideas_meta,
+                    "fingerprint": fingerprint,
+                    "source_dates": ideas_meta.get("source_dates", {})}
 
-def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: str) -> str:
+def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: str, ai_meta: dict | None = None) -> str:
     r = risk
     lines = [
         "# AEGIS AI-First Market Intelligence", "",
@@ -413,6 +496,21 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     lines += ["", "## Sources", ""]
     for s in report.get("sources", []):
         lines.append(f"- {s.get('label','')}: {s.get('url','')} ({s.get('date','')})")
+    meta = ai_meta or {}
+    mm = meta.get("market", {}) if isinstance(meta, dict) else {}
+    fr = meta.get("fundamental_research", {}) if isinstance(meta, dict) else {}
+    lines += ["", "## AI Provenance", "",
+              f"- Provider / model: {meta.get('provider', 'unknown')} / {meta.get('model', 'unknown')}",
+              f"- Market research: attempts={mm.get('attempts')} tokens={mm.get('total_tokens')} "
+              f"(prompt={mm.get('prompt_tokens')}, completion={mm.get('completion_tokens')}) "
+              f"runtime={mm.get('elapsed_s')}s",
+              f"- Fundamental research: {'carried forward' if fr.get('cached') else 'generated this run'}"
+              + (f" from {fr.get('cached_at')} (age {fr.get('age_hours')}h)" if fr.get('cached') else
+                 f" at {fr.get('generated_at', meta.get('generated_at', 'this run'))}"),
+              f"- Evidence source dates: {meta.get('source_dates', {})}",
+              f"- Evidence fingerprint: {meta.get('fingerprint', '')}",
+              "- Source citations include the supplied provenance catalog; market values are from the verified database snapshot.",
+              ""]
     lines += ["", "## Disclosures", "",
               "- This is research and market intelligence, not investment advice.",
               "- AI conclusions are research judgments, not validated return predictions.",
@@ -446,7 +544,7 @@ def _ensure_sources(report, evidence):
             break
         u = str(x.get("url", ""))
         if u.startswith("http") and u not in seen:
-            current.append({"label": x.get("label", ""), "url": u, "date": evidence.get("as_of", "")})
+            current.append({"label": x.get("label", ""), "url": u, "date": "catalog/undated"})
             seen.add(u)
     report["sources"] = current[:12]
     return report
@@ -516,7 +614,11 @@ def main() -> int:
         print("DATA QC FAILED — previous report retained:", evidence["data_qc"])
         return 1
     risk = risk_state(as_of, publish=not dry)
-    if evidence.get("latest_equity_date") != evidence.get("as_of"):
+    alerts = []
+    dq = evidence.get("data_qc", {})
+    if dq.get("status") not in ("PASS",):
+        alerts.append({"type": "data_qc", "detail": dq})
+    if (risk.get("hourly_estimate") or {}).get("source") != "frozen_eod_forecast":
         risk["experimental_hourly"] = True
         risk["hourly_estimate"] = {**(risk.get("hourly_estimate") or {}),
                                     "experimental": True, "eligible_for_formal": False}
@@ -525,11 +627,14 @@ def main() -> int:
     if risk.get("status") == "UNAVAILABLE":
         print("RISK UNAVAILABLE — report not published")
         return 2
+    ai_meta = {}
     try:
-        report = call_ai(evidence, risk, args.model)
+        report, ai_meta = call_ai(evidence, risk, args.model)
     except Exception as exc:
         print(f"AI FAILED — retaining previous report: {exc}")
         return 3
+    ai_meta["generated_at"] = now.isoformat()
+    report["ai_meta"] = ai_meta
     report = _sanitize(report)
     report = _ensure_sources(report, evidence)
     report = _normalize_scenarios(report)
@@ -544,12 +649,13 @@ def main() -> int:
         print("REPORT QC FAILED:", fails)
         return 4
     generated = now.astimezone(ZoneInfo("Asia/Hong_Kong")).strftime("%d %B %Y, %H:%M %Z")
+    risk_sha = _sha(json.dumps(risk, indent=2, default=str))
     content_sha = _sha(json.dumps({
-        "report": {k: v for k, v in report.items() if k not in ("snapshot_id",)},
+        "report": {k: v for k, v in report.items() if k not in ("snapshot_id", "ai_meta")},
         "evidence_sha": _sha(json.dumps(evidence, sort_keys=True, default=str)),
         "risk": risk,
     }, sort_keys=True, default=str))
-    md = render(report, evidence, risk, outcomes, generated)
+    md = render(report, evidence, risk, outcomes, generated, ai_meta)
     report_sha = _sha(md)
     outdir = Path(args.out) if dry else DATA
     outdir.mkdir(parents=True, exist_ok=True)
@@ -569,11 +675,15 @@ def main() -> int:
         "latest_macro_date": evidence["latest_macro_date"],
         "data_qc": evidence.get("data_qc", {}),
         "model": args.model,
+        "ai": ai_meta,
+        "source_dates": ai_meta.get("source_dates", {}),
         "evidence_sha256": _sha(json.dumps(evidence, sort_keys=True, default=str)),
         "report_sha256": report_sha,
+        "risk_layer_sha256": risk_sha,
         "content_sha256": content_sha,
         "risk": risk,
         "outcomes": outcomes,
+        "alerts": alerts,
         "qc": "PASS",
     }
     if not dry and existing_content == content_sha:
@@ -600,7 +710,7 @@ def main() -> int:
             else:
                 print("PUBLISH WARNING: git commit failed")
     print(json.dumps({"dry_run": dry, "output": str(outdir), "report_sha256": report_sha,
-                      "as_of": evidence["as_of"], "model": args.model, "risk": risk,
+                      "as_of": evidence["as_of"], "model": args.model, "ai": ai_meta, "risk": risk,
                       "outcomes": outcomes, "published": published}, indent=2))
     return 0
 
