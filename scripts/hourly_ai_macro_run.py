@@ -36,7 +36,7 @@ ENGINE = local_engine()
 
 DATA = ROOT / "market-dashboard" / "data"
 PROMPT_PATH = ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt.txt"
-FALLBACK_MODELS = ["stepfun/step-3.7-flash:free", "meituan/longcat-2.5:free"]
+FALLBACK_MODELS = ["meituan/longcat-2.5:free", "stepfun/step-3.7-flash:free"]
 REGISTRY = ROOT / "data" / "phase5e_model_registry.json"
 GICS = [
     "Health Care", "Consumer Staples", "Consumer Discretionary", "Real Estate",
@@ -385,11 +385,21 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     ideas_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_ideas.txt").read_text(encoding="utf-8")
     all_external = (evidence.get("external_sources") or {}).get("sources", [])
     sector_etfs = set(SECTOR_ETF.values())
-    market_external = [s for s in all_external if s.get("kind") == "macro" or (s.get("kind") == "etf" and s.get("ticker") in sector_etfs)]
+    def compact(s):
+        return {"id": s.get("id"), "kind": s.get("kind"), "ticker": s.get("ticker"),
+                "published_at": s.get("published_at"), "status": s.get("status"),
+                "claims": [str(c)[:240] for c in (s.get("claims") or [])[:1]]}
+    market_external = [compact(s) for s in all_external if s.get("kind") == "macro" or (s.get("kind") == "etf" and s.get("ticker") in sector_etfs)]
     idea_tickers = {c.get("ticker") for c in evidence.get("candidates", [])}
-    ideas_external = [s for s in all_external if s.get("ticker") in idea_tickers or s.get("kind") == "macro"]
-    market_payload = {**payload, "external_sources": market_external}
-    ideas_payload = {**payload, "external_sources": ideas_external}
+    ideas_external = [compact(s) for s in all_external if s.get("ticker") in idea_tickers or s.get("kind") == "macro"]
+    market_payload = {k: payload[k] for k in (
+        "as_of", "latest_equity_date", "latest_macro_date", "data_qc", "breadth",
+        "sectors", "flows", "macro", "economic", "risk", "source_retrieval")}
+    market_payload["external_sources"] = market_external
+    ideas_payload = {k: payload[k] for k in (
+        "as_of", "latest_equity_date", "latest_macro_date", "data_qc", "candidates",
+        "risk", "source_retrieval")}
+    ideas_payload["external_sources"] = ideas_external
     fingerprint = _research_fingerprint(evidence, risk)
     cache_path = ROOT / "data" / "hourly_research_cache.json"
     cached = None
