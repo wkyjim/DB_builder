@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from db_builder.config import local_engine  # noqa: E402
 from session_calendar import last_completed_session, next_sessions  # noqa: E402
+from source_retrieval import retrieve as retrieve_external_sources  # noqa: E402
 
 ENGINE = local_engine()
 
@@ -119,7 +120,7 @@ def load_evidence(as_of: date) -> dict:
         "select date,ticker,close,pct_chg,volume from public.us_equities where date=:d order by volume desc limit 50",
         {"d": latest_equity},
     )
-    classes = _read("select ticker,sector,company_name from public.security_classification where is_active=true")
+    classes = _read("select ticker,sector,company_name,cik from public.security_classification where is_active=true")
     cmap = {str(r.ticker).upper(): r for r in classes.itertuples()}
     candidates = []
     for r in snap.itertuples():
@@ -131,7 +132,7 @@ def load_evidence(as_of: date) -> dict:
             continue
         candidates.append({
             "ticker": t, "name": str(c.company_name or t), "sector": str(c.sector or ""),
-            "security_type": "Stock",
+            "security_type": "Stock", "cik": str(c.cik or ""),
             "close": float(r.close) if pd.notna(r.close) else None,
             "pct_chg": float(r.pct_chg) if pd.notna(r.pct_chg) else None,
             "volume": float(r.volume) if pd.notna(r.volume) else None,
@@ -279,7 +280,7 @@ def _ensure_proxy() -> None:
     raise RuntimeError("Hermes AI proxy unavailable")
 
 
-def _ai_call(prompt: str, payload: dict, model: str) -> tuple[dict, dict]:
+def _ai_call(prompt: str, payload: dict, model: str, max_tokens: int = 3000) -> tuple[dict, dict]:
     _ensure_proxy()
     started = time.monotonic()
     meta = {
@@ -297,7 +298,7 @@ def _ai_call(prompt: str, payload: dict, model: str) -> tuple[dict, dict]:
     body = {
         "model": model,
         "temperature": 0.0,
-        "max_tokens": 3000,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": prompt},
@@ -356,6 +357,10 @@ def _research_fingerprint(evidence: dict, risk: dict) -> str:
         "economic": evidence.get("economic"),
         "candidates": evidence.get("candidates"),
         "risk": risk,
+        "external_source_evidence": [
+            {k: s.get(k) for k in ("id", "url", "published_at", "status", "claims")}
+            for s in (evidence.get("external_sources") or {}).get("sources", [])
+        ],
     }, sort_keys=True, default=str))
 
 
@@ -372,10 +377,18 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
         "economic": evidence.get("economic", []),
         "candidates": evidence["candidates"],
         "risk": risk,
-        "source_catalog": evidence["source_catalog"],
+        "external_sources": (evidence.get("external_sources") or {}).get("sources", []),
+        "source_retrieval": (evidence.get("external_sources") or {}).get("counts", {}),
     }
     market_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_market.txt").read_text(encoding="utf-8")
     ideas_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_ideas.txt").read_text(encoding="utf-8")
+    all_external = (evidence.get("external_sources") or {}).get("sources", [])
+    sector_etfs = set(SECTOR_ETF.values())
+    market_external = [s for s in all_external if s.get("kind") == "macro" or (s.get("kind") == "etf" and s.get("ticker") in sector_etfs)]
+    idea_tickers = {c.get("ticker") for c in evidence.get("candidates", [])}
+    ideas_external = [s for s in all_external if s.get("ticker") in idea_tickers or s.get("kind") == "macro"]
+    market_payload = {**payload, "external_sources": market_external}
+    ideas_payload = {**payload, "external_sources": ideas_external}
     fingerprint = _research_fingerprint(evidence, risk)
     cache_path = ROOT / "data" / "hourly_research_cache.json"
     cached = None
@@ -390,14 +403,14 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
                     cached = c
         except Exception:
             cached = None
-    market, market_meta = _ai_call(market_prompt, payload, model)
+    market, market_meta = _ai_call(market_prompt, market_payload, model, max_tokens=4000)
     if cached and cached.get("ideas") and cached.get("scenarios"):
         ideas = {"ideas": cached["ideas"], "scenarios": cached["scenarios"]}
         ideas_meta = {"cached": True, "cached_at": cached.get("created_at"),
                       "age_hours": round(cache_age_h, 2), "fingerprint": fingerprint,
                       "source_dates": cached.get("source_dates", {})}
     else:
-        ideas, ideas_meta = _ai_call(ideas_prompt, payload, model)
+        ideas, ideas_meta = _ai_call(ideas_prompt, ideas_payload, model, max_tokens=4000)
         ideas_meta = {**ideas_meta, "cached": False, "fingerprint": fingerprint,
                       "source_dates": {"as_of": evidence.get("as_of"),
                                        "latest_equity_date": evidence.get("latest_equity_date"),
@@ -445,9 +458,12 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     lines += ["", "## Macro, Fiscal, Rates, Liquidity and Credit", ""]
     for x in report.get("macro_analysis", []):
         lines.append(f"- {x}")
-    lines += ["", "## US Equities and 11 GICS Sectors", "", "| GICS sector | Evidence | AI research stance |", "| --- | --- | --- |"]
+    lines += ["", "## US Equities and 11 GICS Sectors", "",
+              f"Macro source IDs: {', '.join(report.get('macro_source_ids', []))}",
+              "", "| GICS sector | Evidence | AI research stance | Source IDs |",
+              "| --- | --- | --- | --- |"]
     for row in report.get("sectors", []):
-        lines.append(f"| {row.get('sector','')} | {row.get('evidence','')} | {row.get('view','')} |")
+        lines.append(f"| {row.get('sector','')} | {row.get('evidence','')} | {row.get('view','')} | {', '.join(row.get('source_ids', []))} |")
     lines += ["", "### Sector fundamentals, valuation and earnings", "",
               report.get("sector_fundamentals", "No verified point-in-time sector fundamental dataset is available."), "",
               "## Growth vs Value", ""]
@@ -456,19 +472,52 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     lines += ["", "## ETF Flows and Breadth", ""]
     for x in report.get("flows_breadth", []):
         lines.append(f"- {x}")
-    lines += ["", "## Investment Ideas", "",
-              "All ideas are research judgments, not validated return predictions.", "",
-              "| Ticker | Security | Research view | Price | Base target | Review |", "| --- | --- | --- | --- | --- | --- |"]
-    for i in report.get("ideas", []):
-        lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {i.get('base_target','')} | {i.get('review','')} |")
+    stock_ideas = [i for i in report.get("ideas", []) if i.get("security_type") == "Stock"]
+    etf_ideas = [i for i in report.get("ideas", []) if i.get("security_type") == "ETF"]
+    lines += ["", "## Stock Ideas", "",
+              "Single-stock research uses reported EPS, forward P/E and company fundamentals. All ideas are research judgments, not validated return predictions.", ""]
+    if stock_ideas:
+        lines += ["| Ticker | Security | Research view | Price | EPS | Forward P/E | Base target | Review |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+        for i in stock_ideas:
+            lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {i.get('eps','')} | {i.get('forward_pe','')} | {i.get('base_target','')} | {i.get('review','')} |")
+    else:
+        lines.append("No qualifying stock ideas this run.")
+    lines += ["", "## ETF Ideas", "",
+              "ETF research uses holdings, portfolio valuation and exposure. Single-stock EPS × P/E valuation is not applied to ETFs.", ""]
+    if etf_ideas:
+        lines += ["| Ticker | Fund | Research view | Price | Top holdings | Portfolio valuation | Sector exposure | Review |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+        for i in etf_ideas:
+            th = i.get("top_holdings", "")
+            if isinstance(th, (list, tuple)):
+                th = ", ".join(str(x) for x in th)
+            lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {th} | {i.get('portfolio_valuation','')} | {i.get('sector_exposure','')} | {i.get('review','')} |")
+    else:
+        lines.append("No qualifying ETF ideas this run.")
     for i in report.get("ideas", []):
         lines += [f"### {i.get('ticker','')} — {i.get('name','')}", "",
+                  f"- **Type:** {i.get('security_type','')}",
                   f"- **Research view:** {i.get('research_view','')}",
                   f"- **Thesis:** {i.get('thesis','')}",
+                  f"- **Source IDs:** {', '.join(i.get('source_ids', []))}",
                   f"- **Catalysts:** {', '.join(i.get('catalysts', []))}",
                   f"- **Risks:** {', '.join(i.get('risks', []))}",
-                  f"- **Valuation assumptions:** {i.get('valuation_assumptions','')}",
-                  f"- **Bull / Base / Bear:** {i.get('bull_target','')} / {i.get('base_target','')} / {i.get('bear_target','')}",
+                  f"- **Valuation method:** {i.get('valuation_method','')}",
+                  f"- **Valuation assumptions:** {i.get('valuation_assumptions','')}"]
+        if i.get("security_type") == "Stock":
+            lines += [f"- **EPS:** {i.get('eps','')}",
+                      f"- **Forward P/E:** {i.get('forward_pe','')}",
+                      f"- **Company fundamentals:** {i.get('company_fundamentals','')}"]
+        else:
+            th = i.get("top_holdings", "")
+            if isinstance(th, (list, tuple)):
+                th = ", ".join(str(x) for x in th)
+            lines += [f"- **Top holdings:** {th}",
+                      f"- **Portfolio valuation:** {i.get('portfolio_valuation','')}",
+                      f"- **Sector exposure:** {i.get('sector_exposure','')}",
+                      f"- **Underlying drivers:** {i.get('underlying_drivers','')}"]
+        lines += [f"- **Bull / Base / Bear:** {i.get('bull_target','')} / {i.get('base_target','')} / {i.get('bear_target','')}",
                   f"- **Scenario probabilities:** {i.get('bull_prob','')} / {i.get('base_prob','')} / {i.get('bear_prob','')}",
                   ""]
     lines += ["## Quant Risk Layer", "", "| Field | Value |", "| --- | --- |",
@@ -499,6 +548,13 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     lines += ["", "## Key Risks", ""]
     for x in report.get("risks", []):
         lines.append(f"- {x}")
+    lines += ["", "## External Source Ledger", "",
+              "| ID | Type | Ticker | Published | Status | URL | Claims |",
+              "| --- | --- | --- | --- | --- | --- | --- |"]
+    ext = (evidence.get("external_sources") or {}).get("sources", [])
+    for s in ext[:40]:
+        claims = "; ".join(s.get("claims", []))[:500]
+        lines.append(f"| {s.get('id','')} | {s.get('kind','')} | {s.get('ticker','') or 'macro'} | {s.get('published_at') or (s.get('retrieved_at') or '')[:10]} | {s.get('status','')} | {s.get('url','')} | {claims} |")
     lines += ["", "## Sources", ""]
     for s in report.get("sources", []):
         lines.append(f"- {s.get('label','')}: {s.get('url','')} ({s.get('date','')})")
@@ -515,7 +571,7 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                  f" at {fr.get('generated_at', meta.get('generated_at', 'this run'))}"),
               f"- Evidence source dates: {meta.get('source_dates', {})}",
               f"- Evidence fingerprint: {meta.get('fingerprint', '')}",
-              "- Source citations include the supplied provenance catalog; market values are from the verified database snapshot.",
+              "- Source citations are retrieved external records in the ledger above; market values remain from the verified database snapshot.",
               ""]
     lines += ["", "## Disclosures", "",
               "- This is research and market intelligence, not investment advice.",
@@ -543,16 +599,37 @@ def _sanitize(obj):
 
 
 def _ensure_sources(report, evidence):
-    current = [x for x in report.get("sources", []) if str(x.get("url", "")).startswith("http")]
-    seen = {x["url"] for x in current}
-    for x in evidence.get("source_catalog", []):
-        if len(current) >= 10:
-            break
-        u = str(x.get("url", ""))
-        if u.startswith("http") and u not in seen:
-            current.append({"label": x.get("label", ""), "url": u, "date": "catalog/undated"})
-            seen.add(u)
-    report["sources"] = current[:12]
+    ext = (evidence.get("external_sources") or {}).get("sources", [])
+    current = []
+    seen = set()
+    for s in ext:
+        if s.get("status") != "ok":
+            continue
+        u = str(s.get("url", ""))
+        if not u.startswith("http") or u in seen:
+            continue
+        current.append({
+            "id": s.get("id"),
+            "label": f"{s.get('kind')} {s.get('ticker') or 'macro'}",
+            "url": u,
+            "date": s.get("published_at") or (s.get("retrieved_at") or "")[:10],
+            "status": s.get("status"),
+        })
+        seen.add(u)
+    report["sources"] = current[:20]
+    return report
+
+
+def _normalize_ideas(report: dict) -> dict:
+    if len(report.get("ideas", []) or []) > 5:
+        report["ideas"] = report["ideas"][:5]
+    for i in report.get("ideas", []) or []:
+        if i.get("security_type") == "ETF":
+            i.pop("eps", None)
+            i.pop("forward_pe", None)
+            th = i.get("top_holdings")
+            if isinstance(th, str):
+                i["top_holdings"] = [x.strip() for x in th.split(",") if x.strip()]
     return report
 
 
@@ -566,20 +643,82 @@ def _normalize_scenarios(report: dict) -> dict:
     return report
 
 
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
     fails = []
-    if len(report.get("sectors", [])) != 11 or {x.get("sector") for x in report.get("sectors", [])} != set(GICS):
+    ext = (evidence.get("external_sources") or {}).get("sources", [])
+    ok_sources = {s.get("id"): s for s in ext if s.get("status") == "ok"}
+    if len(ok_sources) < 10:
+        fails.append("external_sources_below_10_ok")
+    if len({s.get("url", "").split("/")[2] for s in ok_sources.values() if "/" in s.get("url", "")}) < 4:
+        fails.append("external_sources_below_4_domains")
+    sectors = report.get("sectors", [])
+    if len(sectors) != 11 or {x.get("sector") for x in sectors} != set(GICS):
         fails.append("sectors_not_exactly_11_gics")
+    for sec in sectors:
+        ids = sec.get("source_ids") or []
+        if not ids or any(x not in ok_sources for x in ids):
+            fails.append(f"sector_source_ids_invalid:{sec.get('sector')}")
+    macro_ids = report.get("macro_source_ids") or []
+    if len(macro_ids) < 3 or any(x not in ok_sources for x in macro_ids):
+        fails.append("macro_source_ids_invalid")
     ideas = report.get("ideas") or []
     if not 3 <= len(ideas) <= 5:
         fails.append("ideas_not_3_to_5")
     allowed = {x["ticker"] for x in evidence.get("candidates", [])}
     for i in ideas:
-        if str(i.get("ticker", "")).upper() not in allowed:
-            fails.append(f"idea_ticker_not_in_candidate_universe:{i.get('ticker')}")
-        for k in ("research_view", "thesis", "valuation_assumptions", "base_target", "bull_target", "bear_target"):
+        ticker = str(i.get("ticker", "")).upper()
+        if ticker not in allowed:
+            fails.append(f"idea_ticker_not_in_candidate_universe:{ticker}")
+        ids = i.get("source_ids") or []
+        if not ids or any(x not in ok_sources for x in ids):
+            fails.append(f"idea_source_ids_invalid:{ticker}")
+            continue
+        if any(ok_sources[x].get("ticker") not in (ticker, None) for x in ids):
+            fails.append(f"idea_source_ticker_mismatch:{ticker}")
+        stype = i.get("security_type")
+        if stype == "Stock":
+            if _num(i.get("eps")) is None:
+                fails.append(f"stock_eps_not_numeric:{ticker}")
+            if _num(i.get("forward_pe")) is None:
+                fails.append(f"stock_forward_pe_not_numeric:{ticker}")
+            if not any(ok_sources[x].get("kind") == "filing" for x in ids):
+                fails.append(f"stock_missing_filing_source:{ticker}")
+            if not any(ok_sources[x].get("kind") in ("stock", "news") for x in ids):
+                fails.append(f"stock_missing_market_or_news_source:{ticker}")
+            claim_text = " ".join(" ".join(ok_sources[x].get("claims", [])) for x in ids).lower()
+            if "diluted eps" not in claim_text:
+                fails.append(f"stock_eps_not_source_supported:{ticker}")
+            if "forward p/e" not in claim_text:
+                fails.append(f"stock_forward_pe_not_source_supported:{ticker}")
+        elif stype == "ETF":
+            if "eps" in i or "forward_pe" in i:
+                fails.append(f"etf_has_stock_valuation_fields:{ticker}")
+            for f in ("top_holdings", "portfolio_valuation", "sector_exposure", "underlying_drivers"):
+                if not i.get(f):
+                    fails.append(f"etf_missing_{f}:{ticker}")
+            if not any(ok_sources[x].get("kind") in ("etf", "news") for x in ids):
+                fails.append(f"etf_missing_etf_or_news_source:{ticker}")
+            claim_text = " ".join(" ".join(ok_sources[x].get("claims", [])) for x in ids).lower()
+            if "top holdings" not in claim_text and "p/e" not in claim_text:
+                fails.append(f"etf_valuation_not_source_supported:{ticker}")
+        else:
+            fails.append(f"idea_security_type_invalid:{ticker}")
+        for k in ("research_view", "valuation_assumptions"):
             if not i.get(k):
-                fails.append(f"idea_missing_{k}")
+                fails.append(f"idea_missing_{k}:{ticker}")
+        if stype == "Stock":
+            if not i.get("thesis"):
+                fails.append(f"stock_missing_thesis:{ticker}")
+            for k in ("base_target", "bull_target", "bear_target"):
+                if not i.get(k):
+                    fails.append(f"stock_missing_{k}:{ticker}")
     for horizon in ("short_term", "long_term"):
         rows = (report.get("scenarios") or {}).get(horizon) or []
         if len(rows) != 3 or any(not isinstance(x, dict) for x in rows):
@@ -619,6 +758,24 @@ def main() -> int:
     if evidence.get("data_qc", {}).get("status") == "FAIL":
         print("DATA QC FAILED — previous report retained:", evidence["data_qc"])
         return 1
+    try:
+        ext = retrieve_external_sources(evidence, evidence.get("candidates", []), max_stocks=8, max_etfs=24)
+    except Exception as exc:
+        print("EXTERNAL SOURCE RETRIEVAL FAILED — previous report retained:", repr(exc))
+        return 5
+    evidence["external_sources"] = ext
+    ok_ids = {s["id"] for s in ext.get("sources", []) if s.get("status") == "ok"}
+    eligible = []
+    for c in evidence.get("candidates", []):
+        ids = [s["id"] for s in ext.get("sources", []) if s.get("ticker") == c["ticker"] and s.get("status") == "ok"]
+        if ids:
+            c = dict(c)
+            c["source_ids"] = ids
+            eligible.append(c)
+    evidence["candidates"] = eligible
+    if not eligible:
+        print("EXTERNAL SOURCE RETRIEVAL FAILED — no eligible candidates; previous report retained")
+        return 5
     risk = risk_state(as_of, publish=not dry)
     alerts = []
     dq = evidence.get("data_qc", {})
@@ -642,7 +799,19 @@ def main() -> int:
     ai_meta["generated_at"] = now.isoformat()
     report["ai_meta"] = ai_meta
     report = _sanitize(report)
+    allowed_tickers = {c.get("ticker") for c in evidence.get("candidates", [])}
+    kept_ideas = []
+    dropped_ideas = []
+    for idea in report.get("ideas", []) or []:
+        if str(idea.get("ticker", "")).upper() in allowed_tickers:
+            kept_ideas.append(idea)
+        else:
+            dropped_ideas.append(idea.get("ticker"))
+    if dropped_ideas:
+        print("DROPPED_UNSOURCED_IDEAS:", dropped_ideas)
+    report["ideas"] = kept_ideas
     report = _ensure_sources(report, evidence)
+    report = _normalize_ideas(report)
     report = _normalize_scenarios(report)
     report["snapshot_id"] = f"aegis-hourly-{now.strftime('%Y%m%dT%H%M%SZ')}"
     report["risk"] = risk
@@ -683,6 +852,8 @@ def main() -> int:
         "model": args.model,
         "ai": ai_meta,
         "source_dates": ai_meta.get("source_dates", {}),
+        "external_sources": (evidence.get("external_sources") or {}).get("sources", []),
+        "source_retrieval": (evidence.get("external_sources") or {}).get("counts", {}),
         "evidence_sha256": _sha(json.dumps(evidence, sort_keys=True, default=str)),
         "report_sha256": report_sha,
         "risk_layer_sha256": risk_sha,

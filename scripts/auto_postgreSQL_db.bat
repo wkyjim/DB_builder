@@ -30,6 +30,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
       "elseif (-not (Invoke-RetryPython 'scripts\\repair_historical_equity_gaps.py' 'repair_historical_equity_gaps.py' @('--lookback-days', '60', '--minimum-coverage', '0.97', '--apply-local') 3600)) { Write-Log 'ERROR' 'repair_historical_equity_gaps.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_daily_bulk_sync_to_neon.py' 'pgSQL_daily_bulk_sync_to_neon.py' @('--tables', 'equities', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'pgSQL_daily_bulk_sync_to_neon.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\indicator_staged_backfill.py' 'indicator_staged_backfill.py' @('--stage', 'all', '--cleanup-on-success'))) { Write-Log 'ERROR' 'indicator_staged_backfill.py failed after 3 retries'; $ExitCode = 1 }" ^
+      "elseif (-not (Invoke-RetryPython 'scripts\\build_sp500_breadth.py' 'build_sp500_breadth.py' @() 1800)) { Write-Log 'ERROR' 'build_sp500_breadth.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_daily_bulk_sync_to_neon.py' 'indicator reconciliation to Neon' @('--tables', 'indicators', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'indicator reconciliation to Neon failed after 3 retries'; $ExitCode = 1 }" ^
       "else {" ^
         "Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation';" ^

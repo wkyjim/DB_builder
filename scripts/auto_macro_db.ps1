@@ -72,6 +72,9 @@ function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 6
     }
 }
 
+$MacroStart = (Get-Date).AddDays(-45).ToString('yyyy-MM-dd')
+$MacroArgs = '--skip-deferred-recovery --start-date ' + $MacroStart
+
 $Mutex = [System.Threading.Mutex]::new($false, 'Local\DBBuilderAutoMacroDb')
 $HasMutex = $false
 $ExitCode = 0
@@ -85,10 +88,10 @@ try {
         Write-Log 'START' 'auto_macro_db workflow'
         if (-not (Invoke-RetryPython 'scripts\health_check.py' 'health_check.py')) { Write-Log 'ERROR' 'health_check.py failed after 3 retries'; $ExitCode = 1 }
         elseif (-not (Invoke-RetryPython 'scripts\security_classification_fetch.py' 'security_classification_fetch.py' '--upsert-local' 900)) { Write-Log 'ERROR' 'security_classification_fetch.py failed after 3 retries'; $ExitCode = 1 }
-        elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' '--skip-deferred-recovery' 1800 1)) {
-            Write-Alert 'macro_data_fetch.py failed after 3 bounded attempts; attempting last-known-good AI report'
+        elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' $MacroArgs 1800 1)) {
+            Write-Alert 'macro_data_fetch.py failed after its bounded attempt; attempting last-known-good AI report'
             $ExitCode = 1
-            if (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 300) {
+            if (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 900) {
                 Write-Log 'DEGRADED' 'AI report completed on last-known-good data after macro ingestion failure'
             } else {
                 Write-Alert 'AI report failed after macro ingestion failure; previous report retained'
@@ -102,7 +105,7 @@ try {
         else {
             $GlobalOk = Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 600
             if (-not $GlobalOk) { Write-Log 'WARN' 'global_economic_data_fetch.py failed after 3 retries; continuing with available macro data' }
-            if (-not (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 300)) {
+            if (-not (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 900)) {
                 Write-Alert 'hourly_ai_macro_run.py failed after 3 retries; previous report retained'
                 $ExitCode = 1
             }
