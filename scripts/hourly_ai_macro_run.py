@@ -36,6 +36,7 @@ ENGINE = local_engine()
 
 DATA = ROOT / "market-dashboard" / "data"
 PROMPT_PATH = ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt.txt"
+FALLBACK_MODELS = ["stepfun/step-3.7-flash:free", "meituan/longcat-2.5:free"]
 REGISTRY = ROOT / "data" / "phase5e_model_registry.json"
 GICS = [
     "Health Care", "Consumer Staples", "Consumer Discretionary", "Real Estate",
@@ -280,7 +281,7 @@ def _ensure_proxy() -> None:
     raise RuntimeError("Hermes AI proxy unavailable")
 
 
-def _ai_call(prompt: str, payload: dict, model: str, max_tokens: int = 3000) -> tuple[dict, dict]:
+def _ai_call(prompt: str, payload: dict, model: str, max_tokens: int = 3000, attempts: int = 2) -> tuple[dict, dict]:
     _ensure_proxy()
     started = time.monotonic()
     meta = {
@@ -306,7 +307,7 @@ def _ai_call(prompt: str, payload: dict, model: str, max_tokens: int = 3000) -> 
         ],
     }
     last = ""
-    for attempt in range(3):
+    for attempt in range(attempts):
         meta["attempts"] = attempt + 1
         try:
             r = requests.post(
@@ -403,36 +404,44 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
                     cached = c
         except Exception:
             cached = None
-    market, market_meta = _ai_call(market_prompt, market_payload, model, max_tokens=4000)
-    if cached and cached.get("ideas") and cached.get("scenarios"):
-        ideas = {"ideas": cached["ideas"], "scenarios": cached["scenarios"]}
-        ideas_meta = {"cached": True, "cached_at": cached.get("created_at"),
-                      "age_hours": round(cache_age_h, 2), "fingerprint": fingerprint,
-                      "source_dates": cached.get("source_dates", {})}
-    else:
-        ideas, ideas_meta = _ai_call(ideas_prompt, ideas_payload, model, max_tokens=4000)
-        ideas_meta = {**ideas_meta, "cached": False, "fingerprint": fingerprint,
-                      "source_dates": {"as_of": evidence.get("as_of"),
-                                       "latest_equity_date": evidence.get("latest_equity_date"),
-                                       "latest_macro_date": evidence.get("latest_macro_date"),
-                                       "flows_date": evidence.get("flows_date"),
-                                       "breadth_date": evidence.get("data_qc", {}).get("breadth_date")}}
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "fingerprint": fingerprint,
-            "source_dates": ideas_meta["source_dates"],
-            "ideas": ideas.get("ideas", []),
-            "scenarios": ideas.get("scenarios", {}),
-        }, indent=2), encoding="utf-8")
-    merged = dict(market)
-    for key in ("ideas", "scenarios"):
-        if key in ideas:
-            merged[key] = ideas[key]
-    return merged, {"provider": "hermes-local-proxy", "model": model,
-                    "market": market_meta, "fundamental_research": ideas_meta,
+    last_exc = None
+    for candidate_model in [model] + [m for m in FALLBACK_MODELS if m != model]:
+        try:
+            market, market_meta = _ai_call(market_prompt, market_payload, candidate_model, max_tokens=4000)
+            if cached and cached.get("ideas") and cached.get("scenarios"):
+                ideas = {"ideas": cached["ideas"], "scenarios": cached["scenarios"]}
+                ideas_meta = {"cached": True, "cached_at": cached.get("created_at"),
+                              "age_hours": round(cache_age_h, 2), "fingerprint": fingerprint,
+                              "source_dates": cached.get("source_dates", {})}
+            else:
+                ideas, ideas_meta = _ai_call(ideas_prompt, ideas_payload, candidate_model, max_tokens=4000)
+                ideas_meta = {**ideas_meta, "cached": False, "fingerprint": fingerprint,
+                              "source_dates": {"as_of": evidence.get("as_of"),
+                                               "latest_equity_date": evidence.get("latest_equity_date"),
+                                               "latest_macro_date": evidence.get("latest_macro_date"),
+                                               "flows_date": evidence.get("flows_date"),
+                                               "breadth_date": evidence.get("data_qc", {}).get("breadth_date")}}
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps({
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                     "fingerprint": fingerprint,
-                    "source_dates": ideas_meta.get("source_dates", {})}
+                    "source_dates": ideas_meta["source_dates"],
+                    "ideas": ideas.get("ideas", []),
+                    "scenarios": ideas.get("scenarios", {}),
+                }, indent=2), encoding="utf-8")
+            merged = dict(market)
+            for key in ("ideas", "scenarios"):
+                if key in ideas:
+                    merged[key] = ideas[key]
+            return merged, {"provider": "hermes-local-proxy", "model": candidate_model,
+                            "market": market_meta, "fundamental_research": ideas_meta,
+                            "fingerprint": fingerprint,
+                            "source_dates": ideas_meta.get("source_dates", {})}
+        except Exception as exc:
+            last_exc = exc
+            print(f"MODEL FAILED — {candidate_model}: {exc}")
+            continue
+    raise RuntimeError(f"all AI models failed: {last_exc}")
 
 def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: str, ai_meta: dict | None = None) -> str:
     r = risk
@@ -852,7 +861,7 @@ def main() -> int:
         "latest_equity_date": evidence["latest_equity_date"],
         "latest_macro_date": evidence["latest_macro_date"],
         "data_qc": evidence.get("data_qc", {}),
-        "model": args.model,
+        "model": ai_meta.get("model", args.model),
         "ai": ai_meta,
         "source_dates": ai_meta.get("source_dates", {}),
         "external_sources": (evidence.get("external_sources") or {}).get("sources", []),
@@ -890,7 +899,7 @@ def main() -> int:
             else:
                 print("PUBLISH WARNING: git commit failed")
     print(json.dumps({"dry_run": dry, "output": str(outdir), "report_sha256": report_sha,
-                      "as_of": evidence["as_of"], "model": args.model, "ai": ai_meta, "risk": risk,
+                      "as_of": evidence["as_of"], "model": ai_meta.get("model", args.model), "ai": ai_meta, "risk": risk,
                       "outcomes": outcomes, "published": published}, indent=2))
     return 0
 
