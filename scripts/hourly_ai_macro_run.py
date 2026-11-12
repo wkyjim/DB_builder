@@ -451,7 +451,10 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
               f"- Status: **{dq.get('status', 'UNKNOWN')}**",
               f"- Equity session: {dq.get('equity_lag_sessions')} completed session(s) behind inference date",
               f"- Breadth lag: {dq.get('breadth_lag_sessions')} session(s); ETF-flow lag: {dq.get('flows_lag_sessions')} session(s)",
-              f"- Note: {dq.get('warning') or dq.get('warning_detail') or 'No material lag.'}", ""]
+              f"- Note: {dq.get('warning') or dq.get('warning_detail') or 'No material lag.'}",
+              f"- External sources: {(evidence.get('external_sources') or {}).get('counts', {}).get('ok', 0)} ok / "
+              f"{(evidence.get('external_sources') or {}).get('counts', {}).get('unavailable', 0)} unavailable; "
+              f"retrieved {(evidence.get('external_sources') or {}).get('retrieved_at', 'unknown')}", ""]
     lines += ["## Market Snapshot", "", "| Asset | Latest | Change | Observation |", "| --- | --- | --- | --- |"]
     for row in report.get("market_snapshot", []):
         lines.append(f"| {row.get('asset','')} | {row.get('latest','')} | {row.get('change','')} | {row.get('observation','')} |")
