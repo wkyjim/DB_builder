@@ -395,11 +395,15 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     market_payload = {k: payload[k] for k in (
         "as_of", "latest_equity_date", "latest_macro_date", "data_qc", "breadth",
         "sectors", "flows", "macro", "economic", "risk", "source_retrieval")}
-    market_payload["external_sources"] = market_external
+    market_payload["macro"] = payload["macro"][:3]
+    market_payload["economic"] = payload["economic"][:3]
+    market_payload["flows"] = payload["flows"][:3]
+    market_payload["external_sources"] = market_external[:20]
     ideas_payload = {k: payload[k] for k in (
         "as_of", "latest_equity_date", "latest_macro_date", "data_qc", "candidates",
         "risk", "source_retrieval")}
-    ideas_payload["external_sources"] = ideas_external
+    ideas_payload["candidates"] = payload["candidates"][:8]
+    ideas_payload["external_sources"] = ideas_external[:16]
     fingerprint = _research_fingerprint(evidence, risk)
     cache_path = ROOT / "data" / "hourly_research_cache.json"
     cached = None
@@ -417,14 +421,14 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     last_exc = None
     for candidate_model in [model] + [m for m in FALLBACK_MODELS if m != model]:
         try:
-            market, market_meta = _ai_call(market_prompt, market_payload, candidate_model, max_tokens=4000)
+            market, market_meta = _ai_call(market_prompt, market_payload, candidate_model, max_tokens=3000)
             if cached and cached.get("ideas") and cached.get("scenarios"):
                 ideas = {"ideas": cached["ideas"], "scenarios": cached["scenarios"]}
                 ideas_meta = {"cached": True, "cached_at": cached.get("created_at"),
                               "age_hours": round(cache_age_h, 2), "fingerprint": fingerprint,
                               "source_dates": cached.get("source_dates", {})}
             else:
-                ideas, ideas_meta = _ai_call(ideas_prompt, ideas_payload, candidate_model, max_tokens=4000)
+                ideas, ideas_meta = _ai_call(ideas_prompt, ideas_payload, candidate_model, max_tokens=3000)
                 ideas_meta = {**ideas_meta, "cached": False, "fingerprint": fingerprint,
                               "source_dates": {"as_of": evidence.get("as_of"),
                                                "latest_equity_date": evidence.get("latest_equity_date"),
