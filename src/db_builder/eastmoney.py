@@ -145,7 +145,38 @@ def _load_target_table(engine, table_name: str):
     )
 
 
-def _upsert_dataframe(engine, target_table, df: pd.DataFrame) -> None:
+def _mark_data_source(
+    engine,
+    target_table,
+    df: pd.DataFrame,
+    data_source: str,
+    provisional: bool = False,
+) -> None:
+    """Mark already-upserted rows with provider provenance after validation."""
+    columns = set(getattr(target_table, "c", {}).keys())
+    if not {"data_source", "is_provisional", "retrieved_at"} <= columns:
+        return
+    dates = sorted({pd.Timestamp(v).date() for v in df["date"].dropna().unique()})
+    tickers = sorted({str(v) for v in df["ticker"].dropna().unique()})
+    if not dates or not tickers:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            UPDATE {target_table.name}
+            SET data_source=:source, is_provisional=:provisional, retrieved_at=now()
+            WHERE date = ANY(:dates) AND ticker = ANY(:tickers)
+        """), {"source": data_source, "provisional": provisional,
+               "dates": dates, "tickers": tickers})
+
+
+def _upsert_dataframe(
+    engine,
+    target_table,
+    df: pd.DataFrame,
+    *,
+    data_source: str | None = None,
+    provisional: bool = False,
+) -> None:
     if df.empty:
         return
 
@@ -161,6 +192,9 @@ def _upsert_dataframe(engine, target_table, df: pd.DataFrame) -> None:
             set_=update_dict,
         )
         conn.execute(upsert_stmt)
+
+    if data_source:
+        _mark_data_source(engine, target_table, df, data_source, provisional)
 
 
 def get_api_url(pn: int, pz: int = 100) -> str:

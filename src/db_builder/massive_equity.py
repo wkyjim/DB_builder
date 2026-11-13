@@ -243,6 +243,7 @@ def fetch_and_save_session(
     from db_builder.eastmoney import (
         MIN_FETCH_COVERAGE_RATIO,
         _load_target_table,
+        _mark_data_source,
         _upsert_dataframe,
         replace_ytd_pct_chg_with_local_calculation,
     )
@@ -275,13 +276,15 @@ def fetch_and_save_session(
         )
         return {"tickers": len(frame), "fallback_recovered": 0, "coverage": 1.0}
 
-    _upsert_dataframe(engine, _load_target_table(engine, table_name), frame)
+    target_table = _load_target_table(engine, table_name)
+    _upsert_dataframe(engine, target_table, frame)
     print(f"[MASSIVE] upserted {len(frame):,} rows for {day_text}")
 
     prior_universe = fetch_prior_session_universe(engine, day_text, table_name)
     expected_tickers = set(prior_universe["ticker"].astype(str).str.upper())
     unresolved = expected_tickers - fetched_tickers
     fallback_found: set[str] = set()
+    fallback_frame = None
     if unresolved:
         print(
             f"[MASSIVE YF FALLBACK] unresolved_prior_session_tickers={len(unresolved):,}",
@@ -298,9 +301,7 @@ def fetch_and_save_session(
                 fallback_frame = replace_ytd_pct_chg_with_local_calculation(
                     engine, fallback.frame, table_name, target_date=day_text
                 )
-                _upsert_dataframe(
-                    engine, _load_target_table(engine, table_name), fallback_frame
-                )
+                _upsert_dataframe(engine, target_table, fallback_frame)
             fallback_found.update(fallback.found)
             print(
                 f"[MASSIVE YF FALLBACK SUMMARY] requested={len(fallback.requested):,} "
@@ -323,6 +324,12 @@ def fetch_and_save_session(
             f"Massive fetch coverage {coverage:.2%} is below "
             f"required {MIN_FETCH_COVERAGE_RATIO:.0%}"
         )
+    # Promote provenance only after the full coverage gate has passed. A
+    # partial Massive response must never silently make yfinance provisional
+    # rows look canonical.
+    _mark_data_source(engine, target_table, frame, "massive", provisional=False)
+    if fallback_frame is not None and not fallback_frame.empty:
+        _mark_data_source(engine, target_table, fallback_frame, "yfinance_fallback", provisional=True)
     return {
         "tickers": len(fetched_tickers),
         "fallback_recovered": len(fallback_found),

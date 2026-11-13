@@ -72,6 +72,43 @@ function Invoke-RetryPython($Script, $Name, $Arguments = '', $TimeoutSeconds = 6
     }
 }
 
+
+function Test-EarlyRefreshWindow($StartedAt) {
+    $EarlyStart = $StartedAt.Date.AddHours(5).AddMinutes(55)
+    $EarlyEnd = $StartedAt.Date.AddHours(6).AddMinutes(30)
+    return [pscustomobject]@{
+        Eligible = ($StartedAt -ge $EarlyStart) -and ($StartedAt -le $EarlyEnd)
+        EarlyEnd = $EarlyEnd
+    }
+}
+
+function Invoke-EquityYfStage($RunStartedAt) {
+    $Window = Test-EarlyRefreshWindow $RunStartedAt
+    if (-not $Window.Eligible) {
+        if ($RunStartedAt.Hour -le 7) {
+            Write-Log 'WARN' ('06:00 early-refresh window missed; run started ' + $RunStartedAt.ToString('yyyy-MM-dd HH:mm:ss'))
+        }
+        return $true
+    }
+    $EquityMutex = [System.Threading.Mutex]::new($false, 'Local\DBBuilderAutoPostgreSqlDb')
+    $HasEquityMutex = $false
+    try {
+        try { $HasEquityMutex = $EquityMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HasEquityMutex = $true }
+        if (-not $HasEquityMutex) {
+            Write-Log 'SKIP' 'Equity yfinance EOD skipped: shared equity mutex is held'
+            return $true
+        }
+        $ok = Invoke-RetryPython 'scripts\equity_yf_eod_refresh.py' 'equity_yf_eod_refresh.py' '' 1200 2
+        if (-not $ok) { Write-Alert 'yfinance EOD refresh failed; existing prices retained' }
+        return $ok
+    }
+    finally {
+        if ($HasEquityMutex) { $EquityMutex.ReleaseMutex() }
+        $EquityMutex.Dispose()
+    }
+}
+
+$RunStartedAt = Get-Date
 $MacroStart = (Get-Date).AddDays(-45).ToString('yyyy-MM-dd')
 $MacroArgs = '--skip-deferred-recovery --start-date ' + $MacroStart
 
@@ -91,6 +128,8 @@ try {
         elseif (-not (Invoke-RetryPython 'scripts\macro_data_fetch.py' 'macro_data_fetch.py' $MacroArgs 1800 1)) {
             Write-Alert 'macro_data_fetch.py failed after its bounded attempt; attempting last-known-good AI report'
             $ExitCode = 1
+            $EquityOk = Invoke-EquityYfStage $RunStartedAt
+            if (-not $EquityOk) { Write-Log 'WARN' 'Continuing fallback AI with existing price data after yfinance EOD failure' }
             if (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 900) {
                 Write-Log 'DEGRADED' 'AI report completed on last-known-good data after macro ingestion failure'
             } else {
@@ -105,6 +144,8 @@ try {
         else {
             $GlobalOk = Invoke-RetryPython 'scripts\global_economic_data_fetch.py' 'global_economic_data_fetch.py' '--upsert-local --start-date 2026-04-01' 600
             if (-not $GlobalOk) { Write-Log 'WARN' 'global_economic_data_fetch.py failed after 3 retries; continuing with available macro data' }
+            $EquityOk = Invoke-EquityYfStage $RunStartedAt
+            if (-not $EquityOk) { Write-Log 'WARN' 'Continuing AI stage with existing price data after yfinance EOD failure' }
             if (-not (Invoke-RetryPython 'scripts\hourly_ai_macro_run.py' 'hourly_ai_macro_run.py' '--publish --model upstage/solar-mini4:free' 900)) {
                 Write-Alert 'hourly_ai_macro_run.py failed after 3 retries; previous report retained'
                 $ExitCode = 1

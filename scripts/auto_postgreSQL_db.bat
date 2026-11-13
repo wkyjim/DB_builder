@@ -33,6 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
       "elseif (-not (Invoke-RetryPython 'scripts\\build_sp500_breadth.py' 'build_sp500_breadth.py' @() 1800)) { Write-Log 'ERROR' 'build_sp500_breadth.py failed after 3 retries'; $ExitCode = 1 }" ^
       "elseif (-not (Invoke-RetryPython 'scripts\\pgSQL_daily_bulk_sync_to_neon.py' 'indicator reconciliation to Neon' @('--tables', 'indicators', '--reconciliation-days', '60', '--minimum-date', '2026-05-01') 1800)) { Write-Log 'ERROR' 'indicator reconciliation to Neon failed after 3 retries'; $ExitCode = 1 }" ^
       "else {" ^
+        "if (-not (Invoke-RetryPython 'scripts\\equity_yf_eod_refresh.py' 'yfinance reconciliation' @('--reconcile-only') 600)) { Write-Log 'WARN' 'yfinance reconciliation failed; provisional audit retained' };" ^
         "Write-Log 'FRESHNESS' 'Running post-ingestion freshness validation';" ^
         "$FreshnessArgs = @('scripts\\freshness_check.py','--datasets','Equities (raw),Equities (indicators)','--require-critical');" ^
         "$FreshnessOutput = (& $Python @FreshnessArgs 2>&1 | Out-String);" ^
