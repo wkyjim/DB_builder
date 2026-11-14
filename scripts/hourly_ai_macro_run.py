@@ -564,10 +564,17 @@ def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
     # Stable cap; each included ticker retains a non-score rationale.
     shortlist = picked[:20]
     included = [{"ticker": r["ticker"], "reasons": r.get("screen_reasons", [])} for r in shortlist]
+    if universe > len(records):
+        excluded["missing_recent_or_latest_price"] = universe - len(records)
     return shortlist, {
         "universe": universe, "eligible": len(records), "shortlisted": len(shortlist),
         "included": included,
         "excluded": excluded,
+        "eligible_not_shortlisted": max(0, len(records) - len(shortlist)),
+        "not_selected_reason": "outside the top independent momentum, dislocation, valuation and liquidity buckets",
+        "evidence_used": ["latest close", "20d and 60d price returns", "60d drawdown",
+                          "trailing P/E", "dollar volume", "GICS sector"],
+        "unavailable": ["verified earnings-revision history", "structured industry catalyst calendar"],
         "method": "independent momentum/dislocation/PE/liquidity buckets; no composite score",
     }
 
@@ -798,6 +805,10 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                   f"- S&P 500 universe: {scr.get('universe')}; eligible: {scr.get('eligible')}; "
                   f"transparent shortlist: {scr.get('shortlisted')}",
                   f"- Method: {scr.get('method')}",
+                  f"- Evidence used: {', '.join(scr.get('evidence_used', []))}",
+                  f"- Not available as verified inputs: {', '.join(scr.get('unavailable', []))}",
+                  f"- Eligible but not shortlisted: {scr.get('eligible_not_shortlisted')} "
+                  f"({scr.get('not_selected_reason')})",
                   "- Included: " + "; ".join(
                       f"{x.get('ticker')} ({', '.join(x.get('reasons', []))})"
                       for x in (scr.get("included") or [])[:20]),
