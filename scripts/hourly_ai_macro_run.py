@@ -397,7 +397,11 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
             # for forward EPS. A missing forward EPS remains null.
             if forward_eps is None and forward_pe not in (None, 0) and price is not None:
                 forward_eps = price / forward_pe
+            forward_eps_source = "source.forwardEps" if _num(vf.get("forward_eps")) is not None else (
+                "derived_price_over_pe" if forward_eps is not None else "missing")
             quality_flags = []
+            if forward_eps_source == "derived_price_over_pe":
+                quality_flags.append("circular_forward_eps")
             reported_eps = _num(ff.get("diluted_eps"))
             if forward_pe is None:
                 quality_flags.append("forward_pe_unavailable")
@@ -433,9 +437,11 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
                 "diluted_eps_reported": _num(ff.get("diluted_eps")),
                 "diluted_eps_definition": ff.get("definition") or "reported diluted EPS",
                 "forward_eps": forward_eps,
-                "forward_eps_basis": ("source.forwardEps" if _num(vf.get("forward_eps")) is not None
-                                      else ("derived: price / source.forwardPE"
-                                            if forward_eps is not None else None)),
+                "forward_eps_source": forward_eps_source,
+                "forward_eps_basis": forward_eps_source,
+                "fiscal_period_alignment": "unverified",
+                "period_flags": (["forward_eps_fiscal_period_unverified"]
+                                 if forward_eps is not None else ["forward_eps_missing"]),
                 "forward_pe": forward_pe, "price": price,
                 "quality_flags": quality_flags, "quality_ok": quality_ok,
                 "valuation_date": valuation_date,
@@ -490,6 +496,8 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             idea["diluted_eps_definition"] = ev.get("diluted_eps_definition")
             idea["fiscal_period"] = ev.get("fiscal_period")
             idea["forward_eps_basis"] = ev.get("forward_eps_basis")
+            idea["forward_eps_source"] = ev.get("forward_eps_source")
+            idea["period_flags"] = ev.get("period_flags")
             idea["eps_period"] = ev.get("eps_period")
             idea["growth_assumption_pct"] = (round(ev["fy1_growth"] * 100, 2)
                                               if ev.get("fy1_growth") is not None else None)
@@ -514,11 +522,33 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
                     target = idea.get(f"{prefix}_target")
                     idea[f"{prefix}_return_pct"] = (round((target / idea["price"] - 1) * 100, 2)
                                                     if target is not None else None)
-            if feps is not None and _num(inputs.get("base_multiple")):
+            valuation_flags = list(ev.get("quality_flags") or [])
+            base_ret = idea.get("base_return_pct")
+            base_mult = _num(inputs.get("base_multiple"))
+            if base_ret is not None and abs(base_ret) > 50:
+                valuation_flags.append("implausible_base_return")
+            if fpe and base_mult and abs(base_mult - fpe) / fpe < 0.02 and abs(base_ret or 0) < 5:
+                valuation_flags.append("target_multiple_equals_current_pe")
+            if valuation_flags:
+                idea["valuation_status"] = "incomplete"
+                idea["valuation_flags"] = sorted(set(valuation_flags))
+                idea["valuation_omitted_reason"] = "Target withheld: " + "; ".join(sorted(set(valuation_flags)))
+                for key in ("bull_target", "base_target", "bear_target",
+                            "bull_return_pct", "base_return_pct", "bear_return_pct"):
+                    idea[key] = None
+            else:
+                idea["valuation_status"] = "verified"
+                idea["valuation_flags"] = []
+                idea["valuation_omitted_reason"] = None
+            if feps is not None and _num(inputs.get("base_multiple")) and idea.get("valuation_status") == "verified":
                 idea["valuation_assumptions"] = (
                     f"Forward EPS {feps:.4f} ({ev.get('forward_eps_basis')}) x "
                     f"AI multiple assumption {_num(inputs.get('base_multiple')):.2f}; "
                     f"source IDs {', '.join(idea.get('source_ids', []))}")
+            elif idea.get("valuation_status") == "incomplete":
+                idea["valuation_assumptions"] = (
+                    "Target withheld. Qualitative research retained. "
+                    f"Flags: {', '.join(idea.get('valuation_flags', []))}.")
             else:
                 idea["valuation_assumptions"] = "Unavailable: verified forward EPS or assumption missing."
         else:
@@ -541,6 +571,10 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
                     target = idea.get(f"{prefix}_target")
                     idea[f"{prefix}_return_pct"] = (round((target / ev["price"] - 1) * 100, 2)
                                                    if target is not None else None)
+            idea["valuation_status"] = "verified" if holdings and ev.get("price") is not None else "incomplete"
+            idea["valuation_flags"] = [] if idea["valuation_status"] == "verified" else ["etf_valuation_incomplete"]
+            idea["valuation_omitted_reason"] = (None if idea["valuation_status"] == "verified"
+                                                 else "Target withheld: ETF holdings/price incomplete.")
             idea["valuation_assumptions"] = (
                 f"Holdings/portfolio valuation; {len(holdings)} weighted holdings; "
                 f"coverage {ev.get('holdings_coverage_pct'):.2f}%; source IDs "
@@ -732,11 +766,13 @@ def _section_errors(data: dict, section: str, expected: list[str], strict: bool 
             if len(rs) != 3:
                 errors.append(f"scenarios_{horizon}_not_3_rows")
                 continue
-            try:
-                if abs(sum(float(x.get("probability", 0)) for x in rs) - 100) > 0.5:
-                    errors.append(f"scenarios_{horizon}_probabilities_not_100")
-            except (TypeError, ValueError):
-                errors.append(f"scenarios_{horizon}_bad_probability")
+            probs = [x.get("probability") for x in rs]
+            if any(p is not None for p in probs):
+                try:
+                    if any(p is None for p in probs) or abs(sum(float(p) for p in probs) - 100) > 0.5:
+                        errors.append(f"scenarios_{horizon}_probabilities_not_100")
+                except (TypeError, ValueError):
+                    errors.append(f"scenarios_{horizon}_bad_probability")
             for x in rs:
                 if _num(x.get("return_pct")) is None:
                     errors.append(f"scenarios_{horizon}_return_pct_missing:{x.get('scenario')}")
@@ -1006,7 +1042,7 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
         lines += ["| Ticker | Security | Research view | Price | EPS | Forward P/E | Base target | Review |",
                   "| --- | --- | --- | --- | --- | --- | --- | --- |"]
         for i in stock_ideas:
-            lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {i.get('eps','')} | {i.get('forward_pe','')} | {i.get('base_target','')} | {i.get('review','')} |")
+            lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {i.get('eps','')} | {i.get('forward_pe','')} | {i.get('base_target') if i.get('base_target') is not None else '—'} | {i.get('review','')} |")
     else:
         lines.append("No qualifying stock ideas this run.")
     lines += ["", "## ETF Ideas", "",
@@ -1032,6 +1068,9 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                   f"- **Catalysts:** {', '.join(i.get('catalysts', []))}",
                   f"- **Risks:** {', '.join(i.get('risks', []))}",
                   f"- **Valuation method:** {i.get('valuation_method','')}",
+                  f"- **Valuation status:** {i.get('valuation_status','')}; "
+                  f"forward-EPS source: {i.get('forward_eps_source','')}; "
+                  f"period flags: {', '.join(i.get('period_flags', []) or [])}",
                   f"- **Valuation assumptions:** {i.get('valuation_assumptions','')}"]
         if i.get("security_type") == "Stock":
             lines += [f"- **EPS:** {i.get('eps','')} — period: {i.get('eps_period') or 'unavailable'}",
@@ -1048,8 +1087,14 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                       f"- **Portfolio valuation:** {i.get('portfolio_valuation','')}",
                       f"- **Sector exposure:** {i.get('sector_exposure','')}",
                       f"- **Underlying drivers:** {i.get('underlying_drivers','')}"]
-        lines += [f"- **Bull / Base / Bear:** {i.get('bull_target','')} / {i.get('base_target','')} / {i.get('bear_target','')}",
-                  f"- **Bull / Base / Bear returns:** {i.get('bull_return_pct')}% / {i.get('base_return_pct')}% / {i.get('bear_return_pct')}%",
+        lines += [f"- **Bull / Base / Bear:** "
+                  f"{i.get('bull_target') if i.get('bull_target') is not None else '—'} / "
+                  f"{i.get('base_target') if i.get('base_target') is not None else '—'} / "
+                  f"{i.get('bear_target') if i.get('bear_target') is not None else '—'}",
+                  f"- **Bull / Base / Bear returns:** "
+                  f"{i.get('bull_return_pct') if i.get('bull_return_pct') is not None else '—'}% / "
+                  f"{i.get('base_return_pct') if i.get('base_return_pct') is not None else '—'}% / "
+                  f"{i.get('bear_return_pct') if i.get('bear_return_pct') is not None else '—'}%",
                   f"- **Scenario probabilities:** not separately assigned; see scenario table.",
                   ""]
     rejected = report.get("rejected_ideas") or []
@@ -1070,10 +1115,12 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
               "", "Risk-only; no directional interpretation or allocation implication.", "",
               "## Scenarios", ""]
     for horizon in ("short_term", "long_term"):
-        lines += [f"### {horizon.replace('_',' ').title()}", "", "| Scenario | Probability | S&P 500 range | Assumptions |", "| --- | --- | --- | --- |"]
+        horizon_label = "5 trading sessions" if horizon == "short_term" else "12 months"
+        lines += [f"### {horizon.replace('_',' ').title()} ({horizon_label})", "", "| Scenario | Probability | S&P 500 range | Assumptions |", "| --- | --- | --- | --- |"]
         for x in (report.get("scenarios") or {}).get(horizon, []):
             if isinstance(x, dict):
-                lines.append(f"| {x.get('scenario','')} | {x.get('probability','')}% | {x.get('range','')} | {x.get('rationale') or x.get('assumptions','')} |")
+                prob = f"{x.get('probability')}%" if x.get("probability") is not None else "—"
+                lines.append(f"| {x.get('scenario','')} | {prob} | {x.get('range','')} | {x.get('rationale') or x.get('assumptions','')} |")
             else:
                 lines.append(f"| {x} | | | |")
         lines.append("")
@@ -1309,19 +1356,22 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
         if stype == "Stock":
             if not i.get("thesis"):
                 fails.append(f"stock_missing_thesis:{ticker}")
-            for k in ("base_target", "bull_target", "bear_target"):
-                if not i.get(k):
-                    fails.append(f"stock_missing_{k}:{ticker}")
+            if i.get("valuation_status", "verified") != "incomplete":
+                for k in ("base_target", "bull_target", "bear_target"):
+                    if not i.get(k):
+                        fails.append(f"stock_missing_{k}:{ticker}")
     for horizon in ("short_term", "long_term"):
         rows = (report.get("scenarios") or {}).get(horizon) or []
         if len(rows) != 3 or any(not isinstance(x, dict) for x in rows):
             fails.append(f"scenarios_{horizon}_malformed")
         else:
-            try:
-                if abs(sum(float(x.get("probability", 0)) for x in rows) - 100) > 0.5:
-                    fails.append(f"scenarios_{horizon}_probabilities_not_100")
-            except (TypeError, ValueError):
-                fails.append(f"scenarios_{horizon}_bad_probability")
+            probs = [x.get("probability") for x in rows]
+            if any(p is not None for p in probs):
+                try:
+                    if any(p is None for p in probs) or abs(sum(float(p) for p in probs) - 100) > 0.5:
+                        fails.append(f"scenarios_{horizon}_probabilities_not_100")
+                except (TypeError, ValueError):
+                    fails.append(f"scenarios_{horizon}_bad_probability")
             for x in rows:
                 range_text = str(x.get("range") or "").strip()
                 numeric_range = bool(

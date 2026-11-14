@@ -115,7 +115,7 @@ def test_apply_evidence_bindings_computes_targets_and_rejects_ai_numbers():
         "scenarios": {"short_term": [{"scenario": "Bull", "return_pct": 2.0, "range": "bad"}]},
     }
     evidence = {"ticker_evidence": {"AAA": {
-        "ticker": "AAA", "security_type": "Stock", "forward_eps": 2.0, "forward_pe": 20.0,
+        "ticker": "AAA", "security_type": "Stock", "forward_eps": 2.0, "forward_pe": 15.0,
         "price": 40.0, "valuation_date": "2026-11-13", "source_ids": ["S000"],
         "diluted_eps_reported": 1.0, "diluted_eps_definition": "reported diluted EPS",
         "forward_eps_basis": "source.forwardEps", "fiscal_period": "2026-09-30",
@@ -123,8 +123,9 @@ def test_apply_evidence_bindings_computes_targets_and_rejects_ai_numbers():
     out = ai.apply_evidence_bindings(report, evidence)
     idea = out["ideas"][0]
     assert idea["eps"] == 2.0
-    assert idea["forward_pe"] == 20.0
+    assert idea["forward_pe"] == 15.0
     assert idea["base_target"] == 40.0
+    assert idea["valuation_status"] == "verified"
     assert idea["bull_target"] == 50.0
     assert idea["bear_target"] == 30.0
     assert idea["price"] == 40.0
