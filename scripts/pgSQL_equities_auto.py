@@ -111,7 +111,10 @@ def get_canonical_coverage(engine, session: date | None) -> dict:
                 LIMIT 5
             ) prior
         """), {"d": session}).scalar() or 0
-    ratio = (int(verified) / int(baseline)) if baseline else 0.0
+    # Only unambiguously canonical Massive rows may satisfy the skip gate.
+    # Verified fallback rows are reported separately for audit but are
+    # provisional and cannot by themselves trigger SKIPPED_ALREADY_CURRENT.
+    ratio = (int(target) / int(baseline)) if baseline else 0.0
     return {
         "ticker_count": int(target), "verified_ticker_count": int(verified),
         "baseline_count": int(baseline), "ratio": ratio,
