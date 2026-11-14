@@ -413,7 +413,8 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
                     quality_flags.append("forward_eps_vs_reported_jump")
             quality_ok = not quality_flags
             fy1 = date.today().year + 1
-            eps_period = (f"FY{fy1} (+1y consensus)" if vf.get("fy1_eps") is not None
+            eps_period = ("Yahoo +1y consensus (fiscal-year mapping unverified; not labeled FY2027)"
+                          if vf.get("fy1_eps") is not None
                           else "NTM/forward; fiscal period not supplied")
             out[ticker] = {
                 "ticker": ticker, "security_type": "Stock",
@@ -439,6 +440,7 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
                 "forward_eps_source": forward_eps_source,
                 "forward_eps_basis": forward_eps_source,
                 "fiscal_period_alignment": "unverified",
+                "fiscal_year_mapping": "unverified",
                 "period_flags": (["forward_eps_fiscal_period_unverified"]
                                  if forward_eps is not None else ["forward_eps_missing"]),
                 "forward_pe": forward_pe, "price": price,
@@ -497,6 +499,7 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             idea["forward_eps_basis"] = ev.get("forward_eps_basis")
             idea["forward_eps_source"] = ev.get("forward_eps_source")
             idea["period_flags"] = ev.get("period_flags")
+            idea["fiscal_year_mapping"] = ev.get("fiscal_year_mapping")
             idea["eps_period"] = ev.get("eps_period")
             idea["growth_assumption_pct"] = (round(ev["fy1_growth"] * 100, 2)
                                               if ev.get("fy1_growth") is not None else None)
