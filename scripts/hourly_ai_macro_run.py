@@ -79,7 +79,18 @@ def _read(sql: str, params: dict | None = None) -> pd.DataFrame:
         return pd.read_sql(text(sql), c, params=params or {})
 
 
-def load_evidence(as_of: date) -> dict:
+def _etf_price_change(value):
+    raw = _num(value)
+    if raw is None:
+        return {"raw_pct_chg": None, "pct_chg_used": False,
+                "pct_chg_warning": "unavailable"}
+    implausible = abs(raw) > 50.0
+    return {"raw_pct_chg": raw, "pct_chg_used": not implausible,
+            "pct_chg_warning": ("implausible; retained for audit but not used as a research input"
+                                if implausible else "ok")}
+
+
+def load_evidence(as_of: date, expanded: bool = False) -> dict:
     latest_equity = _query("select max(date) from public.us_equities")[0][0]
     latest_macro = _query("select max(date) from public.macro")[0][0]
     db_retrieved = _query("select max(retrieved_at) from public.us_equities where date=:d",
@@ -132,7 +143,7 @@ def load_evidence(as_of: date) -> dict:
             r = row[0]
             econ_rows.append({"date": str(r[0]), "series_id": r[1], "name": r[2],
                               "value": float(r[3]), "unit": r[4], "category": r[5]})
-    candidates, screening = build_stock_discovery(latest_equity)
+    candidates, screening = build_stock_discovery(latest_equity, expanded=expanded)
     for c in candidates:
         c["pct_chg"] = None
     etf_rows = _read(
@@ -154,7 +165,7 @@ def load_evidence(as_of: date) -> dict:
                                "security_type": "ETF", "close": float(r.close) if pd.notna(r.close) else None,
                                "pct_chg": None,
                                "volume": float(r.volume) if pd.notna(r.volume) else None,
-                               "date": str(r.date)})
+                               "date": str(r.date), **_etf_price_change(r.pct_chg)})
             existing.add(etf)
     for e in etf_rows.itertuples():
         et = str(e.ticker).upper()
@@ -165,8 +176,14 @@ def load_evidence(as_of: date) -> dict:
                                "close": float(r.close) if pd.notna(r.close) else None,
                                "pct_chg": None,
                                "volume": float(r.volume) if pd.notna(r.volume) else None,
-                               "date": str(r.date)})
+                               "date": str(r.date), **_etf_price_change(r.pct_chg)})
             existing.add(et)
+    screening["etf_price_change_warnings"] = [
+        {"ticker": c["ticker"], "raw_pct_chg": c.get("raw_pct_chg"),
+         "warning": c.get("pct_chg_warning")}
+        for c in candidates if c.get("security_type") == "ETF" and c.get("pct_chg_warning") not in (None, "ok")
+    ]
+
     def lag(start, end):
         if start is None or end is None:
             return None
@@ -380,9 +397,39 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
             # for forward EPS. A missing forward EPS remains null.
             if forward_eps is None and forward_pe not in (None, 0) and price is not None:
                 forward_eps = price / forward_pe
+            quality_flags = []
+            reported_eps = _num(ff.get("diluted_eps"))
+            if forward_pe is None:
+                quality_flags.append("forward_pe_unavailable")
+            elif forward_pe < 5 or forward_pe > 200:
+                quality_flags.append("forward_pe_outside_plausible_range")
+            if forward_eps is not None and price:
+                if forward_eps > 0 and forward_eps / price > 0.20:
+                    quality_flags.append("implausible_earnings_yield")
+                if reported_eps is not None and abs(reported_eps) > 0 and abs(forward_eps) > 10 * abs(reported_eps):
+                    quality_flags.append("forward_eps_vs_reported_jump")
+            quality_ok = not quality_flags
+            fy1 = date.today().year + 1
+            eps_period = (f"FY{fy1} (+1y consensus)" if vf.get("fy1_eps") is not None
+                          else "NTM/forward; fiscal period not supplied")
             out[ticker] = {
                 "ticker": ticker, "security_type": "Stock",
                 "fiscal_period": ff.get("fiscal_end"),
+                "eps_period": eps_period,
+                "fy1_eps": _num(vf.get("fy1_eps")),
+                "fy1_growth": _num(vf.get("fy1_growth")),
+                "fy1_revenue_growth": _num(vf.get("fy1_revenue_growth")),
+                "fy1_analysts": _num(vf.get("fy1_analysts")),
+                "fy2_eps": None,
+                "fy2_status": vf.get("fy2_status") or "not available from retrieved source",
+                "consensus_available": bool(vf.get("consensus_available")),
+                "revisions_available": bool(vf.get("revisions_available")),
+                "revenue_growth": _num(vf.get("revenue_growth")),
+                "earnings_growth": _num(vf.get("earnings_growth")),
+                "gross_margin": _num(vf.get("gross_margin")),
+                "operating_margin": _num(vf.get("operating_margin")),
+                "profit_margin": _num(vf.get("profit_margin")),
+                "return_on_equity": _num(vf.get("return_on_equity")),
                 "diluted_eps_reported": _num(ff.get("diluted_eps")),
                 "diluted_eps_definition": ff.get("definition") or "reported diluted EPS",
                 "forward_eps": forward_eps,
@@ -390,6 +437,7 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
                                       else ("derived: price / source.forwardPE"
                                             if forward_eps is not None else None)),
                 "forward_pe": forward_pe, "price": price,
+                "quality_flags": quality_flags, "quality_ok": quality_ok,
                 "valuation_date": valuation_date,
                 "source_as_of": (ff.get("filed") or valuation_date),
                 "source_ids": source_ids,
@@ -442,12 +490,30 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             idea["diluted_eps_definition"] = ev.get("diluted_eps_definition")
             idea["fiscal_period"] = ev.get("fiscal_period")
             idea["forward_eps_basis"] = ev.get("forward_eps_basis")
+            idea["eps_period"] = ev.get("eps_period")
+            idea["growth_assumption_pct"] = (round(ev["fy1_growth"] * 100, 2)
+                                              if ev.get("fy1_growth") is not None else None)
+            idea["fy1_growth"] = ev.get("fy1_growth")
+            idea["fy1_revenue_growth"] = ev.get("fy1_revenue_growth")
+            idea["fy2_eps"] = ev.get("fy2_eps")
+            idea["fy2_status"] = ev.get("fy2_status")
+            idea["consensus_available"] = ev.get("consensus_available")
+            idea["revisions_available"] = ev.get("revisions_available")
+            idea["revenue_growth"] = ev.get("revenue_growth")
+            idea["earnings_growth"] = ev.get("earnings_growth")
+            idea["gross_margin"] = ev.get("gross_margin")
+            idea["operating_margin"] = ev.get("operating_margin")
             vals = [("bull_target", inputs.get("bull_multiple")),
                     ("base_target", inputs.get("base_multiple")),
                     ("bear_target", inputs.get("bear_multiple"))]
             for key, multiple in vals:
                 m = _num(multiple)
                 idea[key] = round(feps * m, 2) if feps is not None and m and m > 0 else None
+            if idea.get("price"):
+                for prefix in ("bull", "base", "bear"):
+                    target = idea.get(f"{prefix}_target")
+                    idea[f"{prefix}_return_pct"] = (round((target / idea["price"] - 1) * 100, 2)
+                                                    if target is not None else None)
             if feps is not None and _num(inputs.get("base_multiple")):
                 idea["valuation_assumptions"] = (
                     f"Forward EPS {feps:.4f} ({ev.get('forward_eps_basis')}) x "
@@ -470,6 +536,11 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             for key, pct in vals:
                 r = _num(pct)
                 idea[key] = round(ev["price"] * (1 + r / 100.0), 2) if ev.get("price") is not None and r is not None else None
+            if ev.get("price"):
+                for prefix in ("bull", "base", "bear"):
+                    target = idea.get(f"{prefix}_target")
+                    idea[f"{prefix}_return_pct"] = (round((target / ev["price"] - 1) * 100, 2)
+                                                   if target is not None else None)
             idea["valuation_assumptions"] = (
                 f"Holdings/portfolio valuation; {len(holdings)} weighted holdings; "
                 f"coverage {ev.get('holdings_coverage_pct'):.2f}%; source IDs "
@@ -482,7 +553,7 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
     return report
 
 
-def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
+def build_stock_discovery(latest_equity, expanded: bool = False) -> tuple[list[dict], dict]:
     """Build a transparent S&P 500 shortlist without composite scores.
 
     Buckets are independent and explainable: positive momentum, dislocation,
@@ -507,6 +578,15 @@ def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
         WHERE start_date <= :d AND (end_date IS NULL OR end_date > :d)
     """, {"d": latest_equity})
     universe = int(members[0][0]) if members else 0
+    pe_rows = _read("""
+        SELECT DISTINCT ON (ticker) ticker,date,pe_ttm,mkt_cap
+        FROM public.us_equities
+        WHERE date >= (CAST(:d AS date) - INTERVAL '30 days')
+          AND date <= :d AND pe_ttm IS NOT NULL
+        ORDER BY ticker,date DESC
+    """, {"d": latest_equity})
+    pe_map = {str(r.ticker).upper(): (r.date, _num(r.pe_ttm), _num(r.mkt_cap))
+              for r in pe_rows.itertuples()} if not pe_rows.empty else {}
     excluded = {}
     records = []
     if not rows.empty:
@@ -533,6 +613,8 @@ def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
                 "pct_chg": None, "volume": _num(last["volume"]),
                 "dollar_volume": close * (_num(last["volume"]) or 0),
                 "pe_ttm": _num(last["pe_ttm"]),
+                "pe_ttm_history": (pe_map.get(str(ticker).upper()) or (None, None, None))[1],
+                "pe_as_of": str((pe_map.get(str(ticker).upper()) or (None,))[0]) if pe_map.get(str(ticker).upper()) else None,
                 "return_20d": ret20, "return_60d": ret60,
                 "drawdown_60d": drawdown,
                 "date": str(latest_equity),
@@ -540,6 +622,21 @@ def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
     if not records:
         return [], {"universe": universe, "shortlisted": 0, "included": [],
                     "excluded": excluded, "reason": "no eligible records"}
+
+    # Fundamental discovery inputs available for the full universe: trailing
+    # earnings yield and P/E relative to the company's own GICS sector. Growth,
+    # margins and consensus are retrieved later only for the shortlist.
+    sector_pes = {}
+    for r in records:
+        if r.get("pe_ttm_history") is not None and r["pe_ttm_history"] > 0:
+            sector_pes.setdefault(r.get("sector") or "Unknown", []).append(r["pe_ttm_history"])
+    sector_median = {k: sorted(v)[len(v) // 2] for k, v in sector_pes.items() if v}
+    for r in records:
+        pe = r.get("pe_ttm_history")
+        if pe is not None and pe > 0:
+            r["earnings_yield"] = 1.0 / pe
+            med = sector_median.get(r.get("sector") or "Unknown")
+            r["sector_relative_pe"] = (pe / med) if med else None
 
     def take(key, reverse, predicate, reason, n=8):
         ranked = [r for r in records if predicate(r)]
@@ -561,9 +658,29 @@ def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
         if r not in picked: picked.append(r)
     for r in take("dollar_volume", True, lambda x: x.get("dollar_volume") is not None, "liquidity_leader"):
         if r not in picked: picked.append(r)
+    if expanded:
+        for r in take("sector_relative_pe", False,
+                      lambda x: x.get("sector_relative_pe") is not None,
+                      "fundamental_sector_relative_valuation"):
+            if r not in picked: picked.append(r)
+        for r in take("earnings_yield", True,
+                      lambda x: x.get("earnings_yield") is not None,
+                      "fundamental_earnings_yield"):
+            if r not in picked: picked.append(r)
     # Stable cap; each included ticker retains a non-score rationale.
-    shortlist = picked[:20]
-    included = [{"ticker": r["ticker"], "reasons": r.get("screen_reasons", [])} for r in shortlist]
+    shortlist = picked[:24 if expanded else 20]
+    if expanded:
+        priority = {"fundamental_sector_relative_valuation": 0,
+                    "fundamental_earnings_yield": 1,
+                    "top_20d_momentum": 2,
+                    "largest_20d_dislocation": 3,
+                    "liquidity_leader": 4}
+        shortlist = sorted(shortlist, key=lambda r: min(
+            priority.get(x, 9) for x in r.get("screen_reasons", [])))
+    included = [{"ticker": r["ticker"], "reasons": r.get("screen_reasons", []),
+                 "pe_ttm": r.get("pe_ttm_history"), "pe_as_of": r.get("pe_as_of"),
+                 "earnings_yield": r.get("earnings_yield"),
+                 "sector_relative_pe": r.get("sector_relative_pe")} for r in shortlist]
     if universe > len(records):
         excluded["missing_recent_or_latest_price"] = universe - len(records)
     return shortlist, {
@@ -573,9 +690,16 @@ def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
         "eligible_not_shortlisted": max(0, len(records) - len(shortlist)),
         "not_selected_reason": "outside the top independent momentum, dislocation, valuation and liquidity buckets",
         "evidence_used": ["latest close", "20d and 60d price returns", "60d drawdown",
-                          "trailing P/E", "dollar volume", "GICS sector"],
-        "unavailable": ["verified earnings-revision history", "structured industry catalyst calendar"],
-        "method": "independent momentum/dislocation/PE/liquidity buckets; no composite score",
+                          "trailing P/E", "earnings yield", "sector-relative P/E",
+                          "dollar volume", "GICS sector"],
+        "fundamental_evidence": ("trailing P/E and earnings yield across the 503-name universe; "
+                                 "growth/margins/consensus retrieved only for source-backed shortlist names"),
+        "unavailable": ["verified earnings-revision history for the full universe",
+                        "FY+2 consensus", "structured industry catalyst calendar"],
+        "expanded": bool(expanded),
+        "method": ("independent momentum/dislocation/valuation/liquidity/fundamental buckets; no composite score"
+                   if expanded else
+                   "independent momentum/dislocation/PE/liquidity buckets; no composite score"),
     }
 
 
@@ -599,7 +723,7 @@ def _research_fingerprint(evidence: dict, risk: dict) -> str:
     }, sort_keys=True, default=str))
 
 
-def _section_errors(data: dict, section: str, expected: list[str]) -> list[str]:
+def _section_errors(data: dict, section: str, expected: list[str], strict: bool = False) -> list[str]:
     errors = []
     rows = data.get(section) if isinstance(data, dict) else None
     if section == "scenarios":
@@ -616,6 +740,12 @@ def _section_errors(data: dict, section: str, expected: list[str]) -> list[str]:
             for x in rs:
                 if _num(x.get("return_pct")) is None:
                     errors.append(f"scenarios_{horizon}_return_pct_missing:{x.get('scenario')}")
+                if strict and not str(x.get("rationale") or "").strip():
+                    errors.append(f"scenarios_{horizon}_rationale_missing:{x.get('scenario')}")
+            if strict:
+                rationales = {str(x.get("rationale") or "").strip().lower() for x in rs}
+                if len(rationales) < 2:
+                    errors.append(f"scenarios_{horizon}_rationale_generic")
         return errors
     if not isinstance(rows, dict):
         return [f"{section}_object_missing"]
@@ -624,21 +754,31 @@ def _section_errors(data: dict, section: str, expected: list[str]) -> list[str]:
         if not isinstance(vals, dict):
             errors.append(f"{section}_missing:{ticker}")
             continue
-        for key in (("base_multiple", "bull_multiple", "bear_multiple")
-                    if section == "stocks" else
+        stock_keys = ("base_multiple", "bull_multiple", "bear_multiple")
+        if strict:
+            stock_keys = ("growth_pct",) + stock_keys
+        for key in (stock_keys if section == "stocks" else
                     ("base_return_pct", "bull_return_pct", "bear_return_pct")):
             if _num(vals.get(key)) is None:
                 errors.append(f"{section}_{key}_not_numeric:{ticker}")
     return errors
 
 
-def _qualitative_errors(data: dict) -> list[str]:
+def _qualitative_errors(data: dict, strict: bool = False) -> list[str]:
     ideas = (data or {}).get("ideas") or []
     errors = []
     if not 3 <= len(ideas) <= 5:
         errors.append("ideas_not_3_to_5")
     for i in ideas:
         ticker = str(i.get("ticker", "")).upper()
+        if strict:
+            if i.get("stance") not in ("POSITIVE", "NEUTRAL", "NEGATIVE"):
+                errors.append(f"idea_invalid_stance:{ticker}")
+            if not str(i.get("why_preferred") or "").strip():
+                errors.append(f"idea_missing_why_preferred:{ticker}")
+            alts = i.get("alternatives_considered") or []
+            if not isinstance(alts, list) or not any(str(a).strip() for a in alts):
+                errors.append(f"idea_missing_alternatives:{ticker}")
         if i.get("security_type") == "ETF":
             for f in ("sector_exposure", "underlying_drivers"):
                 if not i.get(f):
@@ -648,9 +788,10 @@ def _qualitative_errors(data: dict) -> list[str]:
 
 def _call_qualitative(prompt: str, payload: dict, model: str) -> tuple[dict, dict]:
     last_errors = []
+    strict = bool(payload.get("strict"))
     for attempt in (1, 2):
         data, meta = _ai_call(prompt, payload, model, max_tokens=3000)
-        errors = _qualitative_errors(data)
+        errors = _qualitative_errors(data, strict=strict)
         if not errors:
             return data, {**meta, "section": "qualitative", "attempts": attempt, "errors": []}
         last_errors = errors
@@ -660,12 +801,12 @@ def _call_qualitative(prompt: str, payload: dict, model: str) -> tuple[dict, dic
 
 
 def _call_numeric(prompt: str, payload: dict, model: str, section: str,
-                  expected: list[str]) -> tuple[dict, dict]:
+                  expected: list[str], strict: bool = False) -> tuple[dict, dict]:
     """Call one numeric section, retrying only that section once on QC errors."""
     last_errors = []
     for attempt in (1, 2):
         data, meta = _ai_call(prompt, payload, model, max_tokens=1400)
-        errors = _section_errors(data, section, expected)
+        errors = _section_errors(data, section, expected, strict=strict)
         if not errors:
             return data, {**meta, "section": section, "attempts": attempt, "errors": []}
         last_errors = errors
@@ -693,6 +834,7 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     etf_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_etf_assumptions.txt").read_text(encoding="utf-8")
     scenario_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_scenarios.txt").read_text(encoding="utf-8")
     all_external = (evidence.get("external_sources") or {}).get("sources", [])
+    strict = bool((evidence.get("screening") or {}).get("expanded"))
     sector_etfs = set(SECTOR_ETF.values())
     def compact(s):
         return {"id": s.get("id"), "kind": s.get("kind"), "ticker": s.get("ticker"),
@@ -711,12 +853,22 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     ideas_payload = {k: payload[k] for k in (
         "as_of", "latest_equity_date", "latest_macro_date", "data_qc", "candidates",
         "risk", "source_retrieval")}
-    ideas_payload["candidates"] = payload["candidates"][:16]
+    evidence_keys = {str(t).upper() for t in (evidence.get("ticker_evidence") or {})}
+    ideas_payload["candidates"] = [
+        c for c in payload["candidates"][:24]
+        if str(c.get("ticker", "")).upper() in evidence_keys
+        and ((evidence["ticker_evidence"].get(str(c.get("ticker", "")).upper()) or {}).get("source_ids"))
+        and ((evidence["ticker_evidence"].get(str(c.get("ticker", "")).upper()) or {}).get("forward_eps") is not None
+             if c.get("security_type") == "Stock" else True)
+        and ((evidence["ticker_evidence"].get(str(c.get("ticker", "")).upper()) or {}).get("quality_ok", True)
+             if c.get("security_type") == "Stock" else True)
+    ][:16]
     ideas_payload["ticker_evidence"] = {
         t: ev for t, ev in (evidence.get("ticker_evidence") or {}).items()
         if t in {c.get("ticker") for c in ideas_payload["candidates"]}
     }
     ideas_payload["external_sources"] = ideas_external[:24]
+    ideas_payload["strict"] = strict
     fingerprint = _research_fingerprint(evidence, risk)
     last_exc = None
     for candidate_model in [model] + [m for m in FALLBACK_MODELS if m != model]:
@@ -735,21 +887,33 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
                            "ticker_evidence": {x.get("ticker"): te.get(x.get("ticker")) for x in etfs}}
             stock_assumptions, stock_meta = _call_numeric(
                 stock_prompt, stock_payload, candidate_model, "stocks",
-                [x.get("ticker") for x in stocks]) if stocks else ({}, {"section": "stocks", "attempts": 0, "errors": []})
+                [x.get("ticker") for x in stocks], strict=strict) if stocks else ({}, {"section": "stocks", "attempts": 0, "errors": []})
             etf_assumptions, etf_meta = _call_numeric(
                 etf_prompt, etf_payload, candidate_model, "etfs",
-                [x.get("ticker") for x in etfs]) if etfs else ({}, {"section": "etfs", "attempts": 0, "errors": []})
+                [x.get("ticker") for x in etfs], strict=strict) if etfs else ({}, {"section": "etfs", "attempts": 0, "errors": []})
             scenario_data, scenario_meta = _call_numeric(
                 scenario_prompt, {"as_of": evidence["as_of"], "risk": risk},
-                candidate_model, "scenarios", [])
+                candidate_model, "scenarios", [], strict=strict)
             smap = stock_assumptions.get("stocks") or {}
             emap = etf_assumptions.get("etfs") or {}
-            for x in stocks:
-                x["assumption_inputs"] = smap.get(str(x.get("ticker", "")).upper()) or {}
-            for x in etfs:
-                x["assumption_inputs"] = emap.get(str(x.get("ticker", "")).upper()) or {}
+            rejected = []
+            valid_ideas = []
+            for x in ideas:
+                ticker = str(x.get("ticker", "")).upper()
+                section = "stocks" if x.get("security_type") == "Stock" else "etfs"
+                amap = smap if section == "stocks" else emap
+                inputs = amap.get(ticker) or {}
+                x["assumption_inputs"] = inputs
+                errs = _section_errors({section: {ticker: inputs}}, section, [ticker])
+                if errs:
+                    rejected.append({"ticker": ticker, "section": section,
+                                     "reason": "numeric assumptions unavailable after one retry",
+                                     "errors": errs})
+                else:
+                    valid_ideas.append(x)
             merged = dict(market)
-            merged["ideas"] = ideas
+            merged["ideas"] = valid_ideas
+            merged["rejected_ideas"] = rejected
             merged["scenarios"] = {"short_term": scenario_data.get("short_term", []),
                                    "long_term": scenario_data.get("long_term", [])}
             meta = {"provider": "hermes-local-proxy", "model": candidate_model,
@@ -812,7 +976,8 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                   "- Included: " + "; ".join(
                       f"{x.get('ticker')} ({', '.join(x.get('reasons', []))})"
                       for x in (scr.get("included") or [])[:20]),
-                  "- Excluded reasons: " + json.dumps(scr.get("excluded") or {}, sort_keys=True), ""]
+                  "- Excluded reasons: " + json.dumps(scr.get("excluded") or {}, sort_keys=True),
+                  "- Valuation-quality rejected: " + json.dumps(scr.get("valuation_quality_rejected") or [], sort_keys=True), ""]
     lines += ["## Market Snapshot", "", "| Asset | Latest | Change | Observation |", "| --- | --- | --- | --- |"]
     for row in report.get("market_snapshot", []):
         lines.append(f"| {row.get('asset','')} | {row.get('latest','')} | {row.get('change','')} | {row.get('observation','')} |")
@@ -859,7 +1024,9 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     for i in report.get("ideas", []):
         lines += [f"### {i.get('ticker','')} — {i.get('name','')}", "",
                   f"- **Type:** {i.get('security_type','')}",
-                  f"- **Research view:** {i.get('research_view','')}",
+                  f"- **Research view:** {i.get('research_view','')} (stance: {i.get('stance','')})",
+                  f"- **Why preferred / alternatives:** {i.get('why_preferred','')} "
+                  f"Alternatives considered: {', '.join(i.get('alternatives_considered', []) or [])}.",
                   f"- **Thesis:** {i.get('thesis','')}",
                   f"- **Source IDs:** {', '.join(i.get('source_ids', []))}",
                   f"- **Catalysts:** {', '.join(i.get('catalysts', []))}",
@@ -867,8 +1034,11 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                   f"- **Valuation method:** {i.get('valuation_method','')}",
                   f"- **Valuation assumptions:** {i.get('valuation_assumptions','')}"]
         if i.get("security_type") == "Stock":
-            lines += [f"- **EPS:** {i.get('eps','')}",
+            lines += [f"- **EPS:** {i.get('eps','')} — period: {i.get('eps_period') or 'unavailable'}",
                       f"- **Forward P/E:** {i.get('forward_pe','')}",
+                      f"- **FY+1 growth assumption:** {i.get('growth_assumption_pct')}%; "
+                      f"consensus available: {i.get('consensus_available')}; "
+                      f"revisions available: {i.get('revisions_available')}; FY+2: {i.get('fy2_status')}",
                       f"- **Company fundamentals:** {i.get('company_fundamentals','')}"]
         else:
             th = i.get("top_holdings", "")
@@ -879,8 +1049,15 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                       f"- **Sector exposure:** {i.get('sector_exposure','')}",
                       f"- **Underlying drivers:** {i.get('underlying_drivers','')}"]
         lines += [f"- **Bull / Base / Bear:** {i.get('bull_target','')} / {i.get('base_target','')} / {i.get('bear_target','')}",
+                  f"- **Bull / Base / Bear returns:** {i.get('bull_return_pct')}% / {i.get('base_return_pct')}% / {i.get('bear_return_pct')}%",
                   f"- **Scenario probabilities:** not separately assigned; see scenario table.",
                   ""]
+    rejected = report.get("rejected_ideas") or []
+    if rejected:
+        lines += ["## Rejected Ideas", ""]
+        for x in rejected:
+            lines.append(f"- {x.get('ticker')}: {x.get('reason')} ({', '.join(x.get('errors', []))})")
+        lines += [""]
     lines += ["## Quant Risk Layer", "", "| Field | Value |", "| --- | --- |",
               "| Volatility model | vol5_ols_v1 |", "| Spike model | spike_logit_v1 |",
               f"| As-of date | {r.get('as_of','')} |", f"| Target window | {r.get('target_start','')} to {r.get('target_end','')} |",
@@ -896,7 +1073,7 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
         lines += [f"### {horizon.replace('_',' ').title()}", "", "| Scenario | Probability | S&P 500 range | Assumptions |", "| --- | --- | --- | --- |"]
         for x in (report.get("scenarios") or {}).get(horizon, []):
             if isinstance(x, dict):
-                lines.append(f"| {x.get('scenario','')} | {x.get('probability','')}% | {x.get('range','')} | {x.get('assumptions','')} |")
+                lines.append(f"| {x.get('scenario','')} | {x.get('probability','')}% | {x.get('range','')} | {x.get('rationale') or x.get('assumptions','')} |")
             else:
                 lines.append(f"| {x} | | | |")
         lines.append("")
@@ -1173,6 +1350,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--publish", action="store_true")
     ap.add_argument("--model", default="upstage/solar-mini4:free")
+    ap.add_argument("--expanded-discovery", action="store_true",
+                    help="shadow/controlled expanded fundamental discovery")
     ap.add_argument("--out", default="/tmp/aegis_hourly")
     args = ap.parse_args()
     if args.publish and args.dry_run:
@@ -1180,17 +1359,27 @@ def main() -> int:
     dry = not args.publish
     now = datetime.now(timezone.utc)
     as_of = last_completed_session(now)
-    evidence = load_evidence(as_of)
+    expanded = args.expanded_discovery or os.getenv("AEGIS_EXPANDED_DISCOVERY", "0") == "1"
+    evidence = load_evidence(as_of, expanded=expanded)
     if evidence.get("data_qc", {}).get("status") == "FAIL":
         print("DATA QC FAILED — previous report retained:", evidence["data_qc"])
         return 1
     try:
-        ext = retrieve_external_sources(evidence, evidence.get("candidates", []), max_stocks=12, max_etfs=12)
+        ext = retrieve_external_sources(
+            evidence, evidence.get("candidates", []),
+            max_stocks=20 if expanded else 12, max_etfs=12)
     except Exception as exc:
         print("EXTERNAL SOURCE RETRIEVAL FAILED — previous report retained:", repr(exc))
         return 5
     evidence["external_sources"] = ext
     evidence["ticker_evidence"] = build_ticker_evidence(evidence, ext)
+    screening = evidence.get("screening") or {}
+    screening["valuation_quality_rejected"] = [
+        {"ticker": k, "flags": v.get("quality_flags", [])}
+        for k, v in evidence["ticker_evidence"].items()
+        if v.get("security_type") == "Stock" and not v.get("quality_ok", True)
+    ]
+    evidence["screening"] = screening
     ok_ids = {s["id"] for s in ext.get("sources", []) if s.get("status") == "ok"}
     eligible = []
     for c in evidence.get("candidates", []):

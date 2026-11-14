@@ -32,6 +32,15 @@ MACRO_SERIES = [
 ]
 
 
+def _num(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -169,6 +178,61 @@ def _yf(ticker: str, kind: str, sources: list[dict]) -> None:
                 except (TypeError, ValueError):
                     facts[fact_key] = info[key]
         facts["valuation_date"] = _now()[:10]
+        if kind == "stock":
+            # Verified company fundamentals and sell-side estimate levels.
+            # FY+2 estimates and revisions are not supplied by this endpoint;
+            # leave them null rather than filling them from a proxy.
+            for key, fact_key in (
+                ("trailingEps", "trailing_eps"),
+                ("revenueGrowth", "revenue_growth"),
+                ("earningsGrowth", "earnings_growth"),
+                ("grossMargins", "gross_margin"),
+                ("operatingMargins", "operating_margin"),
+                ("profitMargins", "profit_margin"),
+                ("returnOnEquity", "return_on_equity"),
+                ("totalRevenue", "total_revenue"),
+                ("marketCap", "market_cap"),
+            ):
+                if info.get(key) not in (None, ""):
+                    try:
+                        facts[fact_key] = float(info[key])
+                    except (TypeError, ValueError):
+                        facts[fact_key] = info[key]
+                    claims.append(f"{fact_key.replace('_',' ').title()}: {info[key]}")
+            try:
+                ee = tk.earnings_estimate
+                re_df = tk.revenue_estimate
+                estimates = {}
+                for period in ("0y", "+1y"):
+                    if ee is not None and period in getattr(ee, "index", []):
+                        row = ee.loc[period]
+                        estimates[period] = {
+                            "eps": _num(row.get("avg")),
+                            "growth": _num(row.get("growth")),
+                            "analysts": _num(row.get("numberOfAnalysts")),
+                        }
+                    if re_df is not None and period in getattr(re_df, "index", []):
+                        row = re_df.loc[period]
+                        estimates.setdefault(period, {})
+                        estimates[period]["revenue"] = _num(row.get("avg"))
+                        estimates[period]["revenue_growth"] = _num(row.get("growth"))
+                if estimates:
+                    facts["estimates"] = estimates
+                    facts["fy0_eps"] = estimates.get("0y", {}).get("eps")
+                    facts["fy1_eps"] = estimates.get("+1y", {}).get("eps")
+                    facts["fy1_growth"] = estimates.get("+1y", {}).get("growth")
+                    facts["fy1_revenue_growth"] = estimates.get("+1y", {}).get("revenue_growth")
+                    facts["fy1_analysts"] = estimates.get("+1y", {}).get("analysts")
+                    facts["consensus_available"] = bool(facts.get("fy1_eps") is not None)
+                    facts["fy2_eps"] = None
+                    facts["fy2_status"] = "not available from retrieved source"
+                    facts["revisions_available"] = False
+                    claims.append("Consensus EPS FY+1: " + str(facts.get("fy1_eps")) +
+                                  "; growth: " + str(facts.get("fy1_growth")))
+            except Exception as exc:
+                facts["estimates_error"] = repr(exc)
+                facts["consensus_available"] = False
+                facts["revisions_available"] = False
         if kind == "etf":
             try:
                 fd = tk.funds_data
