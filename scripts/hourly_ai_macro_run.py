@@ -82,6 +82,10 @@ def _read(sql: str, params: dict | None = None) -> pd.DataFrame:
 def load_evidence(as_of: date) -> dict:
     latest_equity = _query("select max(date) from public.us_equities")[0][0]
     latest_macro = _query("select max(date) from public.macro")[0][0]
+    db_retrieved = _query("select max(retrieved_at) from public.us_equities where date=:d",
+                          {"d": latest_equity})[0][0]
+    db_snapshot = {"equity_latest": str(latest_equity),
+                   "latest_retrieved_at": str(db_retrieved) if db_retrieved else None}
     prov_rows = _query("""
         select coalesce(data_source,'legacy_massive') as source,
                coalesce(is_provisional,false) as provisional, count(*) as n
@@ -128,28 +132,9 @@ def load_evidence(as_of: date) -> dict:
             r = row[0]
             econ_rows.append({"date": str(r[0]), "series_id": r[1], "name": r[2],
                               "value": float(r[3]), "unit": r[4], "category": r[5]})
-    snap = _read(
-        "select date,ticker,close,pct_chg,volume from public.us_equities where date=:d order by volume desc limit 50",
-        {"d": latest_equity},
-    )
-    classes = _read("select ticker,sector,company_name,cik from public.security_classification where is_active=true")
-    cmap = {str(r.ticker).upper(): r for r in classes.itertuples()}
-    candidates = []
-    for r in snap.itertuples():
-        t = str(r.ticker).upper()
-        if len(t) > 5 or t.startswith("^") or t.endswith("=X") or t.endswith("=F"):
-            continue
-        c = cmap.get(t)
-        if c is None:
-            continue
-        candidates.append({
-            "ticker": t, "name": str(c.company_name or t), "sector": str(c.sector or ""),
-            "security_type": "Stock", "cik": str(c.cik or ""),
-            "close": float(r.close) if pd.notna(r.close) else None,
-            "pct_chg": float(r.pct_chg) if pd.notna(r.pct_chg) else None,
-            "volume": float(r.volume) if pd.notna(r.volume) else None,
-            "date": str(r.date.date()) if hasattr(r.date, "date") else str(r.date),
-        })
+    candidates, screening = build_stock_discovery(latest_equity)
+    for c in candidates:
+        c["pct_chg"] = None
     etf_rows = _read(
         "select ticker, fund_name, primary_segment from public.etf_master "
         "where is_active=true and flow_eligible=true order by ticker limit 80"
@@ -204,6 +189,8 @@ def load_evidence(as_of: date) -> dict:
         "flows_date": str(flow_date),
         "flows_lag_sessions": lag(flow_date, as_of),
         "equity_provenance": equity_provenance,
+        "screening": screening,
+        "database_snapshot": db_snapshot,
     }
     if data_qc["equity_lag_sessions"] == 0:
         data_qc["status"] = "PASS"
@@ -234,7 +221,9 @@ def load_evidence(as_of: date) -> dict:
         "flows": flow_rows,
         "macro": macro_rows,
         "economic": econ_rows,
-        "candidates": candidates[:80],
+        "candidates": candidates,
+        "screening": screening,
+        "database_snapshot": db_snapshot,
         "source_catalog": SOURCE_CATALOG,
     }
 
@@ -491,6 +480,96 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
     return report
 
 
+def build_stock_discovery(latest_equity) -> tuple[list[dict], dict]:
+    """Build a transparent S&P 500 shortlist without composite scores.
+
+    Buckets are independent and explainable: positive momentum, dislocation,
+    valuation and liquidity. A ticker may appear in more than one bucket;
+    exclusion reasons are retained for audit.
+    """
+    rows = _read("""
+        SELECT e.date,e.ticker,e.close,e.volume,e.pe_ttm,
+               c.company_name,c.sector,c.cik
+        FROM public.us_equities e
+        JOIN public.security_classification c ON c.ticker=e.ticker AND c.is_active=true
+        JOIN public.sp500_membership_history m
+          ON m.ticker=e.ticker
+         AND m.start_date <= :d
+         AND (m.end_date IS NULL OR m.end_date > :d)
+        WHERE e.date >= (CAST(:d AS date) - INTERVAL '90 days')
+          AND e.date <= :d
+        ORDER BY e.ticker,e.date
+    """, {"d": latest_equity})
+    members = _query("""
+        SELECT COUNT(DISTINCT ticker) FROM public.sp500_membership_history
+        WHERE start_date <= :d AND (end_date IS NULL OR end_date > :d)
+    """, {"d": latest_equity})
+    universe = int(members[0][0]) if members else 0
+    excluded = {}
+    records = []
+    if not rows.empty:
+        for ticker, df in rows.groupby("ticker", sort=False):
+            df = df.sort_values("date")
+            if df.empty or str(df.iloc[-1]["date"])[:10] != str(latest_equity)[:10]:
+                excluded["missing_latest_session"] = excluded.get("missing_latest_session", 0) + 1
+                continue
+            if len(df) < 21:
+                excluded["insufficient_history"] = excluded.get("insufficient_history", 0) + 1
+                continue
+            last = df.iloc[-1]
+            close = _num(last["close"])
+            if close is None or close <= 0:
+                excluded["missing_price"] = excluded.get("missing_price", 0) + 1
+                continue
+            ret20 = close / float(df.iloc[-21]["close"]) - 1 if float(df.iloc[-21]["close"]) else None
+            ret60 = close / float(df.iloc[-61]["close"]) - 1 if len(df) >= 61 and float(df.iloc[-61]["close"]) else ret20
+            drawdown = close / float(df["close"].tail(60).max()) - 1 if len(df) else None
+            records.append({
+                "ticker": str(ticker).upper(), "name": str(last["company_name"] or ticker),
+                "sector": str(last["sector"] or ""), "security_type": "Stock",
+                "cik": str(last["cik"] or ""), "close": close,
+                "pct_chg": None, "volume": _num(last["volume"]),
+                "dollar_volume": close * (_num(last["volume"]) or 0),
+                "pe_ttm": _num(last["pe_ttm"]),
+                "return_20d": ret20, "return_60d": ret60,
+                "drawdown_60d": drawdown,
+                "date": str(latest_equity),
+            })
+    if not records:
+        return [], {"universe": universe, "shortlisted": 0, "included": [],
+                    "excluded": excluded, "reason": "no eligible records"}
+
+    def take(key, reverse, predicate, reason, n=8):
+        ranked = [r for r in records if predicate(r)]
+        ranked.sort(key=lambda r: (r.get(key) if r.get(key) is not None else -1e18), reverse=reverse)
+        picked = []
+        for r in ranked[:n]:
+            if reason not in r.setdefault("screen_reasons", []):
+                r["screen_reasons"].append(reason)
+            if r not in picked:
+                picked.append(r)
+        return picked
+
+    picked = []
+    for r in take("return_20d", True, lambda x: x.get("return_20d") is not None, "top_20d_momentum"):
+        if r not in picked: picked.append(r)
+    for r in take("return_20d", False, lambda x: x.get("return_20d") is not None, "largest_20d_dislocation"):
+        if r not in picked: picked.append(r)
+    for r in take("pe_ttm", False, lambda x: x.get("pe_ttm") is not None and x["pe_ttm"] > 0, "lower_positive_pe"):
+        if r not in picked: picked.append(r)
+    for r in take("dollar_volume", True, lambda x: x.get("dollar_volume") is not None, "liquidity_leader"):
+        if r not in picked: picked.append(r)
+    # Stable cap; each included ticker retains a non-score rationale.
+    shortlist = picked[:20]
+    included = [{"ticker": r["ticker"], "reasons": r.get("screen_reasons", [])} for r in shortlist]
+    return shortlist, {
+        "universe": universe, "eligible": len(records), "shortlisted": len(shortlist),
+        "included": included,
+        "excluded": excluded,
+        "method": "independent momentum/dislocation/PE/liquidity buckets; no composite score",
+    }
+
+
 def _research_fingerprint(evidence: dict, risk: dict) -> str:
     return _sha(json.dumps({
         "as_of": evidence.get("as_of"),
@@ -511,24 +590,99 @@ def _research_fingerprint(evidence: dict, risk: dict) -> str:
     }, sort_keys=True, default=str))
 
 
+def _section_errors(data: dict, section: str, expected: list[str]) -> list[str]:
+    errors = []
+    rows = data.get(section) if isinstance(data, dict) else None
+    if section == "scenarios":
+        for horizon in ("short_term", "long_term"):
+            rs = (data or {}).get(horizon) or []
+            if len(rs) != 3:
+                errors.append(f"scenarios_{horizon}_not_3_rows")
+                continue
+            try:
+                if abs(sum(float(x.get("probability", 0)) for x in rs) - 100) > 0.5:
+                    errors.append(f"scenarios_{horizon}_probabilities_not_100")
+            except (TypeError, ValueError):
+                errors.append(f"scenarios_{horizon}_bad_probability")
+            for x in rs:
+                if _num(x.get("return_pct")) is None:
+                    errors.append(f"scenarios_{horizon}_return_pct_missing:{x.get('scenario')}")
+        return errors
+    if not isinstance(rows, dict):
+        return [f"{section}_object_missing"]
+    for ticker in expected:
+        vals = rows.get(ticker)
+        if not isinstance(vals, dict):
+            errors.append(f"{section}_missing:{ticker}")
+            continue
+        for key in (("base_multiple", "bull_multiple", "bear_multiple")
+                    if section == "stocks" else
+                    ("base_return_pct", "bull_return_pct", "bear_return_pct")):
+            if _num(vals.get(key)) is None:
+                errors.append(f"{section}_{key}_not_numeric:{ticker}")
+    return errors
+
+
+def _qualitative_errors(data: dict) -> list[str]:
+    ideas = (data or {}).get("ideas") or []
+    errors = []
+    if not 3 <= len(ideas) <= 5:
+        errors.append("ideas_not_3_to_5")
+    for i in ideas:
+        ticker = str(i.get("ticker", "")).upper()
+        if i.get("security_type") == "ETF":
+            for f in ("sector_exposure", "underlying_drivers"):
+                if not i.get(f):
+                    errors.append(f"etf_missing_{f}:{ticker}")
+    return errors
+
+
+def _call_qualitative(prompt: str, payload: dict, model: str) -> tuple[dict, dict]:
+    last_errors = []
+    for attempt in (1, 2):
+        data, meta = _ai_call(prompt, payload, model, max_tokens=3000)
+        errors = _qualitative_errors(data)
+        if not errors:
+            return data, {**meta, "section": "qualitative", "attempts": attempt, "errors": []}
+        last_errors = errors
+        print(f"[AI qualitative] invalid attempt {attempt}: {errors[:8]}")
+        payload = {**payload, "validation_errors": errors}
+    return data, {**meta, "section": "qualitative", "attempts": 2, "errors": last_errors}
+
+
+def _call_numeric(prompt: str, payload: dict, model: str, section: str,
+                  expected: list[str]) -> tuple[dict, dict]:
+    """Call one numeric section, retrying only that section once on QC errors."""
+    last_errors = []
+    for attempt in (1, 2):
+        data, meta = _ai_call(prompt, payload, model, max_tokens=1400)
+        errors = _section_errors(data, section, expected)
+        if not errors:
+            return data, {**meta, "section": section, "attempts": attempt, "errors": []}
+        last_errors = errors
+        print(f"[AI {section}] invalid attempt {attempt}: {errors[:8]}")
+        payload = {**payload, "validation_errors": errors}
+    return data, {**meta, "section": section, "attempts": 2, "errors": last_errors}
+
+
 def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     payload = {
         "as_of": evidence["as_of"],
         "latest_equity_date": evidence["latest_equity_date"],
         "latest_macro_date": evidence["latest_macro_date"],
         "data_qc": evidence.get("data_qc", {}),
-        "breadth": evidence["breadth"],
-        "sectors": evidence["sectors"],
-        "flows": evidence["flows"],
-        "macro": evidence["macro"],
-        "economic": evidence.get("economic", []),
-        "candidates": evidence["candidates"],
+        "breadth": evidence["breadth"], "sectors": evidence["sectors"],
+        "flows": evidence["flows"], "macro": evidence["macro"],
+        "economic": evidence.get("economic", []), "candidates": evidence["candidates"],
         "risk": risk,
         "external_sources": (evidence.get("external_sources") or {}).get("sources", []),
         "source_retrieval": (evidence.get("external_sources") or {}).get("counts", {}),
     }
     market_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_market.txt").read_text(encoding="utf-8")
-    ideas_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_ideas.txt").read_text(encoding="utf-8")
+    qual_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_qualitative.txt").read_text(encoding="utf-8")
+    stock_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_stock_assumptions.txt").read_text(encoding="utf-8")
+    etf_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_etf_assumptions.txt").read_text(encoding="utf-8")
+    scenario_prompt = (ROOT / "market-dashboard" / "scripts" / "hourly_ai_prompt_scenarios.txt").read_text(encoding="utf-8")
     all_external = (evidence.get("external_sources") or {}).get("sources", [])
     sector_etfs = set(SECTOR_ETF.values())
     def compact(s):
@@ -548,55 +702,63 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
     ideas_payload = {k: payload[k] for k in (
         "as_of", "latest_equity_date", "latest_macro_date", "data_qc", "candidates",
         "risk", "source_retrieval")}
-    ideas_payload["candidates"] = payload["candidates"][:8]
-    ideas_payload["external_sources"] = ideas_external[:16]
+    ideas_payload["candidates"] = payload["candidates"][:16]
+    ideas_payload["ticker_evidence"] = {
+        t: ev for t, ev in (evidence.get("ticker_evidence") or {}).items()
+        if t in {c.get("ticker") for c in ideas_payload["candidates"]}
+    }
+    ideas_payload["external_sources"] = ideas_external[:24]
     fingerprint = _research_fingerprint(evidence, risk)
-    cache_path = ROOT / "data" / "hourly_research_cache.json"
-    cached = None
-    cache_age_h = None
-    if cache_path.exists():
-        try:
-            c = json.loads(cache_path.read_text(encoding="utf-8"))
-            if c.get("fingerprint") == fingerprint:
-                created = datetime.fromisoformat(c.get("created_at", ""))
-                cache_age_h = (datetime.now(timezone.utc) - created).total_seconds() / 3600
-                if 0 <= cache_age_h <= 24:
-                    cached = c
-        except Exception:
-            cached = None
     last_exc = None
     for candidate_model in [model] + [m for m in FALLBACK_MODELS if m != model]:
         try:
             market, market_meta = _ai_call(market_prompt, market_payload, candidate_model, max_tokens=3000)
-            if cached and cached.get("ideas") and cached.get("scenarios"):
-                ideas = {"ideas": cached["ideas"], "scenarios": cached["scenarios"]}
-                ideas_meta = {"cached": True, "cached_at": cached.get("created_at"),
-                              "age_hours": round(cache_age_h, 2), "fingerprint": fingerprint,
-                              "source_dates": cached.get("source_dates", {})}
-            else:
-                ideas, ideas_meta = _ai_call(ideas_prompt, ideas_payload, candidate_model, max_tokens=3000)
-                ideas_meta = {**ideas_meta, "cached": False, "fingerprint": fingerprint,
-                              "source_dates": {"as_of": evidence.get("as_of"),
-                                               "latest_equity_date": evidence.get("latest_equity_date"),
-                                               "latest_macro_date": evidence.get("latest_macro_date"),
-                                               "flows_date": evidence.get("flows_date"),
-                                               "breadth_date": evidence.get("data_qc", {}).get("breadth_date")}}
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps({
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "fingerprint": fingerprint,
-                    "source_dates": ideas_meta["source_dates"],
-                    "ideas": ideas.get("ideas", []),
-                    "scenarios": ideas.get("scenarios", {}),
-                }, indent=2), encoding="utf-8")
+            qualitative, qual_meta = _call_qualitative(qual_prompt, ideas_payload, candidate_model)
+            ideas = qualitative.get("ideas") or []
+            stocks = [x for x in ideas if str(x.get("security_type")) == "Stock"]
+            etfs = [x for x in ideas if str(x.get("security_type")) == "ETF"]
+            te = ideas_payload.get("ticker_evidence") or {}
+            stock_payload = {"as_of": evidence["as_of"],
+                             "ideas": [{"ticker": x.get("ticker"), "source_ids": x.get("source_ids")} for x in stocks],
+                             "ticker_evidence": {x.get("ticker"): te.get(x.get("ticker")) for x in stocks}}
+            etf_payload = {"as_of": evidence["as_of"],
+                           "ideas": [{"ticker": x.get("ticker"), "source_ids": x.get("source_ids")} for x in etfs],
+                           "ticker_evidence": {x.get("ticker"): te.get(x.get("ticker")) for x in etfs}}
+            stock_assumptions, stock_meta = _call_numeric(
+                stock_prompt, stock_payload, candidate_model, "stocks",
+                [x.get("ticker") for x in stocks]) if stocks else ({}, {"section": "stocks", "attempts": 0, "errors": []})
+            etf_assumptions, etf_meta = _call_numeric(
+                etf_prompt, etf_payload, candidate_model, "etfs",
+                [x.get("ticker") for x in etfs]) if etfs else ({}, {"section": "etfs", "attempts": 0, "errors": []})
+            scenario_data, scenario_meta = _call_numeric(
+                scenario_prompt, {"as_of": evidence["as_of"], "risk": risk},
+                candidate_model, "scenarios", [])
+            smap = stock_assumptions.get("stocks") or {}
+            emap = etf_assumptions.get("etfs") or {}
+            for x in stocks:
+                x["assumption_inputs"] = smap.get(str(x.get("ticker", "")).upper()) or {}
+            for x in etfs:
+                x["assumption_inputs"] = emap.get(str(x.get("ticker", "")).upper()) or {}
             merged = dict(market)
-            for key in ("ideas", "scenarios"):
-                if key in ideas:
-                    merged[key] = ideas[key]
-            return merged, {"provider": "hermes-local-proxy", "model": candidate_model,
-                            "market": market_meta, "fundamental_research": ideas_meta,
-                            "fingerprint": fingerprint,
-                            "source_dates": ideas_meta.get("source_dates", {})}
+            merged["ideas"] = ideas
+            merged["scenarios"] = {"short_term": scenario_data.get("short_term", []),
+                                   "long_term": scenario_data.get("long_term", [])}
+            meta = {"provider": "hermes-local-proxy", "model": candidate_model,
+                    "market": market_meta, "fundamental_research": {
+                        "qualitative": qual_meta, "stocks": stock_meta,
+                        "etfs": etf_meta, "scenarios": scenario_meta,
+                        "fingerprint": fingerprint,
+                        "source_dates": {"as_of": evidence.get("as_of"),
+                                         "latest_equity_date": evidence.get("latest_equity_date"),
+                                         "latest_macro_date": evidence.get("latest_macro_date"),
+                                         "flows_date": evidence.get("flows_date"),
+                                         "breadth_date": evidence.get("data_qc", {}).get("breadth_date")}},
+                    "fingerprint": fingerprint,
+                    "source_dates": {"as_of": evidence.get("as_of"),
+                                     "latest_equity_date": evidence.get("latest_equity_date"),
+                                     "latest_macro_date": evidence.get("latest_macro_date"),
+                                     "flows_date": evidence.get("flows_date")}}
+            return merged, meta
         except Exception as exc:
             last_exc = exc
             print(f"MODEL FAILED — {candidate_model}: {exc}")
@@ -607,7 +769,9 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     r = risk
     lines = [
         "# AEGIS AI-First Market Intelligence", "",
-        f"Generated at: {generated}",
+        f"Research generated at: {generated}",
+        f"Database freshness: equity {evidence.get('database_snapshot',{}).get('equity_latest')} "
+        f"(latest row retrieved {evidence.get('database_snapshot',{}).get('latest_retrieved_at')})",
         f"Data cutoff: {evidence['latest_equity_date']} US cash close",
         f"Snapshot ID: {report.get('snapshot_id', 'hourly')}", "",
         "## Executive Summary", "",
@@ -626,6 +790,16 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
               f"- External sources: {(evidence.get('external_sources') or {}).get('counts', {}).get('ok', 0)} ok / "
               f"{(evidence.get('external_sources') or {}).get('counts', {}).get('unavailable', 0)} unavailable; "
               f"retrieved {(evidence.get('external_sources') or {}).get('retrieved_at', 'unknown')}", ""]
+    scr = evidence.get("screening") or {}
+    if scr:
+        lines += ["## Idea Discovery", "",
+                  f"- S&P 500 universe: {scr.get('universe')}; eligible: {scr.get('eligible')}; "
+                  f"transparent shortlist: {scr.get('shortlisted')}",
+                  f"- Method: {scr.get('method')}",
+                  "- Included: " + "; ".join(
+                      f"{x.get('ticker')} ({', '.join(x.get('reasons', []))})"
+                      for x in (scr.get("included") or [])[:20]),
+                  "- Excluded reasons: " + json.dumps(scr.get("excluded") or {}, sort_keys=True), ""]
     lines += ["## Market Snapshot", "", "| Asset | Latest | Change | Observation |", "| --- | --- | --- | --- |"]
     for row in report.get("market_snapshot", []):
         lines.append(f"| {row.get('asset','')} | {row.get('latest','')} | {row.get('change','')} | {row.get('observation','')} |")
@@ -998,7 +1172,7 @@ def main() -> int:
         print("DATA QC FAILED — previous report retained:", evidence["data_qc"])
         return 1
     try:
-        ext = retrieve_external_sources(evidence, evidence.get("candidates", []), max_stocks=8, max_etfs=24)
+        ext = retrieve_external_sources(evidence, evidence.get("candidates", []), max_stocks=12, max_etfs=12)
     except Exception as exc:
         print("EXTERNAL SOURCE RETRIEVAL FAILED — previous report retained:", repr(exc))
         return 5
