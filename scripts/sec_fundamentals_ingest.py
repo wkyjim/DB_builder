@@ -175,7 +175,9 @@ def latest_observations(raw: list[dict]) -> dict[tuple, dict]:
     return out
 
 
-def normalize(ticker: str, cik: str, raw: list[dict]) -> list[dict]:
+def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) -> list[dict]:
+    if as_of:
+        raw = [r for r in raw if str(r.get("filed") or "") <= as_of]
     obs = latest_observations(raw)
     metrics = []
     def add(metric, period_end, ptype, value, unit, formula, row, derived=True):
@@ -290,7 +292,7 @@ def main() -> int:
         source_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
         try:
             raw, _ = parse_company(cik, ticker, run_id, source_url)
-            metrics = normalize(ticker, cik, raw)
+            metrics = normalize(ticker, cik, raw, as_of=str(latest))
             with engine.begin() as c:
                 for r in raw:
                     c.execute(text("""insert into fundamentals.sec_facts
