@@ -32,10 +32,13 @@ with local_engine().connect() as c:
     out['storage_bytes']=c.execute(text("select pg_total_relation_size('fundamentals.sec_facts')+pg_total_relation_size('fundamentals.sec_metrics')")).scalar()
     out['tags']=dict(c.execute(text("select tag,count(*) from fundamentals.sec_facts group by tag order by count(*) desc limit 20")).fetchall())
     out['sectors']=dict(c.execute(text("""
-      select s.sector,count(distinct m.ticker)
-      from fundamentals.sec_metrics m join public.security_classification s
+      select coalesce(s.sector,(select x.sector from public.security_classification x
+        where x.ticker=m.ticker order by x.is_active desc limit 1)) as sector,
+        count(distinct m.ticker)
+      from fundamentals.sec_metrics m left join public.security_classification s
         on s.ticker=m.ticker and s.is_active=true
-      group by s.sector order by s.sector""")).fetchall())
+      group by 1 order by 1"""
+    )).fetchall())
     # One latest annual example per GICS sector, preferring names with revenue and margin.
     examples=[]
     for sector in [x[0] for x in c.execute(text("select distinct sector from public.security_classification where sector is not null order by sector")).fetchall()]:

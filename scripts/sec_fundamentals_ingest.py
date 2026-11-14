@@ -146,6 +146,7 @@ def ensure_schema(engine) -> None:
         "alter table fundamentals.sec_facts alter column start_date drop not null",
         "alter table fundamentals.sec_facts add column if not exists available_at date",
         "alter table fundamentals.sec_facts add column if not exists availability_basis text",
+        "alter table fundamentals.sec_facts add column if not exists change_class text",
         "create unique index if not exists ux_sec_facts_period on fundamentals.sec_facts(cik,tag,unit,coalesce(start_date,date '0001-01-01'),end_date,accession)",
         "create index if not exists ix_sec_facts_ticker_end on fundamentals.sec_facts(ticker,end_date)",
         "create index if not exists ix_sec_metrics_ticker_metric on fundamentals.sec_metrics(ticker,metric,period_end)",
@@ -244,6 +245,77 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
             "share_basis_status": "unverified",
             "split_status": "unverified",
         })
+    def _days(r):
+        try:
+            return (date.fromisoformat(r["end_date"]) - date.fromisoformat(r["start_date"])).days
+        except Exception:
+            return None
+
+    # Build direct and strictly derived quarterly observations. YTD deltas
+    # require the same accession, tag, unit, fiscal-year start and period end.
+    q_rows = []
+    by_tag_acc = defaultdict(list)
+    for r in obs.values():
+        if r.get("start_date") and r.get("end_date"):
+            by_tag_acc[(r["metric"], r["tag"], r["unit"], r["accession"])].append(r)
+    for (metric, tag, unit, acc), rows in by_tag_acc.items():
+        for r in rows:
+            if r["period_type"] == "Q":
+                q_rows.append({**r, "formula": "reported_quarter", "is_derived": False})
+        q3 = [r for r in rows if _days(r) is not None and 80 <= _days(r) <= 100]
+        ytd6 = [r for r in rows if _days(r) is not None and 150 <= _days(r) <= 210]
+        ytd9 = [r for r in rows if _days(r) is not None and 240 <= _days(r) <= 300]
+        annual_r = [r for r in rows if _days(r) is not None and 350 <= _days(r) <= 380]
+        for target in ytd6:
+            base = next((x for x in q3 if x["start_date"] == target["start_date"]
+                         and x["end_date"] < target["end_date"]), None)
+            if base:
+                q_rows.append({**target, "start_date": base["end_date"], "value": target["value"] - base["value"],
+                               "formula": "ytd_6m_minus_3m", "is_derived": True})
+        for target in ytd9:
+            base = next((x for x in ytd6 if x["start_date"] == target["start_date"]
+                         and x["end_date"] < target["end_date"]), None)
+            if base:
+                q_rows.append({**target, "start_date": base["end_date"], "value": target["value"] - base["value"],
+                               "formula": "ytd_9m_minus_6m", "is_derived": True})
+        for target in annual_r:
+            base = next((x for x in ytd9 if x["start_date"] == target["start_date"]
+                         and x["end_date"] == target["end_date"]), None)
+            if base:
+                q_rows.append({**target, "start_date": base["end_date"], "value": target["value"] - base["value"],
+                               "formula": "fy_minus_9m", "is_derived": True})
+    # Store quarterly observations, preferring reported over derived duplicates.
+    q_seen = {}
+    for r in q_rows:
+        key = (r["metric"], r["unit"], r["end_date"])
+        old = q_seen.get(key)
+        if old is None:
+            q_seen[key] = r
+        elif (not r["is_derived"] and old["is_derived"]) or (
+                r["is_derived"] == old["is_derived"]
+                and _tag_priority(r["metric"], r["tag"]) < _tag_priority(old["metric"], old["tag"])):
+            q_seen[key] = r
+    for r in q_seen.values():
+        add(r["metric"], r["end_date"], "Q", r["value"], r["unit"], r["formula"], r, derived=r["is_derived"])
+
+    # TTM only from four consecutive quarterly observations of the same tag/unit.
+    for metric in ("revenue", "net_income", "operating_cash_flow"):
+        candidates = [r for r in q_seen.values() if r["metric"] == metric]
+        best = None
+        for tag in {r["tag"] for r in candidates}:
+            rows = sorted([r for r in candidates if r["tag"] == tag],
+                          key=lambda x: x["end_date"], reverse=True)
+            for i in range(len(rows) - 3):
+                window = rows[i:i + 4]
+                ends = [date.fromisoformat(x["end_date"]) for x in window]
+                if all(80 <= (a - b).days <= 100 for a, b in zip(ends, ends[1:])):
+                    if best is None or (window[0]["end_date"], -_tag_priority(metric, tag)) > (best[0]["end_date"], -_tag_priority(metric, best[0]["tag"])):
+                        best = window
+                    break
+        if best:
+            add(metric + "_ttm", best[0]["end_date"], "TTM", sum(x["value"] for x in best),
+                best[0]["unit"], "sum_four_consecutive_quarters", best[0])
+
     # Store latest annual observations directly.
     annual = {}
     for r in obs.values():
@@ -278,23 +350,6 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
     if ocf and capex:
         add("free_cash_flow", ocf["end_date"], "Y", ocf["value"] - capex["value"], "USD",
             "operating_cash_flow - capex", ocf)
-    # TTM revenue/net income from Q observations only; no mixing with YTD/annual.
-    def ttm(metric):
-        rows = [r for r in obs.values() if r["metric"] == metric and r["period_type"] == "Q"]
-        rows.sort(key=lambda x: x["end_date"], reverse=True)
-        if len(rows) < 4:
-            return None
-        first4 = rows[:4]
-        # Require four distinct consecutive quarters, approximately 90 days apart.
-        ends = [date.fromisoformat(r["end_date"]) for r in first4]
-        if any(80 > (a - b).days or (a - b).days > 100 for a, b in zip(ends, ends[1:])):
-            return None
-        return sum(r["value"] for r in first4), first4[0]
-    for metric in ("revenue", "net_income", "operating_cash_flow"):
-        t = ttm(metric)
-        if t:
-            value, row = t
-            add(metric + "_ttm", row["end_date"], "TTM", value, row["unit"], "sum_latest_four_quarters", row)
     return metrics
 
 
