@@ -61,16 +61,28 @@ def _as_float(v):
         return None
 
 
+def _ohlcv_issues(r: dict) -> list[str]:
+    """Return exact invalid OHLCV fields for audit/retry evidence."""
+    vals = {k: _as_float(r.get(k)) for k in ("open", "high", "low", "close", "volume")}
+    issues = [f"{k}_missing" for k, v in vals.items() if v is None]
+    for k in ("open", "high", "low", "close"):
+        if vals[k] is not None and vals[k] <= 0:
+            issues.append(f"{k}_nonpositive")
+    if vals["volume"] is not None and vals["volume"] < 0:
+        issues.append("volume_negative")
+    o, h, l, c = (vals[x] for x in ("open", "high", "low", "close"))
+    if None not in (o, h, l, c):
+        if h < l:
+            issues.append("high_lt_low")
+        if h < max(o, c):
+            issues.append("high_lt_open_or_close")
+        if l > min(o, c):
+            issues.append("low_gt_open_or_close")
+    return issues
+
+
 def _valid_ohlcv(r: dict) -> bool:
-    o, h, l, c = (_as_float(r.get(k)) for k in ("open", "high", "low", "close"))
-    v = _as_float(r.get("volume"))
-    if None in (o, h, l, c) or v is None:
-        return False
-    if min(o, h, l, c) <= 0 or v < 0:
-        return False
-    if h < l or h < max(o, c) or l > min(o, c):
-        return False
-    return True
+    return not _ohlcv_issues(r)
 
 
 def _download(tickers: list[str], session, dry_run: bool) -> dict[str, dict]:
@@ -156,6 +168,32 @@ def _tickers(engine, session) -> tuple[list[str], dict[str, str]]:
         for t in etf:
             names.setdefault(t, t)
     return list(dict.fromkeys(sp + etf)), names
+
+
+def _failed_path(session):
+    return ROOT / "data" / f"equity_yf_failed_{session}.json"
+
+
+def _write_failure_artifact(session, target, received, valid, missing, invalid_details, partial_inserted):
+    path = _failed_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session": str(session), "created_at": datetime.now(timezone.utc).isoformat(),
+        "target_tickers": target, "received": received, "valid": valid,
+        "missing": missing, "invalid_count": len(invalid_details),
+        "failed_tickers": sorted({x["ticker"] for x in invalid_details} |
+                                 {x["ticker"] for x in missing}),
+        "invalid": invalid_details, "partial_inserted": partial_inserted,
+    }
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return path
+
+
+def _read_failure_artifact(session):
+    path = _failed_path(session)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _ensure_columns(engine) -> None:
@@ -378,6 +416,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--reconcile-only", action="store_true")
+    ap.add_argument("--recover-failed", action="store_true", help="Retry only the failed tickers from data/equity_yf_failed_<session>.json")
     ap.add_argument("--session", default=None, help="YYYY-MM-DD; defaults to last completed NYSE session")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -401,6 +440,43 @@ def main() -> int:
         stats = reconcile_session(engine, session, tickers)
         print("YF_EOD_RECONCILE " + json.dumps(stats))
         return 0
+    if args.recover_failed:
+        art = _read_failure_artifact(session)
+        if not art:
+            print(f"[YF RECOVERY] no failure artifact for {session}; nothing to do")
+            return 0
+        failed = sorted(set(art.get("failed_tickers", [])) & set(tickers))
+        if not failed:
+            _failed_path(session).unlink(missing_ok=True)
+            print("[YF RECOVERY] failed-ticker set is empty after universe check")
+            return 0
+        print(f"[YF RECOVERY] retrying {len(failed)} failed tickers for {session}")
+        rows_by_ticker = _download(failed, session, False)
+        valid_rows = [dict(r, name=names.get(t, t)) for t, r in rows_by_ticker.items() if _valid_ohlcv(r)]
+        bad = []
+        for t, r in rows_by_ticker.items():
+            issues = _ohlcv_issues(r)
+            if issues:
+                bad.append({"ticker": t, "retrieved_at": str(r.get("retrieved_at")), "issues": issues,
+                            "open": r.get("open"), "high": r.get("high"), "low": r.get("low"),
+                            "close": r.get("close"), "volume": r.get("volume")})
+        missing = sorted(set(failed) - set(rows_by_ticker))
+        if bad or missing:
+            _write_failure_artifact(session, len(tickers), len(rows_by_ticker), len(valid_rows),
+                                    missing, bad, True)
+            print(f"[YF RECOVERY] still incomplete valid={len(valid_rows)}/{len(failed)} "
+                  f"missing={len(missing)} invalid={len(bad)}; no writes")
+            return 1
+        stats = _write_prices(engine, valid_rows, session)
+        daily_update_missing_indicators(engine, tickers=tickers, lookback_rows=320)
+        bdf = build_breadth(engine, start=session - timedelta(days=60), end=session)
+        latest_rows = bdf[pd.to_datetime(bdf["date"]).dt.date == session]
+        if not latest_rows.empty:
+            write_breadth(engine, latest_rows)
+        _failed_path(session).unlink(missing_ok=True)
+        print("YF_EOD_RECOVERY " + json.dumps({"session": str(session), "retried": len(failed),
+                                               "write": stats, "indicators": True, "breadth": True}))
+        return 0
     if args.dry_run:
         print(json.dumps({"session": str(session), "target": len(tickers), "dry_run": True}))
         return 0
@@ -413,7 +489,13 @@ def main() -> int:
         rows.append(r)
     missing = sorted(set(tickers) - set(rows_by_ticker))
     valid_rows = [r for r in rows if _valid_ohlcv(r)]
-    invalid = sorted({r["ticker"] for r in rows if not _valid_ohlcv(r)})
+    invalid_details = [
+        {"ticker": r["ticker"], "retrieved_at": str(r.get("retrieved_at")),
+         "issues": _ohlcv_issues(r), "open": r.get("open"), "high": r.get("high"),
+         "low": r.get("low"), "close": r.get("close"), "volume": r.get("volume")}
+        for r in rows if not _valid_ohlcv(r)
+    ]
+    invalid = sorted({x["ticker"] for x in invalid_details})
     completeness = len(valid_rows) / len(tickers) if tickers else 0.0
     print(f"[YF EOD] received={len(rows)} valid={len(valid_rows)} "
           f"missing={len(missing)} invalid={len(invalid)} completeness={completeness:.2%}")
@@ -422,6 +504,15 @@ def main() -> int:
         "promoted_massive": 0, "incomplete_massive": 0,
     }
     qc_ok = completeness >= QC_MIN_COMPLETENESS and not invalid
+    artifact_path = None
+    if not qc_ok:
+        artifact_path = _write_failure_artifact(
+            session, len(tickers), len(rows), len(valid_rows), missing, invalid_details,
+            partial_inserted=bool(valid_rows),
+        )
+        print(f"[YF EOD] failure artifact: {artifact_path}")
+    else:
+        _failed_path(session).unlink(missing_ok=True)
     indicator_ok = breadth_ok = False
     indicator_error = breadth_error = None
     if qc_ok:
@@ -450,6 +541,7 @@ def main() -> int:
         "received": len(rows), "valid": len(valid_rows),
         "missing": len(missing), "missing_sample": missing[:20],
         "invalid": len(invalid), "invalid_sample": invalid[:20],
+        "invalid_details": invalid_details[:50], "failure_artifact": str(artifact_path) if artifact_path else None,
         "completeness_pct": round(completeness * 100, 2),
         "qc_ok": qc_ok, "write": write_stats,
         "corporate_actions": _corporate_actions(engine, session, tickers),

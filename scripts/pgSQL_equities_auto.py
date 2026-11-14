@@ -75,6 +75,50 @@ def get_latest_indicator_session(engine) -> date | None:
     return row.max_date
 
 
+def get_canonical_coverage(engine, session: date | None) -> dict:
+    """Return verified Massive coverage for a session.
+
+    Unmarked/legacy rows and provisional yfinance rows are deliberately
+    excluded. The denominator is the recent stored universe, not the target
+    date itself, so a partial target cannot inflate its own coverage.
+    """
+    if session is None:
+        return {"ticker_count": 0, "baseline_count": 0, "ratio": 0.0, "ok": False}
+    with engine.connect() as conn:
+        target = conn.execute(text(f"""
+            SELECT COUNT(DISTINCT ticker)
+            FROM {RAW_TABLE}
+            WHERE date = :d
+              AND data_source = 'massive'
+              AND is_provisional IS NOT TRUE
+        """), {"d": session}).scalar() or 0
+        verified = conn.execute(text(f"""
+            SELECT COUNT(DISTINCT ticker)
+            FROM {RAW_TABLE}
+            WHERE date = :d
+              AND (
+                    (data_source = 'massive' AND is_provisional IS NOT TRUE)
+                 OR data_source = 'yfinance_fallback'
+              )
+        """), {"d": session}).scalar() or 0
+        baseline = conn.execute(text(f"""
+            SELECT MAX(ticker_count) FROM (
+                SELECT date, COUNT(DISTINCT ticker) AS ticker_count
+                FROM {RAW_TABLE}
+                WHERE date < :d
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT 5
+            ) prior
+        """), {"d": session}).scalar() or 0
+    ratio = (int(verified) / int(baseline)) if baseline else 0.0
+    return {
+        "ticker_count": int(target), "verified_ticker_count": int(verified),
+        "baseline_count": int(baseline), "ratio": ratio,
+        "ok": bool(target) and bool(baseline) and ratio >= MIN_SESSION_COVERAGE_RATIO,
+    }
+
+
 def get_cycle_metadata(
     local,
     latest_completed: date | None,
@@ -92,10 +136,12 @@ def get_cycle_metadata(
         indicator_refresh_status: 'UPDATED' or 'SKIPPED_ALREADY_CURRENT'.
         decision: The action taken.
     """
+    canonical = get_canonical_coverage(local, latest_completed)
     equity_current = (
         latest_stored is not None
         and latest_completed is not None
         and latest_stored >= latest_completed
+        and canonical["ok"]
     )
     indicator_current = (
         latest_indicator is not None
@@ -112,11 +158,13 @@ def get_cycle_metadata(
         equity_status = "SKIPPED_ALREADY_CURRENT"
         indicator_status = "SKIPPED_ALREADY_CURRENT"
     elif not equity_current and indicator_current:
-        decision = "indicators_only"
+        # The date is current but canonical Massive coverage is not; fetch
+        # equities (including Massive) without recalculating indicators.
+        decision = "equities_only"
         equity_status = "UPDATED"
         indicator_status = "SKIPPED_ALREADY_CURRENT"
     elif equity_current and not indicator_current:
-        decision = "equities_only"
+        decision = "indicators_only"
         equity_status = "SKIPPED_ALREADY_CURRENT"
         indicator_status = "UPDATED"
     else:
@@ -130,6 +178,11 @@ def get_cycle_metadata(
         "latest_indicator_session": latest_indicator.isoformat() if latest_indicator else None,
         "equity_refresh_status": equity_status,
         "indicator_refresh_status": indicator_status,
+        "canonical_ticker_count": canonical["ticker_count"],
+        "verified_ticker_count": canonical.get("verified_ticker_count", canonical["ticker_count"]),
+        "canonical_baseline_count": canonical["baseline_count"],
+        "canonical_coverage_ratio": canonical["ratio"],
+        "canonical_coverage_ok": canonical["ok"],
         "decision": decision,
     }
 
@@ -187,6 +240,10 @@ def main() -> None:
     )
     print(f"Equity refresh status:   {metadata['equity_refresh_status']}")
     print(f"Indicator refresh status: {metadata['indicator_refresh_status']}")
+    print(f"Canonical Massive coverage: {metadata['canonical_ticker_count']} "
+          f"(verified {metadata['verified_ticker_count']})/"
+          f"{metadata['canonical_baseline_count']} "
+          f"({metadata['canonical_coverage_ratio']:.2%}) ok={metadata['canonical_coverage_ok']}")
     print(f"Decision:                {metadata['decision']}")
 
     # --- Case A: Both current, skip everything ---

@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 import sys
@@ -81,6 +82,16 @@ def _read(sql: str, params: dict | None = None) -> pd.DataFrame:
 def load_evidence(as_of: date) -> dict:
     latest_equity = _query("select max(date) from public.us_equities")[0][0]
     latest_macro = _query("select max(date) from public.macro")[0][0]
+    prov_rows = _query("""
+        select coalesce(data_source,'legacy_massive') as source,
+               coalesce(is_provisional,false) as provisional, count(*) as n
+        from public.us_equities where date=:d group by 1,2
+    """, {"d": latest_equity})
+    equity_provenance = {
+        "provisional": int(sum(r[2] for r in prov_rows if r[1])),
+        "canonical": int(sum(r[2] for r in prov_rows if not r[1])),
+        "sources": {str(r[0]): int(r[2]) for r in prov_rows},
+    }
     breadth = _read("select * from public.sp500_breadth_daily order by date desc limit 1")
     breadth_row = breadth.iloc[0].to_dict() if len(breadth) else {}
     sector_tickers = tuple(SECTOR_ETF.values())
@@ -192,6 +203,7 @@ def load_evidence(as_of: date) -> dict:
         "breadth_lag_sessions": lag(breadth_row.get("date"), as_of),
         "flows_date": str(flow_date),
         "flows_lag_sessions": lag(flow_date, as_of),
+        "equity_provenance": equity_provenance,
     }
     if data_qc["equity_lag_sessions"] == 0:
         data_qc["status"] = "PASS"
@@ -201,6 +213,12 @@ def load_evidence(as_of: date) -> dict:
     else:
         data_qc["status"] = "FAIL"
         data_qc["warning"] = "US equity data is more than one completed session behind the inference date."
+    if equity_provenance["provisional"] and not equity_provenance["canonical"]:
+        data_qc["status"] = "PASS_WITH_WARNINGS"
+        data_qc["warning"] = "Equity prices for the session are provisional yfinance data; Massive has not yet replaced them."
+    elif equity_provenance["provisional"] and equity_provenance["canonical"]:
+        data_qc["status"] = "PASS_WITH_WARNINGS"
+        data_qc["warning"] = "Equity session contains a mix of provisional yfinance and canonical Massive rows."
     if data_qc["status"] in ("PASS", "PASS_WITH_WARNINGS") and any(
             (data_qc.get(k) or 0) > 0 for k in ("breadth_lag_sessions", "flows_lag_sessions")):
         data_qc["status"] = "PASS_WITH_WARNINGS"
@@ -473,6 +491,8 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
     lines += ["", "## Data QC", "",
               f"- Status: **{dq.get('status', 'UNKNOWN')}**",
               f"- Equity session: {dq.get('equity_lag_sessions')} completed session(s) behind inference date",
+              f"- Equity provenance: {dq.get('equity_provenance', {}).get('provisional', 0)} provisional / "
+              f"{dq.get('equity_provenance', {}).get('canonical', 0)} canonical",
               f"- Breadth lag: {dq.get('breadth_lag_sessions')} session(s); ETF-flow lag: {dq.get('flows_lag_sessions')} session(s)",
               f"- Note: {dq.get('warning') or dq.get('warning_detail') or 'No material lag.'}",
               f"- External sources: {(evidence.get('external_sources') or {}).get('counts', {}).get('ok', 0)} ok / "
@@ -698,6 +718,9 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
     if not 3 <= len(ideas) <= 5:
         fails.append("ideas_not_3_to_5")
     allowed = {x["ticker"] for x in evidence.get("candidates", [])}
+    valuation_signatures: dict[tuple, str] = {}
+    source_sets: dict[tuple, str] = {}
+    narratives: dict[str, str] = {}
     for i in ideas:
         ticker = str(i.get("ticker", "")).upper()
         if ticker not in allowed:
@@ -708,12 +731,29 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
             continue
         if any(ok_sources[x].get("ticker") not in (ticker, None) for x in ids):
             fails.append(f"idea_source_ticker_mismatch:{ticker}")
+        if ids:
+            source_key = tuple(sorted(str(x) for x in ids))
+            if source_key in source_sets and source_sets[source_key] != ticker:
+                fails.append(f"cross_ticker_source_id_reuse:{source_sets[source_key]}:{ticker}")
+            source_sets.setdefault(source_key, ticker)
+        thesis = str(i.get("thesis") or "").strip().lower()
+        if thesis:
+            if thesis in narratives and narratives[thesis] != ticker:
+                fails.append(f"cross_ticker_narrative_reuse:{narratives[thesis]}:{ticker}")
+            narratives.setdefault(thesis, ticker)
         stype = i.get("security_type")
         if stype == "Stock":
-            if _num(i.get("eps")) is None:
+            eps = _num(i.get("eps"))
+            pe = _num(i.get("forward_pe"))
+            if eps is None:
                 fails.append(f"stock_eps_not_numeric:{ticker}")
-            if _num(i.get("forward_pe")) is None:
+            if pe is None:
                 fails.append(f"stock_forward_pe_not_numeric:{ticker}")
+            if eps is not None and pe is not None:
+                sig = (round(eps, 6), round(pe, 6))
+                if sig in valuation_signatures and valuation_signatures[sig] != ticker:
+                    fails.append(f"cross_ticker_valuation_reuse:{valuation_signatures[sig]}:{ticker}")
+                valuation_signatures.setdefault(sig, ticker)
             if not any(ok_sources[x].get("kind") == "filing" for x in ids):
                 fails.append(f"stock_missing_filing_source:{ticker}")
             if not any(ok_sources[x].get("kind") in ("stock", "news") for x in ids):
@@ -729,6 +769,14 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
             for f in ("top_holdings", "portfolio_valuation", "sector_exposure", "underlying_drivers"):
                 if not i.get(f):
                     fails.append(f"etf_missing_{f}:{ticker}")
+            holdings = i.get("top_holdings")
+            if isinstance(holdings, str):
+                holdings = [x.strip() for x in holdings.split(",") if x.strip()]
+            if not isinstance(holdings, list) or len(holdings) < 3:
+                fails.append(f"etf_holdings_incomplete:{ticker}")
+            pv = str(i.get("portfolio_valuation") or "")
+            if not re.search(r"\d+(?:\.\d+)?\s*%|weight", pv, flags=re.I):
+                fails.append(f"etf_holdings_weights_not_numeric:{ticker}")
             if not any(ok_sources[x].get("kind") in ("etf", "news") for x in ids):
                 fails.append(f"etf_missing_etf_or_news_source:{ticker}")
             claim_text = " ".join(" ".join(ok_sources[x].get("claims", [])) for x in ids).lower()
@@ -755,6 +803,14 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
                     fails.append(f"scenarios_{horizon}_probabilities_not_100")
             except (TypeError, ValueError):
                 fails.append(f"scenarios_{horizon}_bad_probability")
+            for x in rows:
+                range_text = str(x.get("range") or "").strip()
+                numeric_range = bool(
+                    re.search(r"\d+(?:\.\d+)?\s*%", range_text)
+                    or re.search(r"\d.*(?:-|–|—|\bto\b).*\d", range_text, flags=re.I)
+                )
+                if not numeric_range:
+                    fails.append(f"scenarios_{horizon}_range_not_numeric")
     urls = [x.get("url", "") for x in report.get("sources", []) if str(x.get("url", "")).startswith("http")]
     domains = {u.split("/")[2].lower() for u in urls if "/" in u}
     if len(urls) < 10 or len(domains) < 4:
@@ -844,10 +900,18 @@ def main() -> int:
     report["outcomes"] = outcomes
     fails = validate(report, evidence, risk)
     if fails:
+        failed_dir = ROOT / "data" / "ai_failed"
+        failed_dir.mkdir(parents=True, exist_ok=True)
+        failed_path = failed_dir / f"report_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
+        failed_path.write_text(json.dumps({
+            "fails": fails, "report": report,
+            "evidence_fingerprint": _research_fingerprint(evidence, risk),
+            "model": (ai_meta or {}).get("model"), "created_at": now.isoformat(),
+        }, indent=2, default=str), encoding="utf-8")
         if dry:
             Path("/tmp/aegis_hourly").mkdir(parents=True, exist_ok=True)
             Path("/tmp/aegis_hourly/report.failed.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-        print("REPORT QC FAILED:", fails)
+        print(f"REPORT QC FAILED: {fails}; artifact={failed_path}")
         return 4
     generated = now.astimezone(ZoneInfo("Asia/Hong_Kong")).strftime("%d %B %Y, %H:%M %Z")
     risk_sha = _sha(json.dumps(risk, indent=2, default=str))

@@ -35,7 +35,26 @@ INDICATOR_NUMERIC_COLUMNS = [
 ]
 
 
+PROVENANCE_COLUMNS = (
+    ("data_source", "text"),
+    ("is_provisional", "boolean NOT NULL DEFAULT false"),
+    ("retrieved_at", "timestamptz"),
+)
+
+
+def ensure_provenance_columns(engine, table_name: str = RAW_TABLE) -> None:
+    """Add source/provisional audit columns without rewriting existing rows.
+
+    PostgreSQL 11+ stores the constant default for existing rows without a
+    table rewrite. Existing canonical/historical values are untouched.
+    """
+    with engine.begin() as conn:
+        for name, typ in PROVENANCE_COLUMNS:
+            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {name} {typ}"))
+
+
 def setup_neon_required_objects(neon_engine) -> None:
+    ensure_provenance_columns(neon_engine, RAW_TABLE)
     sql = """
     CREATE TABLE IF NOT EXISTS public.sync_state (
         table_name text PRIMARY KEY,
