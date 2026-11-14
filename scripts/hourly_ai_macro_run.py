@@ -395,13 +395,12 @@ def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
             forward_pe = _num(vf.get("forward_pe"))
             # Explicitly do not substitute reported historical diluted EPS
             # for forward EPS. A missing forward EPS remains null.
-            if forward_eps is None and forward_pe not in (None, 0) and price is not None:
-                forward_eps = price / forward_pe
-            forward_eps_source = "source.forwardEps" if _num(vf.get("forward_eps")) is not None else (
-                "derived_price_over_pe" if forward_eps is not None else "missing")
-            quality_flags = []
-            if forward_eps_source == "derived_price_over_pe":
-                quality_flags.append("circular_forward_eps")
+            # Never synthesize forward EPS from price / forward P/E. If the
+            # source lacks forward EPS, retain qualitative research and mark
+            # the valuation incomplete.
+            forward_eps_source = ("source.forwardEps" if _num(vf.get("forward_eps")) is not None
+                                  else "missing")
+            quality_flags = [] if forward_eps is not None else ["forward_eps_missing"]
             reported_eps = _num(ff.get("diluted_eps"))
             if forward_pe is None:
                 quality_flags.append("forward_pe_unavailable")
@@ -501,6 +500,10 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             idea["eps_period"] = ev.get("eps_period")
             idea["growth_assumption_pct"] = (round(ev["fy1_growth"] * 100, 2)
                                               if ev.get("fy1_growth") is not None else None)
+            idea["ai_growth_pct"] = _num(inputs.get("growth_pct"))
+            idea["assumption_horizon"] = inputs.get("horizon")
+            idea["peer_reference"] = inputs.get("peer_reference")
+            idea["assumption_justification"] = inputs.get("justification")
             idea["fy1_growth"] = ev.get("fy1_growth")
             idea["fy1_revenue_growth"] = ev.get("fy1_revenue_growth")
             idea["fy2_eps"] = ev.get("fy2_eps")
@@ -797,18 +800,24 @@ def _section_errors(data: dict, section: str, expected: list[str], strict: bool 
                     ("base_return_pct", "bull_return_pct", "bear_return_pct")):
             if _num(vals.get(key)) is None:
                 errors.append(f"{section}_{key}_not_numeric:{ticker}")
+        if strict and section == "stocks":
+            for key in ("horizon", "peer_reference", "justification"):
+                if not str(vals.get(key) or "").strip():
+                    errors.append(f"stocks_{key}_missing:{ticker}")
     return errors
 
 
 def _qualitative_errors(data: dict, strict: bool = False) -> list[str]:
     ideas = (data or {}).get("ideas") or []
     errors = []
-    if not 3 <= len(ideas) <= 5:
+    if strict and len(ideas) > 5:
+        errors.append("ideas_more_than_5")
+    elif not strict and not 3 <= len(ideas) <= 5:
         errors.append("ideas_not_3_to_5")
     for i in ideas:
         ticker = str(i.get("ticker", "")).upper()
         if strict:
-            if i.get("stance") not in ("POSITIVE", "NEUTRAL", "NEGATIVE"):
+            if i.get("stance") not in ("BUY", "NEUTRAL", "AVOID", "SELL"):
                 errors.append(f"idea_invalid_stance:{ticker}")
             if not str(i.get("why_preferred") or "").strip():
                 errors.append(f"idea_missing_why_preferred:{ticker}")
@@ -921,9 +930,11 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
             etf_payload = {"as_of": evidence["as_of"],
                            "ideas": [{"ticker": x.get("ticker"), "source_ids": x.get("source_ids")} for x in etfs],
                            "ticker_evidence": {x.get("ticker"): te.get(x.get("ticker")) for x in etfs}}
+            stock_expected = [x.get("ticker") for x in stocks
+                              if (te.get(str(x.get("ticker", "")).upper()) or {}).get("forward_eps") is not None]
             stock_assumptions, stock_meta = _call_numeric(
                 stock_prompt, stock_payload, candidate_model, "stocks",
-                [x.get("ticker") for x in stocks], strict=strict) if stocks else ({}, {"section": "stocks", "attempts": 0, "errors": []})
+                stock_expected, strict=strict) if stock_expected else ({}, {"section": "stocks", "attempts": 0, "errors": []})
             etf_assumptions, etf_meta = _call_numeric(
                 etf_prompt, etf_payload, candidate_model, "etfs",
                 [x.get("ticker") for x in etfs], strict=strict) if etfs else ({}, {"section": "etfs", "attempts": 0, "errors": []})
@@ -940,7 +951,11 @@ def call_ai(evidence: dict, risk: dict, model: str) -> tuple[dict, dict]:
                 amap = smap if section == "stocks" else emap
                 inputs = amap.get(ticker) or {}
                 x["assumption_inputs"] = inputs
-                errs = _section_errors({section: {ticker: inputs}}, section, [ticker])
+                ev_for_idea = (ideas_payload.get("ticker_evidence") or {}).get(ticker) or {}
+                errs = (_section_errors({section: {ticker: inputs}}, section, [ticker],
+                                       strict=strict)
+                        if (section != "stocks" or ev_for_idea.get("forward_eps") is not None)
+                        else [])
                 if errs:
                     rejected.append({"ticker": ticker, "section": section,
                                      "reason": "numeric assumptions unavailable after one retry",
@@ -1078,6 +1093,8 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                       f"- **FY+1 growth assumption:** {i.get('growth_assumption_pct')}%; "
                       f"consensus available: {i.get('consensus_available')}; "
                       f"revisions available: {i.get('revisions_available')}; FY+2: {i.get('fy2_status')}",
+                      f"- **Valuation horizon / peer / justification:** {i.get('assumption_horizon')} / "
+                      f"{i.get('peer_reference')} / {i.get('assumption_justification')}",
                       f"- **Company fundamentals:** {i.get('company_fundamentals','')}"]
         else:
             th = i.get("top_holdings", "")
@@ -1254,7 +1271,8 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
     if len(macro_ids) < 3 or any(x not in ok_sources for x in macro_ids):
         fails.append("macro_source_ids_invalid")
     ideas = report.get("ideas") or []
-    if not 3 <= len(ideas) <= 5:
+    min_ideas = 0 if (evidence.get("screening") or {}).get("expanded") else 3
+    if not min_ideas <= len(ideas) <= 5:
         fails.append("ideas_not_3_to_5")
     allowed = {x["ticker"] for x in evidence.get("candidates", [])}
     ticker_evidence = evidence.get("ticker_evidence") or {}
@@ -1288,29 +1306,31 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
             narratives.setdefault(thesis, ticker)
         stype = i.get("security_type")
         if stype == "Stock":
+            incomplete = i.get("valuation_status") == "incomplete"
             eps = _num(i.get("eps"))
             pe = _num(i.get("forward_pe"))
-            if eps is None:
+            if not incomplete and eps is None:
                 fails.append(f"stock_eps_not_numeric:{ticker}")
-            if pe is None:
+            if not incomplete and pe is None:
                 fails.append(f"stock_forward_pe_not_numeric:{ticker}")
             if eps is not None and pe is not None:
                 sig = (round(eps, 6), round(pe, 6))
                 if sig in valuation_signatures and valuation_signatures[sig] != ticker:
                     fails.append(f"cross_ticker_valuation_reuse:{valuation_signatures[sig]}:{ticker}")
                 valuation_signatures.setdefault(sig, ticker)
-            if ev and ev.get("forward_eps") is None:
+            if ev and not incomplete and ev.get("forward_eps") is None:
                 fails.append(f"stock_forward_eps_unavailable:{ticker}")
-            if ev and ev.get("forward_pe") is None:
+            if ev and not incomplete and ev.get("forward_pe") is None:
                 fails.append(f"stock_forward_pe_unavailable:{ticker}")
             if ev and _num(i.get("eps")) != _num(ev.get("forward_eps")):
                 fails.append(f"stock_eps_not_evidence_bound:{ticker}")
             if ev and _num(i.get("forward_pe")) != _num(ev.get("forward_pe")):
                 fails.append(f"stock_pe_not_evidence_bound:{ticker}")
             assumptions = i.get("assumption_inputs") or {}
-            for key in ("base_multiple", "bull_multiple", "bear_multiple"):
-                if _num(assumptions.get(key)) is None or _num(assumptions.get(key)) <= 0:
-                    fails.append(f"stock_assumption_not_numeric:{ticker}:{key}")
+            if not incomplete:
+                for key in ("base_multiple", "bull_multiple", "bear_multiple"):
+                    if _num(assumptions.get(key)) is None or _num(assumptions.get(key)) <= 0:
+                        fails.append(f"stock_assumption_not_numeric:{ticker}:{key}")
             if not any(ok_sources[x].get("kind") == "filing" for x in ids):
                 fails.append(f"stock_missing_filing_source:{ticker}")
             if not any(ok_sources[x].get("kind") in ("stock", "news") for x in ids):
@@ -1417,7 +1437,7 @@ def main() -> int:
     try:
         ext = retrieve_external_sources(
             evidence, evidence.get("candidates", []),
-            max_stocks=20 if expanded else 12, max_etfs=12)
+            max_stocks=12, max_etfs=12)
     except Exception as exc:
         print("EXTERNAL SOURCE RETRIEVAL FAILED — previous report retained:", repr(exc))
         return 5
