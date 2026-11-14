@@ -364,6 +364,133 @@ def _ai_call(prompt: str, payload: dict, model: str, max_tokens: int = 3000, att
     raise RuntimeError(f"AI request failed: {last[:500]}")
 
 
+def build_ticker_evidence(evidence: dict, ext: dict) -> dict:
+    """Build a source-bound valuation object for every candidate.
+
+    AI may select from these objects and supply assumptions, but it cannot
+    write EPS, forward P/E, holdings, weights or source IDs back into them.
+    """
+    sources = [s for s in (ext.get("sources") or []) if s.get("status") == "ok"]
+    out = {}
+    for c in evidence.get("candidates", []) or []:
+        ticker = str(c.get("ticker", "")).upper()
+        ss = [s for s in sources if str(s.get("ticker") or "").upper() == ticker]
+        filing = next((s for s in ss if s.get("kind") == "filing" and
+                       (s.get("facts") or {}).get("diluted_eps") is not None), None)
+        val = next((s for s in ss if s.get("kind") in ("stock", "etf") and
+                    (s.get("facts") or {})), None)
+        ff = (filing or {}).get("facts") or {}
+        vf = (val or {}).get("facts") or {}
+        price = _num(c.get("close"))
+        valuation_date = c.get("date")
+        source_ids = [s["id"] for s in ss]
+        if c.get("security_type") == "Stock":
+            forward_eps = _num(vf.get("forward_eps"))
+            forward_pe = _num(vf.get("forward_pe"))
+            # Explicitly do not substitute reported historical diluted EPS
+            # for forward EPS. A missing forward EPS remains null.
+            if forward_eps is None and forward_pe not in (None, 0) and price is not None:
+                forward_eps = price / forward_pe
+            out[ticker] = {
+                "ticker": ticker, "security_type": "Stock",
+                "fiscal_period": ff.get("fiscal_end"),
+                "diluted_eps_reported": _num(ff.get("diluted_eps")),
+                "diluted_eps_definition": ff.get("definition") or "reported diluted EPS",
+                "forward_eps": forward_eps,
+                "forward_eps_basis": ("source.forwardEps" if _num(vf.get("forward_eps")) is not None
+                                      else ("derived: price / source.forwardPE"
+                                            if forward_eps is not None else None)),
+                "forward_pe": forward_pe, "price": price,
+                "valuation_date": valuation_date,
+                "source_as_of": (ff.get("filed") or valuation_date),
+                "source_ids": source_ids,
+                "filing_source_id": filing.get("id") if filing else None,
+                "valuation_source_id": val.get("id") if val else None,
+                "fresh": True if source_ids else False,
+            }
+        elif c.get("security_type") == "ETF":
+            holdings = [h for h in (vf.get("holdings") or []) if h.get("weight_pct") is not None]
+            coverage = sum(float(h["weight_pct"]) for h in holdings) if holdings else None
+            out[ticker] = {
+                "ticker": ticker, "security_type": "ETF",
+                "holdings": holdings,
+                "holdings_coverage_pct": coverage,
+                "holdings_as_of": vf.get("holdings_as_of") or valuation_date,
+                "price": price, "valuation_date": valuation_date,
+                "portfolio_valuation": (
+                    f"Top {len(holdings)} holdings; numeric weight coverage {coverage:.2f}%"
+                    if holdings and coverage is not None else None),
+                "source_ids": source_ids,
+                "valuation_source_id": val.get("id") if val else None,
+                "fresh": bool(holdings) and coverage is not None,
+            }
+    return out
+
+
+def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
+    """Overwrite AI valuation values with source-bound evidence and compute targets.
+
+    This runs before validation. AI-provided EPS/P/E/targets are discarded;
+    only its qualitative research and numeric assumption inputs survive.
+    """
+    te = evidence.get("ticker_evidence") or {}
+    for idea in report.get("ideas", []) or []:
+        ticker = str(idea.get("ticker", "")).upper()
+        ev = te.get(ticker)
+        if not ev:
+            continue
+        idea["price"] = ev.get("price")
+        idea["valuation_date"] = ev.get("valuation_date")
+        idea["source_ids"] = [x for x in (idea.get("source_ids") or [])
+                              if x in (ev.get("source_ids") or [])]
+        inputs = idea.get("assumption_inputs") or {}
+        if ev["security_type"] == "Stock":
+            feps, fpe = ev.get("forward_eps"), ev.get("forward_pe")
+            idea["eps"] = feps
+            idea["forward_pe"] = fpe
+            idea["diluted_eps_reported"] = ev.get("diluted_eps_reported")
+            idea["diluted_eps_definition"] = ev.get("diluted_eps_definition")
+            idea["fiscal_period"] = ev.get("fiscal_period")
+            idea["forward_eps_basis"] = ev.get("forward_eps_basis")
+            vals = [("bull_target", inputs.get("bull_multiple")),
+                    ("base_target", inputs.get("base_multiple")),
+                    ("bear_target", inputs.get("bear_multiple"))]
+            for key, multiple in vals:
+                m = _num(multiple)
+                idea[key] = round(feps * m, 2) if feps is not None and m and m > 0 else None
+            if feps is not None and _num(inputs.get("base_multiple")):
+                idea["valuation_assumptions"] = (
+                    f"Forward EPS {feps:.4f} ({ev.get('forward_eps_basis')}) x "
+                    f"AI multiple assumption {_num(inputs.get('base_multiple')):.2f}; "
+                    f"source IDs {', '.join(idea.get('source_ids', []))}")
+            else:
+                idea["valuation_assumptions"] = "Unavailable: verified forward EPS or assumption missing."
+        else:
+            idea.pop("eps", None)
+            idea.pop("forward_pe", None)
+            holdings = ev.get("holdings") or []
+            idea["top_holdings"] = [f"{h['ticker']} {h['weight_pct']:.2f}%" for h in holdings]
+            idea["portfolio_valuation"] = ev.get("portfolio_valuation")
+            idea["holdings_coverage_pct"] = ev.get("holdings_coverage_pct")
+            idea["holdings_as_of"] = ev.get("holdings_as_of")
+            vals = [("bull_target", inputs.get("bull_return_pct")),
+                    ("base_target", inputs.get("base_return_pct")),
+                    ("bear_target", inputs.get("bear_return_pct"))]
+            for key, pct in vals:
+                r = _num(pct)
+                idea[key] = round(ev["price"] * (1 + r / 100.0), 2) if ev.get("price") is not None and r is not None else None
+            idea["valuation_assumptions"] = (
+                f"Holdings/portfolio valuation; {len(holdings)} weighted holdings; "
+                f"coverage {ev.get('holdings_coverage_pct')}%; source IDs "
+                f"{', '.join(idea.get('source_ids', []))}")
+    for horizon in ("short_term", "long_term"):
+        for row in (report.get("scenarios") or {}).get(horizon, []) or []:
+            r = _num(row.get("return_pct"))
+            if r is not None:
+                row["range"] = f"{r:+.2f}%"
+    return report
+
+
 def _research_fingerprint(evidence: dict, risk: dict) -> str:
     return _sha(json.dumps({
         "as_of": evidence.get("as_of"),
@@ -376,6 +503,7 @@ def _research_fingerprint(evidence: dict, risk: dict) -> str:
         "economic": evidence.get("economic"),
         "candidates": evidence.get("candidates"),
         "risk": risk,
+        "ticker_evidence": evidence.get("ticker_evidence"),
         "external_source_evidence": [
             {k: s.get(k) for k in ("id", "url", "published_at", "status", "claims")}
             for s in (evidence.get("external_sources") or {}).get("sources", [])
@@ -718,6 +846,7 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
     if not 3 <= len(ideas) <= 5:
         fails.append("ideas_not_3_to_5")
     allowed = {x["ticker"] for x in evidence.get("candidates", [])}
+    ticker_evidence = evidence.get("ticker_evidence") or {}
     valuation_signatures: dict[tuple, str] = {}
     source_sets: dict[tuple, str] = {}
     narratives: dict[str, str] = {}
@@ -731,6 +860,11 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
             continue
         if any(ok_sources[x].get("ticker") not in (ticker, None) for x in ids):
             fails.append(f"idea_source_ticker_mismatch:{ticker}")
+        ev = ticker_evidence.get(ticker)
+        if not ev:
+            fails.append(f"ticker_evidence_missing:{ticker}")
+        elif any(x not in ev.get("source_ids", []) for x in ids):
+            fails.append(f"idea_source_not_bound:{ticker}")
         if ids:
             source_key = tuple(sorted(str(x) for x in ids))
             if source_key in source_sets and source_sets[source_key] != ticker:
@@ -754,6 +888,18 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
                 if sig in valuation_signatures and valuation_signatures[sig] != ticker:
                     fails.append(f"cross_ticker_valuation_reuse:{valuation_signatures[sig]}:{ticker}")
                 valuation_signatures.setdefault(sig, ticker)
+            if ev and ev.get("forward_eps") is None:
+                fails.append(f"stock_forward_eps_unavailable:{ticker}")
+            if ev and ev.get("forward_pe") is None:
+                fails.append(f"stock_forward_pe_unavailable:{ticker}")
+            if ev and _num(i.get("eps")) != _num(ev.get("forward_eps")):
+                fails.append(f"stock_eps_not_evidence_bound:{ticker}")
+            if ev and _num(i.get("forward_pe")) != _num(ev.get("forward_pe")):
+                fails.append(f"stock_pe_not_evidence_bound:{ticker}")
+            assumptions = i.get("assumption_inputs") or {}
+            for key in ("base_multiple", "bull_multiple", "bear_multiple"):
+                if _num(assumptions.get(key)) is None or _num(assumptions.get(key)) <= 0:
+                    fails.append(f"stock_assumption_not_numeric:{ticker}:{key}")
             if not any(ok_sources[x].get("kind") == "filing" for x in ids):
                 fails.append(f"stock_missing_filing_source:{ticker}")
             if not any(ok_sources[x].get("kind") in ("stock", "news") for x in ids):
@@ -777,6 +923,15 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
             pv = str(i.get("portfolio_valuation") or "")
             if not re.search(r"\d+(?:\.\d+)?\s*%|weight", pv, flags=re.I):
                 fails.append(f"etf_holdings_weights_not_numeric:{ticker}")
+            if ev:
+                if len(ev.get("holdings") or []) < 3:
+                    fails.append(f"etf_evidence_holdings_incomplete:{ticker}")
+                if not ev.get("holdings_coverage_pct") or float(ev["holdings_coverage_pct"]) <= 0:
+                    fails.append(f"etf_evidence_coverage_missing:{ticker}")
+            assumptions = i.get("assumption_inputs") or {}
+            for key in ("base_return_pct", "bull_return_pct", "bear_return_pct"):
+                if _num(assumptions.get(key)) is None:
+                    fails.append(f"etf_assumption_not_numeric:{ticker}:{key}")
             if not any(ok_sources[x].get("kind") in ("etf", "news") for x in ids):
                 fails.append(f"etf_missing_etf_or_news_source:{ticker}")
             claim_text = " ".join(" ".join(ok_sources[x].get("claims", [])) for x in ids).lower()
@@ -811,6 +966,8 @@ def validate(report: dict, evidence: dict, risk: dict) -> list[str]:
                 )
                 if not numeric_range:
                     fails.append(f"scenarios_{horizon}_range_not_numeric")
+                if _num(x.get("return_pct")) is None:
+                    fails.append(f"scenarios_{horizon}_return_pct_missing")
     urls = [x.get("url", "") for x in report.get("sources", []) if str(x.get("url", "")).startswith("http")]
     domains = {u.split("/")[2].lower() for u in urls if "/" in u}
     if len(urls) < 10 or len(domains) < 4:
@@ -846,6 +1003,7 @@ def main() -> int:
         print("EXTERNAL SOURCE RETRIEVAL FAILED — previous report retained:", repr(exc))
         return 5
     evidence["external_sources"] = ext
+    evidence["ticker_evidence"] = build_ticker_evidence(evidence, ext)
     ok_ids = {s["id"] for s in ext.get("sources", []) if s.get("status") == "ok"}
     eligible = []
     for c in evidence.get("candidates", []):
@@ -895,6 +1053,7 @@ def main() -> int:
     report = _ensure_sources(report, evidence)
     report = _normalize_ideas(report)
     report = _normalize_scenarios(report)
+    report = apply_evidence_bindings(report, evidence)
     report["snapshot_id"] = f"aegis-hourly-{now.strftime('%Y%m%dT%H%M%SZ')}"
     report["risk"] = risk
     report["outcomes"] = outcomes

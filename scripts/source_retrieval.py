@@ -46,7 +46,8 @@ def _get(url: str, *, timeout: int = TIMEOUT) -> tuple[int | None, str, str | No
 
 def _source(sources: list[dict], *, kind: str, ticker: str | None, url: str,
             published_at: str | None, status: str, claims: list[str],
-            http_status: int | None = None, error: str | None = None) -> dict:
+            http_status: int | None = None, error: str | None = None,
+            facts: dict | None = None) -> dict:
     rec = {
         "id": f"S{len(sources) + 1:03d}",
         "kind": kind,
@@ -58,6 +59,7 @@ def _source(sources: list[dict], *, kind: str, ticker: str | None, url: str,
         "http_status": http_status,
         "claims": [c for c in claims if c],
         "error": error,
+        "facts": facts or {},
     }
     sources.append(rec)
     return rec
@@ -130,7 +132,10 @@ def _sec(cik: str | None, ticker: str, sources: list[dict]) -> None:
             _source(sources, kind="filing", ticker=ticker, url=facts_url,
                     published_at=latest.get("filed") or latest.get("end"),
                     status="ok", claims=[f"Diluted EPS {latest.get('val')} for period ending {latest.get('end')} (filed {latest.get('filed')})"],
-                    http_status=code)
+                    http_status=code,
+                    facts={"diluted_eps": latest.get("val"), "fiscal_end": latest.get("end"),
+                           "filed": latest.get("filed"), "definition": "reported diluted EPS",
+                           "form": latest.get("form"), "fy": latest.get("fy"), "fp": latest.get("fp")})
         else:
             _source(sources, kind="filing", ticker=ticker, url=facts_url, published_at=None,
                     status="unavailable", claims=[], http_status=code, error="no diluted EPS fact")
@@ -145,29 +150,63 @@ def _yf(ticker: str, kind: str, sources: list[dict]) -> None:
         tk = yf.Ticker(ticker)
         info = tk.info or {}
         claims = []
-        for key, label in (("trailingPE", "Trailing P/E"), ("forwardPE", "Forward P/E"),
-                           ("marketCap", "Market cap"), ("sector", "Sector"),
-                           ("category", "Category"), ("totalAssets", "Total assets")):
+        facts = {}
+        for key, label, fact_key in (
+            ("trailingPE", "Trailing P/E", "trailing_pe"),
+            ("forwardPE", "Forward P/E", "forward_pe"),
+            ("forwardEps", "Forward EPS", "forward_eps"),
+            ("currentPrice", "Price", "price"),
+            ("regularMarketPrice", "Market price", "market_price"),
+            ("marketCap", "Market cap", "market_cap"),
+            ("sector", "Sector", "sector"),
+            ("category", "Category", "category"),
+            ("totalAssets", "Total assets", "total_assets"),
+        ):
             if info.get(key) not in (None, ""):
                 claims.append(f"{label}: {info[key]}")
+                try:
+                    facts[fact_key] = float(info[key])
+                except (TypeError, ValueError):
+                    facts[fact_key] = info[key]
+        facts["valuation_date"] = _now()[:10]
         if kind == "etf":
             try:
                 fd = tk.funds_data
                 th = getattr(fd, "top_holdings", None)
                 if th is not None and len(th):
-                    names = []
-                    for idx, row in th.head(5).iterrows():
-                        names.append(f"{idx} {row.get('Holding Percent', '')}")
-                    claims.append("Top holdings: " + "; ".join(names))
+                    holdings = []
+                    for idx, row in th.head(10).iterrows():
+                        raw = row.get("Holding Percent", "")
+                        try:
+                            weight = float(str(raw).replace("%", "").strip())
+                        except (TypeError, ValueError):
+                            weight = None
+                        holdings.append({"ticker": str(idx).upper(), "weight_pct": weight})
+                    # Yahoo `top_holdings` reports decimal fractions on this
+                    # endpoint (0.1688 = 16.88%), while some sources use
+                    # percentages. Normalize only when the whole set is <= 1.
+                    vals = [h["weight_pct"] for h in holdings if h["weight_pct"] is not None]
+                    if vals and max(vals) <= 1.0:
+                        for h in holdings:
+                            if h["weight_pct"] is not None:
+                                h["weight_pct"] *= 100.0
+                    facts["holdings"] = holdings
+                    facts["holdings_coverage_pct"] = sum(
+                        h["weight_pct"] for h in holdings if h["weight_pct"] is not None)
+                    facts["holdings_as_of"] = _now()[:10]
+                    facts["holdings_source"] = url
+                    claims.append("Top holdings: " + "; ".join(
+                        f"{h['ticker']} {h['weight_pct']}%" if h["weight_pct"] is not None
+                        else h["ticker"] for h in holdings))
             except Exception:
                 pass
         _source(sources, kind=kind, ticker=ticker, url=url,
                 published_at=None, status="ok" if claims else "unavailable",
-                claims=claims, error=None if claims else "no valuation fields")
+                claims=claims, error=None if claims else "no valuation fields",
+                facts=facts)
     except Exception as exc:
         _source(sources, kind=kind, ticker=ticker, url=url, published_at=None,
                 status="unavailable", claims=[], error=repr(exc))
-
 
 def _news(ticker: str, name: str, sources: list[dict]) -> None:
     q = quote_plus(f"{ticker} {name} stock")
