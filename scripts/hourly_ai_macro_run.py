@@ -530,8 +530,13 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             base_mult = _num(inputs.get("base_multiple"))
             if base_ret is not None and abs(base_ret) > 50:
                 valuation_flags.append("implausible_base_return")
-            if fpe and base_mult and abs(base_mult - fpe) / fpe < 0.02 and abs(base_ret or 0) < 5:
+            justified = bool(str(inputs.get("justification") or "").strip()
+                            and str(inputs.get("peer_reference") or "").strip())
+            if (fpe and base_mult and abs(base_mult - fpe) / fpe < 0.02
+                    and abs(base_ret or 0) < 5 and not justified):
                 valuation_flags.append("target_multiple_equals_current_pe")
+            if not justified:
+                valuation_flags.append("unsupported_multiple")
             if valuation_flags:
                 idea["valuation_status"] = "incomplete"
                 idea["valuation_flags"] = sorted(set(valuation_flags))
@@ -1057,7 +1062,7 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
         lines += ["| Ticker | Security | Research view | Price | EPS | Forward P/E | Base target | Review |",
                   "| --- | --- | --- | --- | --- | --- | --- | --- |"]
         for i in stock_ideas:
-            lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {i.get('eps','')} | {i.get('forward_pe','')} | {i.get('base_target') if i.get('base_target') is not None else '—'} | {i.get('review','')} |")
+            lines.append(f"| {i.get('ticker','')} | {i.get('name','')} | {i.get('research_view','')} | {i.get('price','')} | {i.get('eps','')} | {i.get('forward_pe','')} | {i.get('base_target') if i.get('base_target') is not None else 'N/A'} | {i.get('review','')} |")
     else:
         lines.append("No qualifying stock ideas this run.")
     lines += ["", "## ETF Ideas", "",
@@ -1105,13 +1110,13 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                       f"- **Sector exposure:** {i.get('sector_exposure','')}",
                       f"- **Underlying drivers:** {i.get('underlying_drivers','')}"]
         lines += [f"- **Bull / Base / Bear:** "
-                  f"{i.get('bull_target') if i.get('bull_target') is not None else '—'} / "
-                  f"{i.get('base_target') if i.get('base_target') is not None else '—'} / "
-                  f"{i.get('bear_target') if i.get('bear_target') is not None else '—'}",
+                  f"{i.get('bull_target') if i.get('bull_target') is not None else 'N/A'} / "
+                  f"{i.get('base_target') if i.get('base_target') is not None else 'N/A'} / "
+                  f"{i.get('bear_target') if i.get('bear_target') is not None else 'N/A'}",
                   f"- **Bull / Base / Bear returns:** "
-                  f"{i.get('bull_return_pct') if i.get('bull_return_pct') is not None else '—'}% / "
-                  f"{i.get('base_return_pct') if i.get('base_return_pct') is not None else '—'}% / "
-                  f"{i.get('bear_return_pct') if i.get('bear_return_pct') is not None else '—'}%",
+                  f"{i.get('bull_return_pct') if i.get('bull_return_pct') is not None else 'N/A'}% / "
+                  f"{i.get('base_return_pct') if i.get('base_return_pct') is not None else 'N/A'}% / "
+                  f"{i.get('bear_return_pct') if i.get('bear_return_pct') is not None else 'N/A'}%",
                   f"- **Scenario probabilities:** not separately assigned; see scenario table.",
                   ""]
     rejected = report.get("rejected_ideas") or []

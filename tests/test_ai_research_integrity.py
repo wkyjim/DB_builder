@@ -27,7 +27,8 @@ def _report(*, contaminated: bool):
         "eps": 1.0, "forward_pe": 20.0, "thesis": "same thesis",
         "valuation_assumptions": "Diluted EPS 1.00; forward P/E 20.0",
         "research_view": "KEEP", "base_target": 20, "bull_target": 25, "bear_target": 15,
-        "assumption_inputs": {"base_multiple": 20, "bull_multiple": 25, "bear_multiple": 15},
+        "assumption_inputs": {"base_multiple": 20, "bull_multiple": 25, "bear_multiple": 15,
+                                          "horizon": "FY2027", "peer_reference": "peer", "justification": "growth and margin"},
     }
     stock_b = {
         "ticker": "BBB", "security_type": "Stock", "source_ids": ids[4:8],
@@ -110,7 +111,8 @@ def test_apply_evidence_bindings_computes_targets_and_rejects_ai_numbers():
             "ticker": "AAA", "security_type": "Stock", "source_ids": ["S000"],
             "eps": 999, "forward_pe": 999, "base_target": 999, "bull_target": 999,
             "bear_target": 999, "price": 999,
-            "assumption_inputs": {"base_multiple": 20, "bull_multiple": 25, "bear_multiple": 15},
+            "assumption_inputs": {"base_multiple": 20, "bull_multiple": 25, "bear_multiple": 15,
+                                  "horizon": "FY2027", "peer_reference": "peer", "justification": "growth and margin"},
         }],
         "scenarios": {"short_term": [{"scenario": "Bull", "return_pct": 2.0, "range": "bad"}]},
     }

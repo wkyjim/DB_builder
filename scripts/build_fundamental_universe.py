@@ -71,7 +71,8 @@ def build(as_of: date, external_snapshot: Path | None) -> dict:
                 continue
             if s.get("kind") not in ("stock", "etf"):
                 continue
-            external[t] = {"facts": s.get("facts") or {}, "source_id": s.get("id")}
+            external[t] = {"facts": s.get("facts") or {}, "source_id": s.get("id"),
+                           "retrieved_at": s.get("retrieved_at")}
     rows = []
     for (ticker,) in members:
         p = price_map.get(ticker)
@@ -87,6 +88,9 @@ def build(as_of: date, external_snapshot: Path | None) -> dict:
             "pe_as_of": str(pe[1]) if pe else (str(p[1]) if p else None),
             "market_cap": _num(p[5]) if p else None,
             "source_ids": ["DB.us_equities:" + str(p[1])] if p else [],
+            "company_reported": {}, "vendor_estimate": {}, "ai_assumed": {},
+            "fiscal_year_end": None, "fiscal_year_mapping": "unverified",
+            "share_basis_status": "unverified", "corporate_action_status": "unverified",
             **{k: None for k in FIELDS},
         }
         if facts:
@@ -108,7 +112,22 @@ def build(as_of: date, external_snapshot: Path | None) -> dict:
             })
             if (external.get(ticker) or {}).get("source_id"):
                 row["source_ids"].append(external[ticker]["source_id"])
+            row["source_retrieved_at"] = (external.get(ticker) or {}).get("retrieved_at")
+            row["vendor_estimate"] = {k: row.get(k) for k in
+                                      ("revenue_growth", "eps_growth", "gross_margin",
+                                       "operating_margin", "profit_margin", "forward_eps",
+                                       "forward_pe", "fy1_growth", "fy1_revenue_growth",
+                                       "fy2_status", "consensus_available", "revisions_available")}
+            row["company_reported"] = {"eps_reported": facts.get("diluted_eps"),
+                                       "fiscal_period": facts.get("fiscal_end"),
+                                       "source_id": external[ticker]["source_id"]}
+            row["ai_assumed"] = {"growth_pct": None, "exit_multiple": None}
+            if row.get("fy1_eps") is not None and row.get("revenue_growth") is not None:
+                row["share_basis_status"] = "unverified"
+                row["corporate_action_status"] = "unverified"
         row["missing_flags"] = [f for f in FIELDS if row.get(f) is None]
+        row["missing_reasons"] = {f: "not available from local store or retrieved vendor snapshot"
+                                  for f in row["missing_flags"]}
         rows.append(row)
     return {
         "schema": "aegis.fundamental_universe.v1",
