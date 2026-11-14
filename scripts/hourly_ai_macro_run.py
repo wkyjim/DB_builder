@@ -152,7 +152,7 @@ def load_evidence(as_of: date) -> dict:
         if r is not None and etf not in existing:
             candidates.append({"ticker": etf, "name": name + " sector ETF", "sector": name,
                                "security_type": "ETF", "close": float(r.close) if pd.notna(r.close) else None,
-                               "pct_chg": float(r.pct_chg) if pd.notna(r.pct_chg) else None,
+                               "pct_chg": None,
                                "volume": float(r.volume) if pd.notna(r.volume) else None,
                                "date": str(r.date)})
             existing.add(etf)
@@ -163,7 +163,7 @@ def load_evidence(as_of: date) -> dict:
             candidates.append({"ticker": et, "name": str(e.fund_name or et),
                                "sector": str(e.primary_segment or ""), "security_type": "ETF",
                                "close": float(r.close) if pd.notna(r.close) else None,
-                               "pct_chg": float(r.pct_chg) if pd.notna(r.pct_chg) else None,
+                               "pct_chg": None,
                                "volume": float(r.volume) if pd.notna(r.volume) else None,
                                "date": str(r.date)})
             existing.add(et)
@@ -437,6 +437,7 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             feps, fpe = ev.get("forward_eps"), ev.get("forward_pe")
             idea["eps"] = feps
             idea["forward_pe"] = fpe
+            idea["valuation_method"] = "Forward EPS × AI forward P/E multiple"
             idea["diluted_eps_reported"] = ev.get("diluted_eps_reported")
             idea["diluted_eps_definition"] = ev.get("diluted_eps_definition")
             idea["fiscal_period"] = ev.get("fiscal_period")
@@ -462,6 +463,7 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
             idea["portfolio_valuation"] = ev.get("portfolio_valuation")
             idea["holdings_coverage_pct"] = ev.get("holdings_coverage_pct")
             idea["holdings_as_of"] = ev.get("holdings_as_of")
+            idea["valuation_method"] = "Holdings/portfolio valuation with AI total-return assumption"
             vals = [("bull_target", inputs.get("bull_return_pct")),
                     ("base_target", inputs.get("base_return_pct")),
                     ("bear_target", inputs.get("bear_return_pct"))]
@@ -470,7 +472,7 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
                 idea[key] = round(ev["price"] * (1 + r / 100.0), 2) if ev.get("price") is not None and r is not None else None
             idea["valuation_assumptions"] = (
                 f"Holdings/portfolio valuation; {len(holdings)} weighted holdings; "
-                f"coverage {ev.get('holdings_coverage_pct')}%; source IDs "
+                f"coverage {ev.get('holdings_coverage_pct'):.2f}%; source IDs "
                 f"{', '.join(idea.get('source_ids', []))}")
     for horizon in ("short_term", "long_term"):
         for row in (report.get("scenarios") or {}).get(horizon, []) or []:
@@ -866,7 +868,7 @@ def render(report: dict, evidence: dict, risk: dict, outcomes: dict, generated: 
                       f"- **Sector exposure:** {i.get('sector_exposure','')}",
                       f"- **Underlying drivers:** {i.get('underlying_drivers','')}"]
         lines += [f"- **Bull / Base / Bear:** {i.get('bull_target','')} / {i.get('base_target','')} / {i.get('bear_target','')}",
-                  f"- **Scenario probabilities:** {i.get('bull_prob','')} / {i.get('base_prob','')} / {i.get('bear_prob','')}",
+                  f"- **Scenario probabilities:** not separately assigned; see scenario table.",
                   ""]
     lines += ["## Quant Risk Layer", "", "| Field | Value |", "| --- | --- |",
               "| Volatility model | vol5_ols_v1 |", "| Spike model | spike_logit_v1 |",
