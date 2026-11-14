@@ -22,6 +22,7 @@ from sqlalchemy import text
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from db_builder.config import local_engine  # noqa: E402
+from db_builder.trading_calendar import is_valid_nyse_session  # noqa: E402
 
 UA = "AEGIS research contact@example.com"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
@@ -106,8 +107,11 @@ def _next_business_day(filed: str | None) -> str | None:
     if not filed:
         return None
     d = date.fromisoformat(filed) + timedelta(days=1)
-    while d.weekday() >= 5:
+    for _ in range(10):
+        if is_valid_nyse_session(d):
+            return d.isoformat()
         d += timedelta(days=1)
+    return d.isoformat()
     return d.isoformat()
 
 
@@ -199,11 +203,24 @@ def latest_observations(raw: list[dict]) -> dict[tuple, dict]:
     """Latest-filed observation per metric/unit/period, preserving all raw facts."""
     out = {}
     for r in raw:
-        key = (r["metric"], r["unit"], r["start_date"], r["end_date"], r["period_type"])
+        key = (r["metric"], r["tag"], r["unit"], r["start_date"], r["end_date"], r["period_type"])
         old = out.get(key)
         if old is None or (r.get("filed") or "") >= (old.get("filed") or ""):
             out[key] = r
     return out
+
+
+def _tag_priority(metric: str, tag: str) -> int:
+    return METRICS.get(metric, []).index(tag) if tag in METRICS.get(metric, []) else 999
+
+
+def _best_annual(rows: list[dict], metric: str) -> dict | None:
+    if not rows:
+        return None
+    latest_end = max(r["end_date"] for r in rows)
+    candidates = [r for r in rows if r["end_date"] == latest_end]
+    latest_first = sorted(candidates, key=lambda r: r.get("filed") or "", reverse=True)
+    return sorted(latest_first, key=lambda r: _tag_priority(metric, r["tag"]))[0]
 
 
 def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) -> list[dict]:
@@ -233,27 +250,30 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
         if r["period_type"] == "Y":
             annual.setdefault(r["metric"], []).append(r)
     for metric, rows in annual.items():
-        rows.sort(key=lambda x: (x["end_date"], x.get("filed") or ""), reverse=True)
-        if rows:
-            r = rows[0]
+        r = _best_annual(rows, metric)
+        if r:
             add(metric, r["end_date"], "Y", r["value"], r["unit"], "reported_annual", r, derived=False)
-            # YoY growth for revenue/EPS/net income.
-            prior = next((x for x in rows[1:] if x["end_date"] < r["end_date"]), None)
+            # YoY growth for revenue/EPS/net income, within the same selected tag.
+            same_tag = [x for x in rows if x["tag"] == r["tag"]]
+            prior = next((x for x in sorted(same_tag, key=lambda y: y["end_date"], reverse=True)
+                          if x["end_date"] < r["end_date"]), None)
             if prior and prior["value"] not in (None, 0) and metric != "diluted_eps":
                 add(metric + "_growth_yoy", r["end_date"], "Y",
                     (r["value"] / prior["value"] - 1) * 100, "percent", "latest_annual / prior_annual - 1", r)
     # Margins from latest annual revenue/operating/net.
     def latest_metric(metric):
-        rows = annual.get(metric) or []
-        rows.sort(key=lambda x: x["end_date"], reverse=True)
-        return rows[0] if rows else None
+        return _best_annual(annual.get(metric) or [], metric)
     rev, op, net = latest_metric("revenue"), latest_metric("operating_income"), latest_metric("net_income")
     if rev and op and rev["value"]:
-        add("operating_margin", rev["end_date"], "Y", op["value"] / rev["value"] * 100, "percent",
-            "operating_income / revenue", rev)
+        op_margin = op["value"] / rev["value"] * 100
+        if abs(op_margin) <= 100:
+            add("operating_margin", rev["end_date"], "Y", op_margin, "percent",
+                "operating_income / revenue", rev)
     if rev and net and rev["value"]:
-        add("net_margin", rev["end_date"], "Y", net["value"] / rev["value"] * 100, "percent",
-            "net_income / revenue", rev)
+        net_margin = net["value"] / rev["value"] * 100
+        if abs(net_margin) <= 100:
+            add("net_margin", rev["end_date"], "Y", net_margin, "percent",
+                "net_income / revenue", rev)
     ocf, capex = latest_metric("operating_cash_flow"), latest_metric("capex")
     if ocf and capex:
         add("free_cash_flow", ocf["end_date"], "Y", ocf["value"] - capex["value"], "USD",
@@ -342,7 +362,11 @@ def main() -> int:
                         values (:cik,:ticker,:taxonomy,:tag,:unit,:value,:start_date,:end_date,
                          :fy,:fp,:form,:accession,:filed,:accepted_at,:frame,:period_type,
                          :source_url,:retrieved_at,:run_id,:is_restatement,:available_at,:availability_basis)
-                        on conflict do nothing"""), r)
+                        on conflict (cik,tag,unit,coalesce(start_date,date '0001-01-01'),end_date,accession)
+                        do update set accepted_at=coalesce(excluded.accepted_at,sec_facts.accepted_at),
+                        available_at=coalesce(excluded.available_at,sec_facts.available_at),
+                        availability_basis=coalesce(excluded.availability_basis,sec_facts.availability_basis),
+                        retrieved_at=excluded.retrieved_at, run_id=excluded.run_id"""), r)
                 for m in metrics:
                     c.execute(text("""insert into fundamentals.sec_metrics
                         (cik,ticker,metric,period_end,period_type,value,unit,formula,
