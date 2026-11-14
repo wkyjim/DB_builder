@@ -13,7 +13,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -92,6 +92,25 @@ def _sec_get(cik: str, retries: int = 4) -> dict:
     raise RuntimeError("SEC fetch exhausted")
 
 
+def _acceptance_map(cik: str) -> dict[str, str]:
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    recent = (r.json().get("filings") or {}).get("recent") or {}
+    accn = recent.get("accessionNumber") or []
+    accepted = recent.get("acceptanceDateTime") or []
+    return {str(a): str(t) for a, t in zip(accn, accepted) if a and t}
+
+
+def _next_business_day(filed: str | None) -> str | None:
+    if not filed:
+        return None
+    d = date.fromisoformat(filed) + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d.isoformat()
+
+
 def ensure_schema(engine) -> None:
     ddl = [
         "create schema if not exists fundamentals",
@@ -121,6 +140,8 @@ def ensure_schema(engine) -> None:
         "alter table fundamentals.sec_facts add column if not exists fact_id bigserial",
         "alter table fundamentals.sec_facts drop constraint if exists sec_facts_pkey",
         "alter table fundamentals.sec_facts alter column start_date drop not null",
+        "alter table fundamentals.sec_facts add column if not exists available_at date",
+        "alter table fundamentals.sec_facts add column if not exists availability_basis text",
         "create unique index if not exists ux_sec_facts_period on fundamentals.sec_facts(cik,tag,unit,coalesce(start_date,date '0001-01-01'),end_date,accession)",
         "create index if not exists ix_sec_facts_ticker_end on fundamentals.sec_facts(ticker,end_date)",
         "create index if not exists ix_sec_metrics_ticker_metric on fundamentals.sec_metrics(ticker,metric,period_end)",
@@ -130,8 +151,10 @@ def ensure_schema(engine) -> None:
             c.execute(text(q))
 
 
-def parse_company(cik: str, ticker: str, run_id: str, source_url: str) -> tuple[list[dict], list[dict]]:
+def parse_company(cik: str, ticker: str, run_id: str, source_url: str,
+                  acceptance: dict[str, str] | None = None) -> tuple[list[dict], list[dict]]:
     data = _sec_get(cik)
+    acceptance = acceptance or {}
     facts = data.get("facts", {}).get("us-gaap", {})
     raw = []
     for metric, tags in METRICS.items():
@@ -149,7 +172,15 @@ def parse_company(cik: str, ticker: str, run_id: str, source_url: str) -> tuple[
                         "metric": metric, "unit": unit, "value": _num(x.get("val")),
                         "start_date": start, "end_date": x.get("end"), "fy": x.get("fy"),
                         "fp": x.get("fp"), "form": x.get("form"), "accession": x.get("accn"),
-                        "filed": x.get("filed"), "accepted_at": None, "frame": x.get("frame"),
+                        "filed": x.get("filed"),
+                        "accepted_at": acceptance.get(str(x.get("accn"))) or None,
+                        "available_at": (date.fromisoformat(acceptance[str(x.get("accn"))][:10])
+                                         if str(x.get("accn")) in acceptance
+                                         else date.fromisoformat(_next_business_day(x.get("filed")))
+                                         if x.get("filed") else None),
+                        "availability_basis": ("accepted" if str(x.get("accn")) in acceptance
+                                               else "next_session_fallback"),
+                        "frame": x.get("frame"),
                         "period_type": _period_type(start, x.get("end")),
                         "source_url": source_url, "retrieved_at": datetime.now(timezone.utc),
                         "run_id": run_id, "is_restatement": False,
@@ -189,7 +220,8 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
             "unit": unit, "formula": formula, "fiscal_year": row.get("fy"),
             "fiscal_period": row.get("fp"), "source_accession": row.get("accession"),
             "filed": row.get("filed"),
-            "available_at": datetime.fromisoformat(row["filed"]).replace(tzinfo=timezone.utc) if row.get("filed") else None,
+            "available_at": (datetime.combine(row["available_at"], datetime.min.time(), tzinfo=timezone.utc)
+                             if row.get("available_at") else None),
             "source_url": row.get("source_url"), "is_derived": derived,
             "retrieved_at": row.get("retrieved_at"),
             "share_basis_status": "unverified",
@@ -207,7 +239,7 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
             add(metric, r["end_date"], "Y", r["value"], r["unit"], "reported_annual", r, derived=False)
             # YoY growth for revenue/EPS/net income.
             prior = next((x for x in rows[1:] if x["end_date"] < r["end_date"]), None)
-            if prior and prior["value"] not in (None, 0):
+            if prior and prior["value"] not in (None, 0) and metric != "diluted_eps":
                 add(metric + "_growth_yoy", r["end_date"], "Y",
                     (r["value"] / prior["value"] - 1) * 100, "percent", "latest_annual / prior_annual - 1", r)
     # Margins from latest annual revenue/operating/net.
@@ -249,6 +281,8 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=12)
+    ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--dedupe-issuer", action="store_true", default=True)
     ap.add_argument("--tickers", default=None)
     ap.add_argument("--run-id", default=None)
     args = ap.parse_args()
@@ -268,6 +302,7 @@ def main() -> int:
     sec_map = _cik_map()
     universe = []
     missing = []
+    seen = {}
     for ticker, cik, name in rows:
         t = str(ticker).upper()
         if not cik:
@@ -276,11 +311,15 @@ def main() -> int:
             if not cik:
                 missing.append(t)
                 continue
-        universe.append((t, str(cik).zfill(10), name))
+        c = str(cik).zfill(10)
+        if args.dedupe_issuer and c in seen:
+            continue
+        seen[c] = t
+        universe.append((t, c, name))
     if args.tickers:
         wanted = {x.strip().upper() for x in args.tickers.split(",")}
         universe = [x for x in universe if x[0] in wanted]
-    universe = universe[:args.limit]
+    universe = universe[args.offset:args.offset + args.limit]
     with engine.begin() as c:
         c.execute(text("""insert into fundamentals.sec_ingest_runs
             (run_id,started_at,requested,ok,failed,source,notes)
@@ -291,17 +330,18 @@ def main() -> int:
     for ticker, cik, name in universe:
         source_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
         try:
-            raw, _ = parse_company(cik, ticker, run_id, source_url)
+            raw, _ = parse_company(cik, ticker, run_id, source_url,
+                                   acceptance=_acceptance_map(cik))
             metrics = normalize(ticker, cik, raw, as_of=str(latest))
             with engine.begin() as c:
                 for r in raw:
                     c.execute(text("""insert into fundamentals.sec_facts
                         (cik,ticker,taxonomy,tag,unit,value,start_date,end_date,fy,fp,form,
                          accession,filed,accepted_at,frame,period_type,source_url,retrieved_at,
-                         run_id,is_restatement)
+                         run_id,is_restatement,available_at,availability_basis)
                         values (:cik,:ticker,:taxonomy,:tag,:unit,:value,:start_date,:end_date,
                          :fy,:fp,:form,:accession,:filed,:accepted_at,:frame,:period_type,
-                         :source_url,:retrieved_at,:run_id,:is_restatement)
+                         :source_url,:retrieved_at,:run_id,:is_restatement,:available_at,:availability_basis)
                         on conflict do nothing"""), r)
                 for m in metrics:
                     c.execute(text("""insert into fundamentals.sec_metrics
