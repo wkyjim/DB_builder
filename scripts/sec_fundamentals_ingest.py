@@ -136,7 +136,7 @@ def ensure_schema(engine) -> None:
             cik text not null, ticker text not null, metric text not null,
             period_end date not null, period_type text not null, value numeric,
             unit text not null, formula text, fiscal_year int, fiscal_period text,
-            fiscal_period_original text, metric_period_type text,
+            fiscal_period_original text, metric_period_type text, metric_fiscal_period text,
             start_date date, end_date date, derivation_method text,
             source_accession text, filed date, available_at timestamptz,
             source_url text, is_derived boolean, retrieved_at timestamptz,
@@ -161,9 +161,11 @@ def ensure_schema(engine) -> None:
         "create index if not exists ix_sec_metrics_ticker_metric on fundamentals.sec_metrics(ticker,metric,period_end)",
         "alter table fundamentals.sec_metrics add column if not exists fiscal_period_original text",
         "alter table fundamentals.sec_metrics add column if not exists metric_period_type text",
+        "alter table fundamentals.sec_metrics add column if not exists metric_fiscal_period text",
         "alter table fundamentals.sec_metrics add column if not exists start_date date",
         "alter table fundamentals.sec_metrics add column if not exists end_date date",
         "alter table fundamentals.sec_metrics add column if not exists derivation_method text",
+        "alter table fundamentals.sec_metrics add column if not exists pit_eligible boolean default true",
     ]
     with engine.begin() as c:
         for q in ddl:
@@ -243,12 +245,18 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
     def add(metric, period_end, ptype, value, unit, formula, row, derived=True):
         if value is None:
             return
+        norm_fp = row.get("fp")
+        if ptype == "Q":
+            norm_fp = {"fy_minus_9m": "Q4", "ytd_9m_minus_6m": "Q3",
+                       "ytd_6m_minus_3m": "Q2"}.get(formula, row.get("fp"))
+        elif ptype == "Y":
+            norm_fp = "FY"
         metrics.append({
             "cik": cik, "ticker": ticker, "metric": metric,
             "period_end": period_end, "period_type": ptype, "value": value,
             "unit": unit, "formula": formula, "fiscal_year": row.get("fy"),
             "fiscal_period": row.get("fp"), "fiscal_period_original": row.get("fp"),
-            "metric_period_type": ptype,
+            "metric_period_type": ptype, "metric_fiscal_period": norm_fp,
             "start_date": row.get("start_date"), "end_date": period_end,
             "derivation_method": formula,
             "source_accession": row.get("accession"),
@@ -453,16 +461,17 @@ def main() -> int:
                 for m in metrics:
                     c.execute(text("""insert into fundamentals.sec_metrics
                         (cik,ticker,metric,period_end,period_type,value,unit,formula,
-                         fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,
+                         fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,metric_fiscal_period,
                          start_date,end_date,derivation_method,source_accession,filed,available_at,
                          source_url,is_derived,retrieved_at,share_basis_status,split_status)
                         values (:cik,:ticker,:metric,:period_end,:period_type,:value,:unit,:formula,
-                         :fiscal_year,:fiscal_period,:fiscal_period_original,:metric_period_type,
+                         :fiscal_year,:fiscal_period,:fiscal_period_original,:metric_period_type,:metric_fiscal_period,
                          :start_date,:end_date,:derivation_method,:source_accession,:filed,:available_at,
                          :source_url,:is_derived,:retrieved_at,:share_basis_status,:split_status)
                         on conflict (cik,metric,period_end,period_type,unit) do update set
                          fiscal_period_original=excluded.fiscal_period_original,
                          metric_period_type=excluded.metric_period_type,
+                         metric_fiscal_period=excluded.metric_fiscal_period,
                          start_date=excluded.start_date,end_date=excluded.end_date,
                          derivation_method=excluded.derivation_method,
                          value=excluded.value, source_accession=excluded.source_accession,

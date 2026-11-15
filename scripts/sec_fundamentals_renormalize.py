@@ -37,11 +37,11 @@ for t in tickers:
         for m in metrics:
             c.execute(text("""insert into fundamentals.sec_metrics
                 (cik,ticker,metric,period_end,period_type,value,unit,formula,
-                 fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,
+                 fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,metric_fiscal_period,
                  start_date,end_date,derivation_method,source_accession,filed,available_at,
                  source_url,is_derived,retrieved_at,share_basis_status,split_status)
                 values (:cik,:ticker,:metric,:period_end,:period_type,:value,:unit,:formula,
-                 :fiscal_year,:fiscal_period,:fiscal_period_original,:metric_period_type,
+                 :fiscal_year,:fiscal_period,:fiscal_period_original,:metric_period_type,:metric_fiscal_period,
                  :start_date,:end_date,:derivation_method,:source_accession,:filed,:available_at,
                  :source_url,:is_derived,:retrieved_at,:share_basis_status,:split_status)"""),m)
         c.execute(text("update fundamentals.sec_coverage set metric_count=:n,retrieved_at=now() where ticker=:t"),{'n':len(metrics),'t':t})
