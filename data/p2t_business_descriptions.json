@@ -1,0 +1,12 @@
+{
+  "MU": {
+    "source": "SEC 10-K, accession 0000723125-26-000023, filed 2026-10-09",
+    "url": "https://www.sec.gov/Archives/edgar/data/723125/000072312526000023/mu-20260903.htm",
+    "passage": "We are a global leader in semiconductor memory and storage, powering AI and compute-intensive applications from cloud to edge. Our portfolio includes high-performance DRAM, NAND, and NOR solutions. We manufacture our products at wholly-owned facilities and also utilize subcontractors."
+  },
+  "SNDK": {
+    "source": "SEC 10-K, accession 0001628280-26-057406, filed 2026-08-17",
+    "url": "https://www.sec.gov/Archives/edgar/data/2023554/000162828026057406/sndk-20260703.htm",
+    "passage": "Sandisk is a leading global semiconductor memory company with more than 30 years of innovation in NAND flash technology. We are a vertically integrated solutions provider with ownership of chip-level design and IP, front and back-end manufacturing, as well as systems engineering and design. Our solutions include SSDs, embedded products, removable cards, USB drives, and wafers and components."
+  }
+}
