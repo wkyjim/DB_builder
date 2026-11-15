@@ -8,5 +8,15 @@
     "source": "SEC 10-K, accession 0001628280-26-057406, filed 2026-08-17",
     "url": "https://www.sec.gov/Archives/edgar/data/2023554/000162828026057406/sndk-20260703.htm",
     "passage": "Sandisk is a leading global semiconductor memory company with more than 30 years of innovation in NAND flash technology. We are a vertically integrated solutions provider with ownership of chip-level design and IP, front and back-end manufacturing, as well as systems engineering and design. Our solutions include SSDs, embedded products, removable cards, USB drives, and wafers and components."
+  },
+  "DOW": {
+    "source": "SEC 10-K, accession 0001751788-26-000018, filed 2026-02-03",
+    "url": "https://www.sec.gov/Archives/edgar/data/1751788/000175178826000018/dow-20251231.htm",
+    "passage": "Dow is one of the world\u2019s leading materials science companies, serving customers in high-growth markets such as packaging, infrastructure, mobility and consumer applications. Dow operates manufacturing sites in 29 countries and delivered sales of approximately $40 billion in 2025."
+  },
+  "LYB": {
+    "source": "SEC 10-K, accession 0001489393-26-000012, filed 2026-02-20",
+    "url": "https://www.sec.gov/Archives/edgar/data/1489393/000148939326000012/lyb-20251231.htm",
+    "passage": "LyondellBasell Industries N.V. is a global, independent chemical company. We participate globally across the petrochemical value chain and are an industry leader in many of our product lines. Our chemicals businesses convert large volumes of liquid and gaseous hydrocarbon feedstocks into plastic resins and other chemicals."
   }
 }
