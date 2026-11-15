@@ -19,7 +19,7 @@ for t in tickers:
     with engine.connect() as c:
         rows=c.execute(text("""select cik,ticker,taxonomy,tag,unit,value,start_date,end_date,fy,fp,form,
             accession,filed,accepted_at,frame,period_type,source_url,retrieved_at,run_id,is_restatement,
-            available_at,availability_basis from fundamentals.sec_facts where ticker=:t"""),{'t':t}).fetchall()
+            available_at,availability_basis from fundamentals.sec_facts where ticker=:t and quarantined is not true"""),{'t':t}).fetchall()
     if not rows:
         print('SKIP',t); continue
     cik=rows[0][0]

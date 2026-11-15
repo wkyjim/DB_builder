@@ -31,6 +31,8 @@ METRICS = {
                 "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"],
     "operating_income": ["OperatingIncomeLoss"],
     "net_income": ["NetIncomeLoss", "ProfitLoss"],
+    "common_net_income": ["NetIncomeLossAvailableToCommonStockholdersBasic",
+                          "NetIncomeLossAvailableToCommonStockholdersDiluted"],
     "diluted_eps": ["EarningsPerShareDiluted"],
     "operating_cash_flow": ["NetCashProvidedByUsedInOperatingActivities"],
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
@@ -147,6 +149,11 @@ def ensure_schema(engine) -> None:
         "alter table fundamentals.sec_facts add column if not exists available_at date",
         "alter table fundamentals.sec_facts add column if not exists availability_basis text",
         "alter table fundamentals.sec_facts add column if not exists change_class text",
+        "alter table fundamentals.sec_facts add column if not exists quarantined boolean default false",
+        """create table if not exists fundamentals.sec_entity_quarantine (
+            ticker text, wrong_cik text, correct_cik text, reason text,
+            verified_at timestamptz, source_url text,
+            primary key(ticker,wrong_cik))""",
         "create unique index if not exists ux_sec_facts_period on fundamentals.sec_facts(cik,tag,unit,coalesce(start_date,date '0001-01-01'),end_date,accession)",
         "create index if not exists ix_sec_facts_ticker_end on fundamentals.sec_facts(ticker,end_date)",
         "create index if not exists ix_sec_metrics_ticker_metric on fundamentals.sec_metrics(ticker,metric,period_end)",
@@ -188,15 +195,12 @@ def parse_company(cik: str, ticker: str, run_id: str, source_url: str,
                         "frame": x.get("frame"),
                         "period_type": _period_type(start, x.get("end")),
                         "source_url": source_url, "retrieved_at": datetime.now(timezone.utc),
-                        "run_id": run_id, "is_restatement": False,
+                        "run_id": run_id, "is_restatement": False, "quarantined": False,
                     })
-    # Mark restatements: same metric/tag/unit/period with more than one accession.
-    groups = defaultdict(set)
+    # A repeated accession/period is not a restatement. Change classification is
+    # applied separately and conservatively; do not use a broad restatement flag.
     for r in raw:
-        groups[(r["metric"], r["tag"], r["unit"], r["start_date"], r["end_date"])].add(r["accession"])
-    for r in raw:
-        r["is_restatement"] = len(groups[(r["metric"], r["tag"], r["unit"],
-                                          r["start_date"], r["end_date"])]) > 1
+        r["is_restatement"] = False
     return raw, data
 
 
@@ -367,6 +371,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=12)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--dedupe-issuer", action="store_true", default=True)
+    ap.add_argument("--cik-override", default=None, help="TICKER=CIK override")
     ap.add_argument("--tickers", default=None)
     ap.add_argument("--run-id", default=None)
     args = ap.parse_args()
@@ -396,6 +401,8 @@ def main() -> int:
                 missing.append(t)
                 continue
         c = str(cik).zfill(10)
+        if args.cik_override and t == args.cik_override.split("=", 1)[0].upper():
+            c = args.cik_override.split("=", 1)[1].zfill(10)
         if args.dedupe_issuer and c in seen:
             continue
         seen[c] = t
@@ -422,10 +429,11 @@ def main() -> int:
                     c.execute(text("""insert into fundamentals.sec_facts
                         (cik,ticker,taxonomy,tag,unit,value,start_date,end_date,fy,fp,form,
                          accession,filed,accepted_at,frame,period_type,source_url,retrieved_at,
-                         run_id,is_restatement,available_at,availability_basis)
+                         run_id,is_restatement,available_at,availability_basis,quarantined)
                         values (:cik,:ticker,:taxonomy,:tag,:unit,:value,:start_date,:end_date,
                          :fy,:fp,:form,:accession,:filed,:accepted_at,:frame,:period_type,
-                         :source_url,:retrieved_at,:run_id,:is_restatement,:available_at,:availability_basis)
+                         :source_url,:retrieved_at,:run_id,:is_restatement,:available_at,:availability_basis,
+                         coalesce(:quarantined,false))
                         on conflict (cik,tag,unit,coalesce(start_date,date '0001-01-01'),end_date,accession)
                         do update set accepted_at=coalesce(excluded.accepted_at,sec_facts.accepted_at),
                         available_at=coalesce(excluded.available_at,sec_facts.available_at),
