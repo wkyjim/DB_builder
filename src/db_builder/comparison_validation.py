@@ -23,7 +23,7 @@ def validate_comparisons(selected: list[dict], comparisons: list[dict], candidat
         if t not in sector: flags.append(f"unknown_selected:{t}"); continue
         if p == t: flags.append(f"self_comparison:{t}"); continue
         if p not in sector: flags.append(f"unknown_peer:{t}:{p}"); continue
-        if sector[t] != sector[p]: flags.append(f"unrelated_peer:{t}:{p}"); continue
+        if sector[t] != sector[p]: flags.append(f"unrelated_peer:{t}:{p}")
         dim = str(x.get("dimension") or "").strip().lower()
         if not dim or dim in {"generic", "other", "n/a", "none"}:
             flags.append(f"generic_dimension:{t}:{p}")
