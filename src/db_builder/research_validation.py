@@ -43,14 +43,21 @@ def validate_narrative(text: str, evidence: list[dict], ticker: str) -> list[str
     labels = set()
     for e in evidence:
         p = e.get("canonical_period") or e.get("metric_fiscal_period")
-        if p and re.fullmatch(r"(Q[1-4]|FY\d{4}|FY|TTM)", str(p), re.I):
-            labels.add(str(p).upper())
+        if p:
+            raw_label=str(p).upper()
+            if re.fullmatch(r"(Q[1-4]|FY\d{4}|FY|TTM)", raw_label):
+                labels.add(raw_label)
+            # A guidance period such as Q2 FY2027 supports both component labels.
+            for part in re.findall(r"Q[1-4]|FY\d{4}", raw_label):
+                labels.add(part)
     for m in re.finditer(r"\b(Q[1-4]|FY\s*\d{4}|FY)\b", text, re.I):
         label = m.group(1).upper().replace(" ", "")
         if label not in labels and label not in {"FY2026", "FY2027", "FY2028", "FY2029"}:
             flags.append(f"unsupported_period:{ticker}:{label}")
     allowed = _allowed_values(evidence); allowed |= {2026, 2027, 2028, 2029}
     for tok in _numbers(text):
+        if tok.startswith("0") and len(tok) < 4 and "." not in tok:
+            continue
         v = abs(_num(tok))
         if v in allowed: continue
         if not any(abs(v - a) <= max(0.01, abs(a) * 0.01) for a in allowed):

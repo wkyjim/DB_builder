@@ -17,17 +17,17 @@ def main():
             for e in rows:
                 keys.append({'key':f'K_{c["ticker"]}_{len(keys)+1:02d}','metric':metric,
                              'period':e.get('period'),'canonical_period':e.get('metric_fiscal_period'),
-                             'value':e.get('value'),'unit':e.get('unit'),'source':e.get('source'),
+                             'value':e.get('value'),'unit':e.get('unit'),'source':e.get('source'),'kind':'SEC_ACTUAL',
                              'accession':e.get('accession'),'available_at':e.get('available_at')})
         for e in c.get('derived',[])[:8]:
             keys.append({'key':f'K_{c["ticker"]}_{len(keys)+1:02d}','metric':e.get('metric'),
                          'period':e.get('period'),'canonical_period':'DERIVED','value':e.get('value'),
-                         'unit':e.get('unit'),'source':'Python derived','accession':e.get('input_ids'),
+                         'unit':e.get('unit'),'source':'Python derived','kind':'DERIVED','accession':e.get('input_ids'),
                          'available_at':None})
         for e in c.get('typed_guidance',[]):
             keys.append({'key':f'K_{c["ticker"]}_{len(keys)+1:02d}','metric':e.get('metric'),
-                         'period':e.get('period'),'canonical_period':'GUIDANCE',
-                         'value':{'low':e.get('low'),'high':e.get('high')},'unit':e.get('unit'),
+                         'period':e.get('period'),'canonical_period':e.get('period'),'kind':'MANAGEMENT_GUIDANCE_TYPED',
+                         'value':{'low':e.get('low'),'high':e.get('high')},'low':e.get('low'),'high':e.get('high'),'unit':e.get('unit'),
                          'source':'SEC 8-K typing','accession':e.get('source_passage_id'),
                          'gaap_basis':e.get('gaap_basis'),'split_basis':e.get('split_basis')})
         c['packet']={'ticker':c['ticker'],'sector':c.get('sector'),'evidence':keys}
