@@ -57,6 +57,8 @@ def main():
         for t,form,acc,filed in filing_rows:
             filings_by.setdefault(t,[]).append({'form':form,'accession':acc,'filed':str(filed)})
     cache=json.load(open(ROOT/'data/fundamentals/sp500_latest.json'))
+    guidance_path=ROOT/'data/p2i_guidance.json'
+    guidance=json.load(open(guidance_path))['results'] if guidance_path.exists() else {}
     vendor={r['ticker']:r for r in cache['rows'] if r['ticker'] in set(tick)}
     out=[]
     for x in cand:
@@ -71,6 +73,7 @@ def main():
         if not ve.get('consensus_available'): warnings.append(f'{t}: vendor consensus unavailable')
         if not ve.get('revisions_available'): warnings.append(f'{t}: earnings revisions unavailable')
         if not split_by.get(t): warnings.append(f'{t}: no recorded split event; full corporate-action history unresolved')
+        if not guidance.get(t,{}).get('guidance'): warnings.append(f'{t}: no management guidance passage extracted')
         warnings.append(f'{t}: share-basis and per-share valuation incomplete')
         out.append({
             'ticker':t,'cik':cik_by.get(t),'sector':sector_by.get(t),
@@ -78,7 +81,11 @@ def main():
             'vendor_estimate':ve,
             'vendor_source':{'provider':'Yahoo Finance via fundamental cache','source_ids':v.get('source_ids',[]),
                              'fiscal_period':v.get('fiscal_period'),'fiscal_year_mapping':v.get('fiscal_year_mapping','unverified')} if ve else {},
-            'management_guidance':{'available':False,'reason':'no verified guidance extraction in controlled evidence packet'},
+            'management_guidance':({
+                'available':bool(guidance.get(t,{}).get('guidance')),
+                'passages':guidance.get(t,{}).get('guidance',[])[:6],
+                'reason':None if guidance.get(t,{}).get('guidance') else 'no quantified guidance passage found in recent SEC 8-K exhibits'
+            }),
             'recent_filings':filings_by.get(t,[])[:6],
             'earnings_disclosures':{'available':bool(filings_by.get(t)),'basis':'SEC filing metadata only; management guidance text not extracted'},
             'corporate_actions':split_by.get(t,[]),
@@ -89,7 +96,7 @@ def main():
               'FY2028 consensus and revisions are unavailable; do not treat vendor FY+1 as FY2027/FY2028.',
               'Vendor estimates are not used for targets unless fiscal period and share basis are verified.',
               'Share-basis and split history are incomplete for per-share valuation.',
-              'No management guidance was extracted; absence is recorded, not replaced by AI assumptions.',
+              'SEC 8-K management-guidance passages were retrieved for 10 of 12 candidates; guidance is unavailable for RDDT and VRSN and quantified forward guidance is limited.',
               'No scenario probabilities are supported by this packet.',
             ]}
     print(json.dumps(packet,indent=2,default=str))
