@@ -7,11 +7,12 @@ from sqlalchemy import text
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src')); sys.path.insert(0,str(ROOT/'scripts'))
 from db_builder.config import local_engine
-from sec_fundamentals_ingest import normalize, METRICS
+from sec_fundamentals_ingest import normalize, METRICS, ensure_schema
 TAG_TO_METRIC={tag:m for m,tags in METRICS.items() for tag in tags}
 
 ap=argparse.ArgumentParser(); ap.add_argument('--tickers',default=None); a=ap.parse_args()
 engine=local_engine()
+ensure_schema(engine)
 with engine.connect() as c:
     as_of=str(c.execute(text("select max(date) from public.us_equities")).scalar())
     tickers=[x.strip().upper() for x in a.tickers.split(',')] if a.tickers else [r[0] for r in c.execute(text("select distinct ticker from fundamentals.sec_facts order by ticker")).fetchall()]
@@ -36,10 +37,12 @@ for t in tickers:
         for m in metrics:
             c.execute(text("""insert into fundamentals.sec_metrics
                 (cik,ticker,metric,period_end,period_type,value,unit,formula,
-                 fiscal_year,fiscal_period,source_accession,filed,available_at,
+                 fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,
+                 start_date,end_date,derivation_method,source_accession,filed,available_at,
                  source_url,is_derived,retrieved_at,share_basis_status,split_status)
                 values (:cik,:ticker,:metric,:period_end,:period_type,:value,:unit,:formula,
-                 :fiscal_year,:fiscal_period,:source_accession,:filed,:available_at,
+                 :fiscal_year,:fiscal_period,:fiscal_period_original,:metric_period_type,
+                 :start_date,:end_date,:derivation_method,:source_accession,:filed,:available_at,
                  :source_url,:is_derived,:retrieved_at,:share_basis_status,:split_status)"""),m)
         c.execute(text("update fundamentals.sec_coverage set metric_count=:n,retrieved_at=now() where ticker=:t"),{'n':len(metrics),'t':t})
     print('OK',t,'metrics',len(metrics))

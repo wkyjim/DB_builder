@@ -65,6 +65,24 @@ _ALLOWED = {
 }
 
 
+CALCULATION_TYPES = {
+    "growth_pct": (growth_pct, ("current", "prior")),
+    "margin_pct": (margin_pct, ("numerator", "denominator")),
+    "pct_to_bps": (pct_to_bps, ("pct",)),
+    "usd_billions_to_millions": (usd_billions_to_millions, ("value",)),
+}
+
+
+def calculate(calculation_type: str, inputs: Mapping[str, float]) -> float:
+    """Run a predefined calculation type. AI cannot provide a free-form formula."""
+    if calculation_type not in CALCULATION_TYPES:
+        raise FormulaError(f"unknown calculation type: {calculation_type}")
+    fn, names = CALCULATION_TYPES[calculation_type]
+    if set(inputs) != set(names):
+        raise FormulaError(f"{calculation_type} requires inputs {names}")
+    return fn(**{name: inputs[name] for name in names})
+
+
 def evaluate_calculation(formula: str, inputs: Mapping[str, float]) -> float:
     """Evaluate a deliberately small arithmetic expression.
 

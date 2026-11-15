@@ -1,5 +1,5 @@
 from db_builder.research_calculations import (
-    evaluate_calculation, growth_pct, margin_pct, parse_fiscal_label, pct_to_bps,
+    calculate, evaluate_calculation, growth_pct, margin_pct, parse_fiscal_label, pct_to_bps,
     usd_billions_to_millions,
 )
 
@@ -27,6 +27,13 @@ def test_fiscal_year_string_and_percentage_units():
 def test_unit_conversion_and_margin():
     assert usd_billions_to_millions(12.2) == 12200.0
     assert round(margin_pct(8.78, 11.031), 1) == 79.6
+
+
+def test_predefined_calculation_types_only():
+    assert round(calculate("growth_pct", {"current": 41.46, "prior": 9.30}), 1) == 345.8
+    assert calculate("pct_to_bps", {"pct": 3.75}) == 375.0
+    with __import__("pytest").raises(Exception):
+        calculate("(a-b)/c*100", {"a": 1})
 
 
 def test_formula_rejects_unknown_inputs_and_attributes():

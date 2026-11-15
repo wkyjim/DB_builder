@@ -136,6 +136,8 @@ def ensure_schema(engine) -> None:
             cik text not null, ticker text not null, metric text not null,
             period_end date not null, period_type text not null, value numeric,
             unit text not null, formula text, fiscal_year int, fiscal_period text,
+            fiscal_period_original text, metric_period_type text,
+            start_date date, end_date date, derivation_method text,
             source_accession text, filed date, available_at timestamptz,
             source_url text, is_derived boolean, retrieved_at timestamptz,
             share_basis_status text, split_status text,
@@ -157,6 +159,11 @@ def ensure_schema(engine) -> None:
         "create unique index if not exists ux_sec_facts_period on fundamentals.sec_facts(cik,tag,unit,coalesce(start_date,date '0001-01-01'),end_date,accession)",
         "create index if not exists ix_sec_facts_ticker_end on fundamentals.sec_facts(ticker,end_date)",
         "create index if not exists ix_sec_metrics_ticker_metric on fundamentals.sec_metrics(ticker,metric,period_end)",
+        "alter table fundamentals.sec_metrics add column if not exists fiscal_period_original text",
+        "alter table fundamentals.sec_metrics add column if not exists metric_period_type text",
+        "alter table fundamentals.sec_metrics add column if not exists start_date date",
+        "alter table fundamentals.sec_metrics add column if not exists end_date date",
+        "alter table fundamentals.sec_metrics add column if not exists derivation_method text",
     ]
     with engine.begin() as c:
         for q in ddl:
@@ -240,7 +247,11 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
             "cik": cik, "ticker": ticker, "metric": metric,
             "period_end": period_end, "period_type": ptype, "value": value,
             "unit": unit, "formula": formula, "fiscal_year": row.get("fy"),
-            "fiscal_period": row.get("fp"), "source_accession": row.get("accession"),
+            "fiscal_period": row.get("fp"), "fiscal_period_original": row.get("fp"),
+            "metric_period_type": ptype,
+            "start_date": row.get("start_date"), "end_date": period_end,
+            "derivation_method": formula,
+            "source_accession": row.get("accession"),
             "filed": row.get("filed"),
             "available_at": (datetime.combine(row["available_at"], datetime.min.time(), tzinfo=timezone.utc)
                              if row.get("available_at") else None),
@@ -442,12 +453,18 @@ def main() -> int:
                 for m in metrics:
                     c.execute(text("""insert into fundamentals.sec_metrics
                         (cik,ticker,metric,period_end,period_type,value,unit,formula,
-                         fiscal_year,fiscal_period,source_accession,filed,available_at,
+                         fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,
+                         start_date,end_date,derivation_method,source_accession,filed,available_at,
                          source_url,is_derived,retrieved_at,share_basis_status,split_status)
                         values (:cik,:ticker,:metric,:period_end,:period_type,:value,:unit,:formula,
-                         :fiscal_year,:fiscal_period,:source_accession,:filed,:available_at,
+                         :fiscal_year,:fiscal_period,:fiscal_period_original,:metric_period_type,
+                         :start_date,:end_date,:derivation_method,:source_accession,:filed,:available_at,
                          :source_url,:is_derived,:retrieved_at,:share_basis_status,:split_status)
                         on conflict (cik,metric,period_end,period_type,unit) do update set
+                         fiscal_period_original=excluded.fiscal_period_original,
+                         metric_period_type=excluded.metric_period_type,
+                         start_date=excluded.start_date,end_date=excluded.end_date,
+                         derivation_method=excluded.derivation_method,
                          value=excluded.value, source_accession=excluded.source_accession,
                          filed=excluded.filed, available_at=excluded.available_at,
                          retrieved_at=excluded.retrieved_at"""), m)

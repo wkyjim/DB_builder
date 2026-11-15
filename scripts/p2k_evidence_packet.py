@@ -20,7 +20,7 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--as-of',default=None); a=ap.parse_args()
     with local_engine().connect() as c:
         as_of=a.as_of or str(c.execute(text("select max(date) from public.us_equities")).scalar())
-        rows=c.execute(text("""select ticker,metric,value,period_end,period_type,unit,formula,fiscal_year,fiscal_period,
+        rows=c.execute(text("""select ticker,metric,value,period_end,period_type,unit,formula,fiscal_year,fiscal_period,fiscal_period_original,metric_period_type,
           source_accession,available_at,split_status,share_basis_status
           from fundamentals.sec_metrics where ticker=any(:t) and available_at<=:d
           and period_type in ('Y','Q') order by ticker,metric,period_end"""),{'t':TICKERS,'d':as_of}).fetchall()
@@ -31,12 +31,12 @@ def main():
           where ticker=any(:e) and date<=(:d) order by ticker,date"""),{'e':etfs,'d':as_of}).fetchall()
     # actuals compact: latest annual plus recent quarters, one row per metric/period
     by={}
-    for t,m,v,p,pt,u,f,fy,fp,acc,av,ss,sb in rows:
+    for t,m,v,p,pt,u,f,fy,fp,fpo,mpt,acc,av,ss,sb in rows:
         x=by.setdefault(t,{})
         key=f'{m}|{pt}|{p}'
         x.setdefault(key,{'id':f'SEC:{t}:{m}:{pt}:{p}','metric':m,'period_type':pt,'period_end':str(p),
                           'value':float(v) if v is not None else None,'unit':u,'formula':f,
-                          'fiscal_year':fy,'fiscal_period':fp,
+                          'fiscal_year':fy,'fiscal_period':fp,'fiscal_period_original':fpo,'metric_period_type':mpt,
                           'source_accession':acc,'available_at':str(av),'split_status':ss,'share_basis_status':sb})
     cache=json.load(open(ROOT/'data/fundamentals/sp500_latest.json'))
     vendor={r['ticker']:r for r in cache['rows'] if r['ticker'] in TICKERS}
@@ -55,6 +55,7 @@ def main():
         sec=[{'id':x['id'],'ticker':t,'kind':'SEC_ACTUAL','metric':x['metric'],'period':x['period_end'],
               'period_type':x['period_type'],'value':x['value'],'unit':x['unit'],
               'formula':x['formula'],'fiscal_year':x['fiscal_year'],'fiscal_period':x['fiscal_period'],
+              'fiscal_period_original':x.get('fiscal_period_original'),'metric_period_type':x.get('metric_period_type'),
               'source':'SEC Companyfacts','accession':x['source_accession'],
               'available_at':x['available_at']} for x in actuals]
         g=[]
