@@ -251,39 +251,48 @@ def normalize(ticker: str, cik: str, raw: list[dict], as_of: str | None = None) 
         except Exception:
             return None
 
-    # Build direct and strictly derived quarterly observations. YTD deltas
-    # require the same accession, tag, unit, fiscal-year start and period end.
+    # Build direct and strictly derived quarterly observations from compatible
+    # periods. Cross-accession subtraction is allowed only when the fiscal-year
+    # start, tag, unit and period end line up and the prior fact was available
+    # before the later filing.
     q_rows = []
-    by_tag_acc = defaultdict(list)
-    for r in obs.values():
+    by_period = defaultdict(list)
+    for r in raw:
         if r.get("start_date") and r.get("end_date"):
-            by_tag_acc[(r["metric"], r["tag"], r["unit"], r["accession"])].append(r)
-    for (metric, tag, unit, acc), rows in by_tag_acc.items():
+            by_period[(r["metric"], r["tag"], r["unit"], r["start_date"])].append(r)
+    for (metric, tag, unit, start), rows in by_period.items():
+        rows = sorted(rows, key=lambda x: (x["end_date"], x.get("filed") or ""))
         for r in rows:
+            days = _days(r)
             if r["period_type"] == "Q":
                 q_rows.append({**r, "formula": "reported_quarter", "is_derived": False})
-        q3 = [r for r in rows if _days(r) is not None and 80 <= _days(r) <= 100]
-        ytd6 = [r for r in rows if _days(r) is not None and 150 <= _days(r) <= 210]
-        ytd9 = [r for r in rows if _days(r) is not None and 240 <= _days(r) <= 300]
-        annual_r = [r for r in rows if _days(r) is not None and 350 <= _days(r) <= 380]
-        for target in ytd6:
-            base = next((x for x in q3 if x["start_date"] == target["start_date"]
-                         and x["end_date"] < target["end_date"]), None)
-            if base:
-                q_rows.append({**target, "start_date": base["end_date"], "value": target["value"] - base["value"],
-                               "formula": "ytd_6m_minus_3m", "is_derived": True})
-        for target in ytd9:
-            base = next((x for x in ytd6 if x["start_date"] == target["start_date"]
-                         and x["end_date"] < target["end_date"]), None)
-            if base:
-                q_rows.append({**target, "start_date": base["end_date"], "value": target["value"] - base["value"],
-                               "formula": "ytd_9m_minus_6m", "is_derived": True})
-        for target in annual_r:
-            base = next((x for x in ytd9 if x["start_date"] == target["start_date"]
-                         and x["end_date"] == target["end_date"]), None)
-            if base:
-                q_rows.append({**target, "start_date": base["end_date"], "value": target["value"] - base["value"],
-                               "formula": "fy_minus_9m", "is_derived": True})
+            elif days is not None and 150 <= days <= 210:
+                prior = [x for x in rows if x["end_date"] < r["end_date"] and x.get("available_at")
+                         and x["available_at"] <= r["available_at"]]
+                if prior:
+                    base = sorted(prior, key=lambda x: x["end_date"], reverse=True)[0]
+                    q_rows.append({**r, "start_date": base["end_date"],
+                                   "value": r["value"] - base["value"],
+                                   "formula": "ytd_6m_minus_3m", "is_derived": True})
+            elif days is not None and 240 <= days <= 300:
+                prior = [x for x in rows if x["end_date"] < r["end_date"] and x.get("available_at")
+                         and x["available_at"] <= r["available_at"] and _days(x) is not None
+                         and 150 <= _days(x) <= 210]
+                if prior:
+                    base = sorted(prior, key=lambda x: x["end_date"], reverse=True)[0]
+                    q_rows.append({**r, "start_date": base["end_date"],
+                                   "value": r["value"] - base["value"],
+                                   "formula": "ytd_9m_minus_6m", "is_derived": True})
+            elif days is not None and 350 <= days <= 380:
+                prior = [x for x in rows if x["end_date"] < r["end_date"] and x.get("available_at")
+                         and x["available_at"] <= r["available_at"] and _days(x) is not None
+                         and 240 <= _days(x) <= 300]
+                if prior:
+                    base = sorted(prior, key=lambda x: x["end_date"], reverse=True)[0]
+                    q_rows.append({**r, "start_date": base["end_date"],
+                                   "value": r["value"] - base["value"],
+                                   "formula": "fy_minus_9m", "is_derived": True})
+
     # Store quarterly observations, preferring reported over derived duplicates.
     q_seen = {}
     for r in q_rows:
