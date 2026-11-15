@@ -505,9 +505,9 @@ def apply_evidence_bindings(report: dict, evidence: dict) -> dict:
                                               if ev.get("fy1_growth") is not None else None)
             idea["ai_growth_pct"] = _num(inputs.get("growth_pct"))
             horizon = inputs.get("horizon")
-        if isinstance(horizon, str) and re.search(r"FY\s*20(27|28)", horizon, re.I):
-            horizon = "12M from valuation date; fiscal-year mapping unverified"
-        idea["assumption_horizon"] = horizon
+            if isinstance(horizon, str) and re.search(r"FY\s*20(27|28)", horizon, re.I):
+                horizon = "12M from valuation date; fiscal-year mapping unverified"
+            idea["assumption_horizon"] = horizon
             idea["peer_reference"] = inputs.get("peer_reference")
             idea["assumption_justification"] = inputs.get("justification")
             idea["fy1_growth"] = ev.get("fy1_growth")
